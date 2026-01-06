@@ -1,0 +1,58 @@
+[project]
+name = "duckstring"
+version = "0.1.0"
+description = "Duckstring is a Python-native data-mesh orchestration framework built on DuckDB as a default engine that composes local and remote datasets into reproducible, dependency-aware analytical pipelines."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [
+  { name = "Isaac Harvey", email = "dev@isaacharvey.com" }
+]
+
+dependencies = [
+  # Core execution & query layer
+  "duckdb>=0.10",
+  "ibis-framework[duckdb]>=9.0",
+  "pyarrow>=15.0",
+
+  # Graph / orchestration primitives
+  "networkx>=3.2",
+
+  # Contracts, schemas, config
+  "pydantic>=2.6",
+
+  # UX / diagnostics
+  "rich>=13.7",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+  "ruff>=0.3",
+  "mypy>=1.8",
+]
+
+# Remote / cloud execution
+motherduck = [
+  "motherduck>=0.1.0",
+]
+
+# Future-facing integrations (kept optional)
+extras = [
+  "sqlalchemy>=2.0",
+  "orjson>=3.9",
+  "click>=8.1",
+]
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B"]

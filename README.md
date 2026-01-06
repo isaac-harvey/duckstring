@@ -13,7 +13,7 @@ Duckstring’s philosophy:
 - Brains, delays, and governance requirements are more expensive than compute
 - Communication is the core bottleneck to complexity
 
-The default engine is DuckDB (optionally backed by MotherDuck) with Ibis-friendly semantics, though this is configurable.
+The default engine is DuckDB (optionally backed by MotherDuck) with Ibis-friendly semantics, though this is configurable. Duckstring is an independent project and is not affiliated with, endorsed by, or maintained by the DuckDB project.
 
 ## Glossary
 
