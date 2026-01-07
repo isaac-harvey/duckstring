@@ -1,6 +1,6 @@
 # Duckstring
 
-Duckstring is a cloud-native ELT framework for orchestrating data preparation DAGs by breaking each stage into modular, potentially reusable nodes called **Ponds**. A **Basin** is a dependency-resolved graph of Ponds built from one or more terminal Ponds (targets) backward through upstream dependencies. Multiple Basins together form a **Lake**.
+Duckstring is a cloud-native ELT framework for orchestrating data preparation DAGs by breaking each stage into modular, potentially reusable nodes called **Ponds**. A **Basin** is a dependency-resolved graph of Ponds built from one or more terminal Ponds (targets) backward through upstream dependencies. Multiple Basins together form a **Catchment** in which data is stored.
 
 Duckstring focuses on batch and incremental workloads for tables typically on the order of tens of millions of rows (e.g. <50M), executed on a single compute node. It is intentionally **not** a streaming engine and does **not** provide distributed processing. The objective is to help small analytics teams do *everything decently* with room for progressive evolution, avoiding the overhead of perfection. There are plenty of specialist tools for millisecond latency and truly massive data; most are unnecessary for the majority of analytical workflows.
 
@@ -17,11 +17,12 @@ The default engine is DuckDB (optionally backed by MotherDuck) with Ibis-friendl
 
 ## Glossary
 
-- A **Lake** is the entire data ecosystem
-- A Lake is broken into multiple **Basins**
+- A **Catchment** is the entire data ecosystem
+- A Catchment is broken into multiple **Basins**
 - Each Basin consists of a collection of **Ponds**
 - **Inlets** and **Outlets** are the first (root) and last (leaf) Ponds in a Basin
 - A **Pulse** is one execution pass over a Basin, where each Pond runs when its upstream dependencies for that Pulse are satisfied
+- A **Duck** is a worker (compute) executing a Pulse
 
 ## Ponds
 
@@ -31,13 +32,13 @@ Each Pond is attached to a version-controlled repository. It should be treated l
 - **Compute** defining engine requirements and compute settings
 - **Storage** defining the location and naming/namespace of tables
 
-All tables in a Pond must be uniquely named (within the Lake namespace).
+All tables in a Pond must be uniquely named (within the Catchment namespace).
 
 ### Inlet / Outlet
 
-An **Inlet** is a type of Pond whose inputs come exclusively from sources external to the Lake, and includes specification of source details (e.g. connectors and ingestion tooling).
+An **Inlet** is a type of Pond whose inputs come exclusively from sources external to the Catchment, and includes specification of source details (e.g. connectors and ingestion tooling).
 
-An **Outlet** is a type of Pond whose only intended consumers are external to the Lake, and includes specification of consumer details (e.g. intended customers, schema requirements, data contracts). Outlets are not strictly required (consumers may read from non-Outlet Ponds), but are strongly recommended for governance and clear ownership of consumer expectations.
+An **Outlet** is a type of Pond whose only intended consumers are external to the Catchment, and includes specification of consumer details (e.g. intended customers, schema requirements, data contracts). Outlets are not strictly required (consumers may read from non-Outlet Ponds), but are strongly recommended for governance and clear ownership of consumer expectations.
 
 ### Public / Private
 
@@ -66,7 +67,11 @@ Basin Modes:
 
 **Wave** is useful when updates should be frequent but you want to maintain one Pulse at a time in a Basin. In practice it is nearly as responsive as Ripple when one process dominates total execution time.
 
-**Ripple** is useful when minimising latency is most important. It is best suited to incremental transformations and small, fast Ponds, and can approach streaming performance without the overhead.
+**Ripple** is useful when minimising latency is most important. It is best suited to incremental transformations and small, fast Ponds, and can approach streaming performance without the extra complexity that true streaming requires.
+
+### Ducks
+
+A Duck is a compute instance, and can be assigned by a Basin to an associated Pond. The Duck is made active when the first attached Pond begins, and remains active until the last attached Pond completes.
 
 ## Versioning
 

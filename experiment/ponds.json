@@ -1,0 +1,8 @@
+{
+    "order_daily": "https://github.com/ponds/order_daily.git",
+    "order_weekly": "https://github.com/ponds/order_weekly.git",
+    "order": "https://github.com/ponds/order.git",
+    "customer": "https://github.com/ponds/customer.git",
+    "product": "https://github.com/ponds/product.git",
+    "region": "https://github.com/ponds/region.git"
+}
