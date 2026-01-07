@@ -1,3 +1,3 @@
-from .core import main_function
+from .core import Pond, PondContract, TableContract
 
-__all__ = ["main_function"]
+__all__ = ["Pond", "PondContract", "TableContract"]
