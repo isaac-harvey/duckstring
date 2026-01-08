@@ -1,5 +1,6 @@
 from duckstring import Pond
 
+
 def pond():
     # Pond
     ## Needs the name and version, as this sets the schema location in the lake and the version of all tables within this pond

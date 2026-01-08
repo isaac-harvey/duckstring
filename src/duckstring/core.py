@@ -1,34 +1,47 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import json
+import os
+import sqlite3
+import warnings
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import (
     Any,
-    Callable,
     Dict,
-    Iterable,
     List,
     Mapping,
-    MutableMapping,
     Optional,
     Protocol,
     Sequence,
+    Set,
     Tuple,
-    Union,
 )
 
-# Optional ibis integration (recommended)
-try:
-    import ibis  # type: ignore
-    from ibis.expr.types import Table as IbisTable  # type: ignore
-    from ibis.expr.schema import Schema as IbisSchema  # type: ignore
-
-    _HAVE_IBIS = True
-except Exception:  # pragma: no cover
-    ibis = None  # type: ignore
-    IbisTable = Any  # type: ignore
-    IbisSchema = Any  # type: ignore
-    _HAVE_IBIS = False
-
+from .utils import (
+    _HAVE_DUCKDB,
+    _HAVE_IBIS,
+    duckdb,
+    ibis,
+)
+from .utils import (
+    expr_schema as _expr_schema,
+)
+from .utils import (
+    ibis_placeholder_table as _ibis_placeholder_table,
+)
+from .utils import (
+    load_module_from_file as _load_module_from_file,
+)
+from .utils import (
+    physical_table_name as _physical_table_name,
+)
+from .utils import (
+    select_and_alias as _select_and_alias,
+)
+from .utils import (
+    toposort as _toposort,
+)
 
 # ----------------------------
 # Contracts / manifests
@@ -44,13 +57,23 @@ class TableContract:
     schema: SchemaSpec
     description: Optional[str] = None
 
+    def to_dict(self) -> Dict[str, Any]:
+        return {"name": self.name, "schema": dict(self.schema), "description": self.description}
+
+    @staticmethod
+    def from_dict(d: Mapping[str, Any]) -> "TableContract":
+        return TableContract(
+            name=str(d["name"]),
+            schema=dict(d.get("schema", {})),
+            description=d.get("description"),
+        )
+
 
 @dataclass(frozen=True)
 class PondContract:
     name: str
     version: str
     description: Optional[str] = None
-    # exported tables only
     tables: Dict[str, TableContract] = field(default_factory=dict)
 
     def require_table(self, table_name: str) -> TableContract:
@@ -62,57 +85,93 @@ class PondContract:
             )
         return self.tables[table_name]
 
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "name": self.name,
+            "version": self.version,
+            "description": self.description,
+            "tables": {k: v.to_dict() for k, v in self.tables.items()},
+        }
 
-@dataclass(frozen=True)
-class SourceSpec:
-    pond: str
-    constraint: str  # semver range or pinned version/tag, as a string
+    @staticmethod
+    def from_dict(d: Mapping[str, Any]) -> "PondContract":
+        tables = {k: TableContract.from_dict(v) for k, v in dict(d.get("tables", {})).items()}
+        return PondContract(
+            name=str(d["name"]),
+            version=str(d["version"]),
+            description=d.get("description"),
+            tables=tables,
+        )
 
 
 @dataclass
 class FlowStage:
-    """
-    A stage boundary in the Pond graph.
-
-    Semantics:
-      - A stage groups table materializations that have no ordering requirement relative
-        to each other (i.e., can be executed in parallel).
-      - Stage ordering is defined by the order of stage creation.
-    """
-
     index: int
     parallelizable: bool
     outputs: List[str] = field(default_factory=list)
     notes: Optional[str] = None
 
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "index": self.index,
+            "parallelizable": self.parallelizable,
+            "outputs": list(self.outputs),
+            "notes": self.notes,
+        }
+
+    @staticmethod
+    def from_dict(d: Mapping[str, Any]) -> "FlowStage":
+        return FlowStage(
+            index=int(d["index"]),
+            parallelizable=bool(d.get("parallelizable", True)),
+            outputs=list(d.get("outputs", [])),
+            notes=d.get("notes"),
+        )
+
 
 @dataclass(frozen=True)
 class PondManifest:
-    """
-    Output of pond.build(): a pure description of the pond.
-    Intended to be serialized to JSON/YAML by the CLI.
-    """
-
     name: str
     version: str
     description: Optional[str]
-    sources: Dict[str, str]  # pond_name -> constraint
+    sources: Dict[str, str]
     stages: List[FlowStage]
     exported_tables: Dict[str, TableContract]
     private_tables: Dict[str, TableContract]
 
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "name": self.name,
+            "version": self.version,
+            "description": self.description,
+            "sources": dict(self.sources),
+            "stages": [s.to_dict() for s in self.stages],
+            "exported_tables": {k: v.to_dict() for k, v in self.exported_tables.items()},
+            "private_tables": {k: v.to_dict() for k, v in self.private_tables.items()},
+        }
+
+    @staticmethod
+    def from_dict(d: Mapping[str, Any]) -> "PondManifest":
+        return PondManifest(
+            name=str(d["name"]),
+            version=str(d["version"]),
+            description=d.get("description"),
+            sources=dict(d.get("sources", {})),
+            stages=[FlowStage.from_dict(x) for x in d.get("stages", [])],
+            exported_tables={
+                k: TableContract.from_dict(v) for k, v in dict(d.get("exported_tables", {})).items()
+            },
+            private_tables={
+                k: TableContract.from_dict(v) for k, v in dict(d.get("private_tables", {})).items()
+            },
+        )
+
 
 # ----------------------------
-# Basin interface (resolver)
+# Resolver interface (what Pond needs)
 # ----------------------------
 
-class Basin(Protocol):
-    """
-    Minimal interface Pond needs for preflight resolution.
-
-    A Basin is responsible for resolving upstream pond contracts (from git/registry/etc).
-    """
-
+class ContractResolver(Protocol):
     def resolve_contract(self, pond_name: str, constraint: str) -> PondContract: ...
 
 
@@ -123,60 +182,10 @@ class Basin(Protocol):
 @dataclass
 class _TableDef:
     name: str
-    expr: Optional[Any]  # ibis table expression, ideally
+    expr: Optional[Any]
     exported: bool
     schema: Optional[SchemaSpec] = None
     description: Optional[str] = None
-
-
-def _expr_schema(expr: Any) -> Optional[SchemaSpec]:
-    """
-    Best-effort schema extraction.
-    Prefer ibis because it gives stable, explicit column names.
-    """
-    if expr is None:
-        return None
-
-    if _HAVE_IBIS:
-        try:
-            sch = expr.schema()
-            # ibis schema -> dict[str, str]
-            return {k: str(v) for k, v in sch.items()}
-        except Exception:
-            return None
-
-    # Non-ibis objects: cannot infer safely
-    return None
-
-
-def _ibis_placeholder_table(name: str, schema: SchemaSpec) -> Any:
-    """
-    Create an ibis table expression from a contract schema (no backend binding).
-    """
-    if not _HAVE_IBIS:
-        raise RuntimeError(
-            "Ibis is not available. Install 'ibis-framework' to use contract-backed preflight checks."
-        )
-
-    # ibis.schema expects mapping col->dtype; dtype strings are accepted by ibis.dtype
-    ibis_schema = ibis.schema({k: ibis.dtype(v) for k, v in schema.items()})
-    return ibis.table(ibis_schema, name=name)
-
-
-def _select_and_alias(table_expr: Any, mapping: Mapping[str, str]) -> Any:
-    """
-    mapping: output_col -> input_col
-    """
-    if not _HAVE_IBIS:
-        raise RuntimeError(
-            "Ibis is not available. Install 'ibis-framework' to use duckstring Pond.get()."
-        )
-
-    projections = []
-    for out_col, in_col in mapping.items():
-        # ibis: t[in_col].name(out_col)
-        projections.append(table_expr[in_col].name(out_col))
-    return table_expr.select(projections)
 
 
 # ----------------------------
@@ -194,24 +203,15 @@ class _UpstreamPond:
         return self._pond._resolved_contracts.get(self.name)
 
     def get(self, table_name: str, mapping: Mapping[str, str]) -> Any:
-        """
-        Get an ibis table expression for an upstream exported table, selecting + aliasing
-        according to mapping (output_col -> upstream_col).
-
-        Preflight validation:
-          - requires upstream contract resolved (via pond.attach_basin() or pond.build()).
-          - validates requested columns exist in upstream contract.
-        """
         contract = self.contract
         if contract is None:
             raise RuntimeError(
                 f"Upstream contract for '{self.name}' is not resolved. "
-                f"Call pond.attach_basin(basin) or pond.build(basin) before upstream.get()."
+                f"Call pond.attach_resolver(resolver) or pond.build(resolver) before upstream.get()."
             )
 
         t_contract = contract.require_table(table_name)
 
-        # Validate input columns exist
         missing = sorted({src_col for src_col in mapping.values()} - set(t_contract.schema.keys()))
         if missing:
             available = ", ".join(sorted(t_contract.schema.keys()))
@@ -220,8 +220,7 @@ class _UpstreamPond:
                 f"Available: {available}"
             )
 
-        # Create an ibis placeholder from contract and select/alias requested columns
-        upstream_expr = _ibis_placeholder_table(name=f"{self.name}.{table_name}", schema=t_contract.schema)
+        upstream_expr = _ibis_placeholder_table(self.name, table_name, t_contract.schema)
         return _select_and_alias(upstream_expr, mapping)
 
 
@@ -247,16 +246,6 @@ class _UpstreamRegistry(Mapping[str, _UpstreamPond]):
 # ----------------------------
 
 class Pond:
-    """
-    Declarative pond definition:
-      - metadata (name/version/description)
-      - sources (dependency graph edges)
-      - local tables (private/exported)
-      - stage boundaries (flow)
-
-    Execution and storage are intentionally not modeled here.
-    """
-
     def __init__(self, name: str, description: Optional[str], version: str):
         if not name:
             raise ValueError("Pond.name must be non-empty.")
@@ -267,36 +256,16 @@ class Pond:
         self.description = description
         self.version = version
 
-        # pond_name -> version constraint
         self._sources: Dict[str, str] = {}
-
-        # resolved pond_name -> PondContract (exported surface only)
         self._resolved_contracts: Dict[str, PondContract] = {}
-
-        # table_name -> _TableDef (includes private + exported)
         self._tables: Dict[str, _TableDef] = {}
-
-        # stage boundaries
         self._stages: List[FlowStage] = []
         self._pending_outputs: List[str] = []
-
-        # upstream access
         self.upstream: Mapping[str, _UpstreamPond] = _UpstreamRegistry(self)
 
-        # optional basin attached for preflight
-        self._basin: Optional[Basin] = None
-
-        if not _HAVE_IBIS:
-            # You can still build manifests without ibis; but get()/schema checks require ibis.
-            pass
-
-    # -------- Sources --------
+        self._resolver: Optional[ContractResolver] = None
 
     def source(self, sources: Mapping[str, str]) -> None:
-        """
-        Declare upstream pond dependencies as pond_name -> version constraint.
-        Example: {"customer": "^1.0.0", "order": "~1.2.3"}
-        """
         for pond_name, constraint in sources.items():
             if pond_name == self.name:
                 raise ValueError("A pond cannot declare itself as an upstream source.")
@@ -304,72 +273,35 @@ class Pond:
                 raise ValueError(f"Invalid source declaration: {pond_name!r}: {constraint!r}")
             self._sources[pond_name] = constraint
 
-    def attach_basin(self, basin: Basin) -> None:
-        """
-        Attach a basin so upstream.get() can resolve contracts immediately.
-        """
-        self._basin = basin
+    def attach_resolver(self, resolver: ContractResolver) -> None:
+        self._resolver = resolver
         self._resolve_upstream_contracts()
 
-    # -------- Flow / stage boundaries --------
-
     def flow(self, actions: Optional[Sequence[Any]] = None, *, notes: Optional[str] = None) -> None:
-        """
-        Create a stage boundary.
-
-        Intended use:
-          - Call pond.flow([...]) after defining a batch of transformations/sinks to indicate
-            they belong to the same stage and can be executed in parallel.
-
-        Implementation detail:
-          - This records the names of tables sunk since the previous stage boundary.
-          - 'actions' is accepted for ergonomic parity with user code, but Pond does not
-            interpret or execute actions; execution belongs to Basin.
-
-        parallelizable rule:
-          - If 'actions' is a list/sequence, stage is marked parallelizable=True.
-          - If actions is None, parallelizable defaults to True (safe default).
-        """
-        parallelizable = True
-        if actions is not None:
-            parallelizable = True  # stage-level hint: "no ordering requirements inside the stage"
-
+        _ = actions
         stage = FlowStage(
             index=len(self._stages),
-            parallelizable=parallelizable,
+            parallelizable=True,
             outputs=list(self._pending_outputs),
             notes=notes,
         )
         self._stages.append(stage)
         self._pending_outputs.clear()
 
-    # -------- Local get / sinks --------
-
     def get(self, table_name: str, mapping: Mapping[str, str]) -> Any:
-        """
-        Local get: fetch a table already added to the pond context (private or exported),
-        then select+alias according to mapping.
-
-        Preflight validation:
-          - validates the requested columns exist if schema is known (from ibis expr or
-            previously inferred schema).
-        """
         if table_name not in self._tables:
             available = ", ".join(sorted(self._tables.keys())) or "<none>"
             raise KeyError(f"Local table '{table_name}' not found in pond context. Available: {available}")
 
         tdef = self._tables[table_name]
 
-        # Ensure we have an ibis expression to build transformations
         if tdef.expr is None:
-            # If schema known, create placeholder; else cannot proceed
             if tdef.schema is None:
                 raise RuntimeError(
                     f"Table '{table_name}' has no expression and unknown schema; cannot build ibis expression."
                 )
-            tdef.expr = _ibis_placeholder_table(name=f"{self.name}.{table_name}", schema=tdef.schema)
+            tdef.expr = _ibis_placeholder_table(self.name, table_name, tdef.schema)
 
-        # Validate input cols if we have schema
         schema = tdef.schema or _expr_schema(tdef.expr)
         if schema is not None:
             missing = sorted({src_col for src_col in mapping.values()} - set(schema.keys()))
@@ -382,16 +314,9 @@ class Pond:
         return _select_and_alias(tdef.expr, mapping)
 
     def sink(self, tables: Mapping[str, Any], *, description: Optional[str] = None) -> None:
-        """
-        Exported materializations (public surface of the pond contract).
-        sink() only registers tables in the pond context; it does not execute.
-        """
         self._register_tables(tables=tables, exported=True, description=description)
 
     def sink_private(self, tables: Mapping[str, Any], *, description: Optional[str] = None) -> None:
-        """
-        Internal materializations (not part of exported contract surface).
-        """
         self._register_tables(tables=tables, exported=False, description=description)
 
     def _register_tables(self, tables: Mapping[str, Any], exported: bool, description: Optional[str]) -> None:
@@ -411,26 +336,12 @@ class Pond:
             )
             self._pending_outputs.append(name)
 
-    # -------- Build (manifest + preflight) --------
-
-    def build(self, basin: Optional[Basin] = None) -> PondManifest:
-        """
-        Finalize and return a manifest for this pond.
-
-        If a basin is supplied (or was attached), upstream contracts are resolved and
-        preflight checks are enabled for upstream.get() calls.
-
-        Notes:
-          - build() does not execute transformations.
-          - if there are pending outputs not yet captured by a stage boundary, build()
-            will create an implicit final stage.
-        """
-        if basin is not None:
-            self.attach_basin(basin)
-        elif self._basin is not None:
+    def build(self, resolver: Optional[ContractResolver] = None) -> PondManifest:
+        if resolver is not None:
+            self.attach_resolver(resolver)
+        elif self._resolver is not None:
             self._resolve_upstream_contracts()
 
-        # Create implicit final stage if the user forgot to call pond.flow() after last sinks
         if self._pending_outputs:
             self.flow(notes="implicit final stage")
 
@@ -456,14 +367,591 @@ class Pond:
         )
 
     def _resolve_upstream_contracts(self) -> None:
-        """
-        Resolve upstream contracts via attached basin.
-        """
-        if self._basin is None:
+        if self._resolver is None:
             return
 
         for pond_name, constraint in self._sources.items():
             if pond_name in self._resolved_contracts:
                 continue
-            contract = self._basin.resolve_contract(pond_name, constraint)
+            contract = self._resolver.resolve_contract(pond_name, constraint)
             self._resolved_contracts[pond_name] = contract
+
+
+# ----------------------------
+# Compute: Species and Duck
+# ----------------------------
+
+@dataclass(frozen=True)
+class Species:
+    kind: str = "local"
+    engine: str = "duckdb"
+    options: Dict[str, Any] = field(default_factory=dict)
+
+    def validate(self) -> None:
+        if self.kind != "local":
+            raise ValueError(f"Only Species(kind='local') is supported for now. Got: {self.kind!r}")
+        if self.engine != "duckdb":
+            raise ValueError(f"Only Species(engine='duckdb') is supported for now. Got: {self.engine!r}")
+
+
+@dataclass
+class Duck:
+    species: Species
+    duckdb_path: Path
+
+    def validate(self) -> None:
+        self.species.validate()
+        if not self.duckdb_path:
+            raise ValueError("Duck.duckdb_path must be set")
+
+    def connect_duckdb(self):
+        if not _HAVE_DUCKDB:
+            raise RuntimeError("duckdb is required for local execution. Install 'duckdb'.")
+        return duckdb.connect(str(self.duckdb_path))
+
+    def connect_ibis(self):
+        if not _HAVE_IBIS:
+            raise RuntimeError("ibis is required for execution planning/compilation. Install 'ibis-framework'.")
+        return ibis.duckdb.connect(database=str(self.duckdb_path))
+
+
+# ----------------------------
+# State store (SQLite default)
+# ----------------------------
+
+class SQLiteStateStore:
+    def __init__(self, path: Path):
+        self.path = path
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._init_db()
+
+    def _connect(self) -> sqlite3.Connection:
+        con = sqlite3.connect(str(self.path), timeout=30)
+        con.execute("PRAGMA journal_mode=WAL;")
+        con.execute("PRAGMA synchronous=NORMAL;")
+        con.execute("PRAGMA foreign_keys=ON;")
+        return con
+
+    def _init_db(self) -> None:
+        con = self._connect()
+        try:
+            con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS locks (
+                    node_id TEXT PRIMARY KEY,
+                    holder  TEXT NOT NULL,
+                    acquired_at REAL NOT NULL,
+                    expires_at REAL NOT NULL
+                )
+                """
+            )
+            con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS pond_success (
+                    pond_name TEXT PRIMARY KEY,
+                    last_success_at REAL NOT NULL
+                )
+                """
+            )
+            con.execute(
+                """
+                CREATE TABLE IF NOT EXISTS table_success (
+                    pond_name TEXT NOT NULL,
+                    table_name TEXT NOT NULL,
+                    last_success_at REAL NOT NULL,
+                    PRIMARY KEY (pond_name, table_name)
+                )
+                """
+            )
+            con.commit()
+        finally:
+            con.close()
+
+    def acquire_lock(self, *, node_id: str, holder: str, ttl_secs: int) -> bool:
+        import time
+
+        now = float(time.time())
+        expires = now + float(ttl_secs)
+
+        con = self._connect()
+        try:
+            con.execute("BEGIN IMMEDIATE;")
+            row = con.execute(
+                "SELECT holder, expires_at FROM locks WHERE node_id = ?",
+                (node_id,),
+            ).fetchone()
+
+            if row is None:
+                con.execute(
+                    "INSERT INTO locks(node_id, holder, acquired_at, expires_at) VALUES (?, ?, ?, ?)",
+                    (node_id, holder, now, expires),
+                )
+                con.commit()
+                return True
+
+            _, current_expires = row
+            if float(current_expires) <= now:
+                con.execute(
+                    "UPDATE locks SET holder = ?, acquired_at = ?, expires_at = ? WHERE node_id = ?",
+                    (holder, now, expires, node_id),
+                )
+                con.commit()
+                return True
+
+            con.rollback()
+            return False
+        finally:
+            con.close()
+
+    def release_lock(self, *, node_id: str, holder: str) -> None:
+        con = self._connect()
+        try:
+            con.execute("DELETE FROM locks WHERE node_id = ? AND holder = ?", (node_id, holder))
+            con.commit()
+        finally:
+            con.close()
+
+    def set_pond_success(self, *, pond_name: str, ts: float) -> None:
+        con = self._connect()
+        try:
+            con.execute(
+                """
+                INSERT INTO pond_success(pond_name, last_success_at)
+                VALUES (?, ?)
+                ON CONFLICT(pond_name) DO UPDATE SET last_success_at=excluded.last_success_at
+                """,
+                (pond_name, ts),
+            )
+            con.commit()
+        finally:
+            con.close()
+
+    def set_table_success(self, *, pond_name: str, table_name: str, ts: float) -> None:
+        con = self._connect()
+        try:
+            con.execute(
+                """
+                INSERT INTO table_success(pond_name, table_name, last_success_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(pond_name, table_name) DO UPDATE SET last_success_at=excluded.last_success_at
+                """,
+                (pond_name, table_name, ts),
+            )
+            con.commit()
+        finally:
+            con.close()
+
+
+# ----------------------------
+# Catchment and Basin (v1: local + pulse)
+# ----------------------------
+
+@dataclass(frozen=True)
+class PulsePlan:
+    ponds_topo: Tuple[str, ...]
+    outlets: Dict[str, str]
+    manifests: Dict[str, PondManifest]
+
+
+class Catchment:
+    SPEC_VERSION = 1
+    DEFAULT_MANIFEST_NAME = "duckstring.manifest.json"
+    DEFAULT_POND_ENTRYPOINT = "pond.py"
+    DEFAULT_POND_FACTORY_NAME = "pond"
+
+    def __init__(self, *, root_dir: str = "catchment"):
+        self.root_dir = root_dir
+        self.ponds: Dict[str, str] = {}
+
+        self.species: Dict[str, Species] = {}
+        self.default_species: Optional[str] = None
+        self.pond_species: Dict[str, str] = {}
+
+        self.modes: Dict[str, Dict[str, Any]] = {"pulse": {"type": "pulse"}}
+
+        self._loaded_from: Optional[str] = None
+        self._state: Optional[SQLiteStateStore] = None
+
+    @property
+    def state(self) -> SQLiteStateStore:
+        if self._state is None:
+            state_path = Path(self.root_dir) / "state" / "duckstring_state.sqlite"
+            self._state = SQLiteStateStore(state_path)
+        return self._state
+
+    @staticmethod
+    def load(path: str | os.PathLike[str]) -> "Catchment":
+        p = Path(path)
+        data = json.loads(p.read_text(encoding="utf-8"))
+        c = Catchment.from_dict(data)
+        c._loaded_from = str(p)
+        return c
+
+    def save(self, path: Optional[str | os.PathLike[str]] = None) -> None:
+        out = Path(path) if path is not None else (Path(self._loaded_from) if self._loaded_from else None)
+        if out is None:
+            raise ValueError("No save path provided and Catchment was not loaded from a file.")
+        out.write_text(json.dumps(self.to_dict(), indent=2, sort_keys=True), encoding="utf-8")
+        self._loaded_from = str(out)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "spec_version": self.SPEC_VERSION,
+            "root_dir": self.root_dir,
+            "ponds": dict(self.ponds),
+            "species": {k: asdict(v) for k, v in self.species.items()},
+            "default_species": self.default_species,
+            "pond_species": dict(self.pond_species),
+            "modes": dict(self.modes),
+        }
+
+    @staticmethod
+    def from_dict(d: Mapping[str, Any]) -> "Catchment":
+        spec_version = int(d.get("spec_version", 1))
+        if spec_version != Catchment.SPEC_VERSION:
+            raise ValueError(f"Unsupported catchment spec_version={spec_version}. Expected {Catchment.SPEC_VERSION}.")
+
+        c = Catchment(root_dir=str(d.get("root_dir", "catchment")))
+        c.ponds = dict(d.get("ponds", {}))
+        c.species = {k: Species(**v) for k, v in dict(d.get("species", {})).items()}
+        c.default_species = d.get("default_species")
+        c.pond_species = dict(d.get("pond_species", {}))
+        c.modes = dict(d.get("modes", {"pulse": {"type": "pulse"}}))
+        return c
+
+    def set_root_dir(self, root_dir: str) -> None:
+        self.root_dir = root_dir
+
+    def load_ponds(self, ponds_json_path: str | os.PathLike[str], *, overwrite: bool = False) -> None:
+        p = Path(ponds_json_path)
+        ponds = json.loads(p.read_text(encoding="utf-8"))
+        if not isinstance(ponds, dict):
+            raise ValueError("ponds.json must be a JSON object mapping pond_name -> local_path")
+        for name, path in ponds.items():
+            if not isinstance(name, str) or not isinstance(path, str):
+                raise ValueError("ponds.json keys/values must be strings")
+            if not overwrite and name in self.ponds and self.ponds[name] != path:
+                raise ValueError(f"Conflict while loading ponds: {name!r} already set to a different path.")
+            self.ponds[name] = path
+
+    def set_species(self, species: Mapping[str, Species], *, overwrite: bool = False) -> None:
+        for name, sp in species.items():
+            if name in self.species and not overwrite and self.species[name] != sp:
+                raise ValueError(f"Conflict while setting species: {name!r} already exists with a different value.")
+            sp.validate()
+            self.species[name] = sp
+
+    def set_default_species(self, name: str) -> None:
+        if name not in self.species:
+            raise KeyError(f"Unknown species {name!r}. Available: {', '.join(sorted(self.species.keys()))}")
+        self.default_species = name
+
+    def set_pond_species(self, mapping: Mapping[str, str], *, overwrite: bool = False) -> None:
+        for pond_name, sp_name in mapping.items():
+            if sp_name not in self.species:
+                raise KeyError(f"Unknown species {sp_name!r} for pond {pond_name!r}")
+            if not overwrite and pond_name in self.pond_species and self.pond_species[pond_name] != sp_name:
+                raise ValueError(f"Conflict: pond {pond_name!r} already assigned to a different species.")
+            self.pond_species[pond_name] = sp_name
+
+    def set_modes(self, modes: Mapping[str, Mapping[str, Any]], *, overwrite: bool = False) -> None:
+        for name, spec in modes.items():
+            spec = dict(spec or {})
+            t = str(spec.get("type", "pulse"))
+            if t != "pulse":
+                raise ValueError(f"Only mode type='pulse' is supported for now. Got: {t!r}")
+            if name in self.modes and not overwrite and self.modes[name] != spec:
+                raise ValueError(f"Conflict while setting modes: {name!r} already exists with a different value.")
+            self.modes[name] = spec
+
+    def basin(
+        self,
+        *,
+        outlets: Mapping[str, str],
+        mode: str = "pulse",
+        pond_species: Optional[Mapping[str, str]] = None,
+        name: Optional[str] = None,
+    ) -> "Basin":
+        return Basin(
+            catchment=self,
+            outlets=dict(outlets),
+            mode=mode,
+            pond_species=dict(pond_species or {}),
+            name=name,
+        )
+
+    def validate(self) -> None:
+        if not self.ponds:
+            warnings.warn("Catchment has an empty pond catalog.", RuntimeWarning, stacklevel=2)
+
+        for sp in self.species.values():
+            sp.validate()
+
+        if self.default_species is None:
+            raise ValueError("Catchment.default_species is not set. Call set_default_species(...).")
+
+        if self.default_species not in self.species:
+            raise ValueError(f"default_species {self.default_species!r} is not present in species registry.")
+
+        for name, spec in self.modes.items():
+            t = str(dict(spec).get("type", "pulse"))
+            if t != "pulse":
+                raise ValueError(f"Only mode type='pulse' is supported for now. Got: {t!r} (mode {name!r})")
+
+
+class Basin(ContractResolver):
+    def __init__(
+        self,
+        *,
+        catchment: Catchment,
+        outlets: Dict[str, str],
+        mode: str = "pulse",
+        pond_species: Optional[Dict[str, str]] = None,
+        name: Optional[str] = None,
+    ):
+        self.catchment = catchment
+        self.name = name
+        self.outlets = outlets
+        self.mode = mode
+        self.pond_species = pond_species or {}
+
+        self._resolved: bool = False
+        self._manifests: Dict[str, PondManifest] = {}
+        self._contracts: Dict[str, PondContract] = {}
+        self._edges: Dict[str, Set[str]] = {}
+        self._topo: List[str] = []
+        self._constraints: Dict[str, str] = {}
+
+    def resolve_contract(self, pond_name: str, constraint: str) -> PondContract:
+        self.resolve()
+        if pond_name not in self._contracts:
+            raise KeyError(f"No contract resolved for pond {pond_name!r}. Is it in the dependency graph?")
+        expected = self._constraints.get(pond_name)
+        if expected is not None and expected != constraint:
+            raise ValueError(
+                f"Constraint mismatch for pond {pond_name!r}: basin expected {expected!r}, got {constraint!r}"
+            )
+        return self._contracts[pond_name]
+
+    def resolve(self) -> None:
+        if self._resolved:
+            return
+
+        self.catchment.validate()
+
+        if self.mode not in self.catchment.modes:
+            raise KeyError(
+                f"Unknown mode {self.mode!r}. Available: {', '.join(sorted(self.catchment.modes.keys()))}"
+            )
+        if str(self.catchment.modes[self.mode].get("type", "pulse")) != "pulse":
+            raise ValueError("v1 only supports pulse mode.")
+
+        for pond_name in self.outlets.keys():
+            if pond_name not in self.catchment.ponds:
+                raise KeyError(f"Outlet pond {pond_name!r} is not present in catchment pond catalog.")
+
+        def read_manifest(pond_name: str) -> PondManifest:
+            if pond_name in self._manifests:
+                return self._manifests[pond_name]
+
+            repo = Path(self.catchment.ponds[pond_name])
+            mf_path = repo / self.catchment.DEFAULT_MANIFEST_NAME
+            if not mf_path.exists():
+                raise FileNotFoundError(
+                    f"Missing manifest for pond {pond_name!r}: {mf_path}. "
+                    f"Generate it in the pond repo (pond.build() -> duckstring.manifest.json)."
+                )
+            data = json.loads(mf_path.read_text(encoding="utf-8"))
+            mf = PondManifest.from_dict(data)
+
+            self._manifests[pond_name] = mf
+            self._edges[pond_name] = set(mf.sources.keys())
+
+            contract = PondContract(
+                name=mf.name,
+                version=mf.version,
+                description=mf.description,
+                tables=dict(mf.exported_tables),
+            )
+            self._contracts[pond_name] = contract
+
+            return mf
+
+        def require_version(pond_name: str, constraint: str) -> None:
+            prev = self._constraints.get(pond_name)
+            if prev is not None and prev != constraint:
+                raise ValueError(
+                    f"Constraint conflict for pond {pond_name!r}: previously {prev!r}, now {constraint!r}"
+                )
+            self._constraints[pond_name] = constraint
+
+        def visit(pond_name: str, constraint: str) -> None:
+            require_version(pond_name, constraint)
+            mf = read_manifest(pond_name)
+
+            if mf.version != constraint:
+                raise ValueError(
+                    f"Pond {pond_name!r} manifest version {mf.version!r} does not match required {constraint!r}. "
+                    "v1 requires exact versions; ensure the local repo is checked out at the correct version."
+                )
+
+            for up_name, up_constraint in mf.sources.items():
+                if up_name not in self.catchment.ponds:
+                    raise KeyError(
+                        f"Pond {pond_name!r} depends on {up_name!r}, but it is not in the catchment pond catalog."
+                    )
+                visit(up_name, up_constraint)
+
+        for out_name, out_constraint in self.outlets.items():
+            visit(out_name, out_constraint)
+
+        reachable = set(self._constraints.keys())
+        edges_sub = {k: {u for u in v if u in reachable} for k, v in self._edges.items() if k in reachable}
+        self._topo = _toposort(edges_sub)
+
+        self._resolved = True
+
+    def plan(self) -> PulsePlan:
+        self.resolve()
+        return PulsePlan(
+            ponds_topo=tuple(self._topo),
+            outlets=dict(self.outlets),
+            manifests=dict(self._manifests),
+        )
+
+    def pulse(self) -> PulsePlan:
+        self.resolve()
+
+        if not _HAVE_DUCKDB:
+            raise RuntimeError("duckdb is required for Basin.pulse(). Install 'duckdb'.")
+        if not _HAVE_IBIS:
+            raise RuntimeError("ibis is required for Basin.pulse(). Install 'ibis-framework'.")
+
+        root = Path(self.catchment.root_dir)
+        (root / "data").mkdir(parents=True, exist_ok=True)
+        (root / "state").mkdir(parents=True, exist_ok=True)
+
+        run_id = f"pulse:{self.name or 'basin'}:{os.getpid()}"
+
+        duckdb_path = root / "state" / "duckstring.duckdb"
+
+        sp_name = self.catchment.default_species
+        if sp_name is None:
+            raise ValueError("Catchment.default_species not set.")
+        sp = self.catchment.species[sp_name]
+        duck = Duck(species=sp, duckdb_path=duckdb_path)
+        duck.validate()
+
+        con = duck.connect_duckdb()
+
+        # Prefer a single shared DuckDB session for both raw SQL and Ibis execution.
+        # This avoids issues where compiled SQL references temporary in-memory tables
+        # (e.g. ibis.memtable) that only exist inside the Ibis session.
+        ibis_con = None
+        if _HAVE_IBIS:
+            try:
+                backend_cls = getattr(getattr(getattr(ibis, "backends", None), "duckdb", None), "Backend", None)
+                if backend_cls is not None and hasattr(backend_cls, "from_connection"):
+                    ibis_con = backend_cls.from_connection(con)
+            except Exception:
+                ibis_con = None
+        if ibis_con is None:
+            ibis_con = duck.connect_ibis()
+
+        try:
+            for pond_name in self._topo:
+                if not self.catchment.state.acquire_lock(node_id=f"pond:{pond_name}", holder=run_id, ttl_secs=3600):
+                    raise RuntimeError(f"Could not acquire lock for pond {pond_name!r}. Another run may be active.")
+
+                try:
+                    pond_obj = self._load_pond_object(pond_name)
+                    _ = pond_obj.build(self)
+
+                    for stage in pond_obj._stages:
+                        for table_name in stage.outputs:
+                            tdef = pond_obj._tables.get(table_name)
+                            if tdef is None or tdef.expr is None:
+                                raise RuntimeError(
+                                    f"Pond {pond_name!r} did not register an expression for table {table_name!r}."
+                                )
+
+                            sql = ibis_con.compile(tdef.expr)
+
+                            physical = _physical_table_name(pond_name, table_name)
+
+                            # Use the backend to materialize: this ensures in-memory sources
+                            # like ibis.memtable are registered correctly before execution.
+                            if hasattr(ibis_con, "create_table"):
+                                ibis_con.create_table(physical, obj=tdef.expr, overwrite=True)
+                            else:  # pragma: no cover
+                                sql = ibis_con.compile(tdef.expr)
+                                con.execute(f'CREATE OR REPLACE TABLE "{physical}" AS {sql}')
+
+                            con.execute(f'CREATE SCHEMA IF NOT EXISTS "{pond_name}"')
+                            con.execute(
+                                f'CREATE OR REPLACE VIEW "{pond_name}"."{table_name}" AS SELECT * FROM "{physical}"'
+                            )
+
+                            out_dir = root / "data" / pond_name
+                            out_dir.mkdir(parents=True, exist_ok=True)
+                            out_path = out_dir / f"{table_name}.parquet"
+                            if out_path.exists():
+                                out_path.unlink()
+                            con.execute(
+                                f"COPY (SELECT * FROM \"{physical}\") TO '{out_path.as_posix()}' (FORMAT PARQUET)"
+                            )
+
+                            import time
+
+                            ts = float(time.time())
+                            self.catchment.state.set_table_success(pond_name=pond_name, table_name=table_name, ts=ts)
+
+                    import time
+
+                    ts = float(time.time())
+                    self.catchment.state.set_pond_success(pond_name=pond_name, ts=ts)
+
+                finally:
+                    self.catchment.state.release_lock(node_id=f"pond:{pond_name}", holder=run_id)
+
+        finally:
+            con.close()
+
+        return self.plan()
+
+    def _load_pond_object(self, pond_name: str) -> Pond:
+        repo = Path(self.catchment.ponds[pond_name])
+        entry = repo / self.catchment.DEFAULT_POND_ENTRYPOINT
+        if not entry.exists():
+            raise FileNotFoundError(
+                f"Missing pond entrypoint for {pond_name!r}: expected {entry} with function "
+                f"{self.catchment.DEFAULT_POND_FACTORY_NAME}()."
+            )
+
+        module_name = f"duckstring_pond_{pond_name}"
+        mod = _load_module_from_file(module_name, entry)
+
+        factory_name = self.catchment.DEFAULT_POND_FACTORY_NAME
+        if not hasattr(mod, factory_name):
+            raise AttributeError(f"Entrypoint {entry} does not define function {factory_name}().")
+        factory = getattr(mod, factory_name)
+        if not callable(factory):
+            raise TypeError(f"{factory_name} in {entry} is not callable.")
+
+        try:
+            pond_obj = factory(resolver=self)
+        except TypeError:
+            try:
+                pond_obj = factory(basin=self)
+            except TypeError:
+                pond_obj = factory()
+                if hasattr(pond_obj, "attach_resolver"):
+                    pond_obj.attach_resolver(self)
+                warnings.warn(
+                    f"Pond factory for {pond_name!r} did not accept resolver=...; "
+                    f"attached resolver after construction. Upstream preflight checks may be skipped.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+
+        return pond_obj

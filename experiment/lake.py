@@ -1,4 +1,5 @@
-from duckstring import Basin, Duck, Catchment
+from duckstring import Basin, Catchment, Duck
+
 
 # Duck Types
 def duck_local():

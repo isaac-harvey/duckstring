@@ -51,8 +51,9 @@ package-dir = { "" = "src" }
 where = ["src"]
 
 [tool.ruff]
-line-length = 88
+line-length = 128
 target-version = "py310"
+extend-exclude = ["experiment"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B"]
