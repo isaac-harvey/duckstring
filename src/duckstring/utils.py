@@ -134,6 +134,16 @@ def parse_semver_major(version: str) -> int:
         raise ValueError(f"Invalid version string: {version!r}") from exc
 
 
+def parse_semver(version: str) -> Tuple[int, int, int]:
+    parts = version.split(".")
+    if len(parts) != 3:
+        raise ValueError(f"Invalid version string: {version!r}")
+    try:
+        return int(parts[0]), int(parts[1]), int(parts[2])
+    except Exception as exc:  # pragma: no cover
+        raise ValueError(f"Invalid version string: {version!r}") from exc
+
+
 def split_pond_ref(pond_ref: str) -> Tuple[str, Optional[str]]:
     if "@" not in pond_ref:
         if not pond_ref:

@@ -262,6 +262,106 @@ def test_basin_constraint_conflict_raises(tmp_path: Path):
         b.resolve()
 
 
+def test_basin_resolve_upgrades_dependency_to_prior_major_max(tmp_path: Path):
+    base_v1 = tmp_path / "base_v1"
+    base_v2 = tmp_path / "base_v2"
+    derived_repo = tmp_path / "derived_repo"
+    base_v1.mkdir()
+    base_v2.mkdir()
+    derived_repo.mkdir()
+
+    _write_manifest(
+        base_v1,
+        _manifest_dict(
+            name="base",
+            version="0.1.0",
+            sources={},
+            exported_tables={},
+            stages=[],
+        ),
+    )
+
+    _write_manifest(
+        base_v2,
+        _manifest_dict(
+            name="base",
+            version="0.2.0",
+            sources={},
+            exported_tables={},
+            stages=[],
+        ),
+    )
+
+    _write_manifest(
+        derived_repo,
+        _manifest_dict(
+            name="derived",
+            version="1.0.0",
+            sources={"base": "0.1.0"},
+            exported_tables={},
+            stages=[],
+        ),
+    )
+
+    c = Catchment(root_dir=str(tmp_path / "catchment_root"))
+    c.ponds = {
+        "base": {"0.1.0": str(base_v1), "0.2.0": str(base_v2)},
+        "derived": {"1.0.0": str(derived_repo)},
+    }
+    c.set_species({"local": Species()})
+    c.set_default_species("local")
+
+    c.state.set_pond_version(pond_name="base", version="0.2.0", ts=1.0)
+
+    b = c.basin(outlets={"derived": "1.0.0"})
+    b.resolve(auto_upgrade=True)
+
+    assert b._constraints["base"] == "0.2.0"
+
+
+def test_basin_resolve_keeps_outlet_pinned(tmp_path: Path):
+    base_v1 = tmp_path / "base_v1"
+    base_v2 = tmp_path / "base_v2"
+    base_v1.mkdir()
+    base_v2.mkdir()
+
+    _write_manifest(
+        base_v1,
+        _manifest_dict(
+            name="base",
+            version="0.1.0",
+            sources={},
+            exported_tables={},
+            stages=[],
+        ),
+    )
+
+    _write_manifest(
+        base_v2,
+        _manifest_dict(
+            name="base",
+            version="0.2.0",
+            sources={},
+            exported_tables={},
+            stages=[],
+        ),
+    )
+
+    c = Catchment(root_dir=str(tmp_path / "catchment_root"))
+    c.ponds = {
+        "base": {"0.1.0": str(base_v1), "0.2.0": str(base_v2)},
+    }
+    c.set_species({"local": Species()})
+    c.set_default_species("local")
+
+    c.state.set_pond_version(pond_name="base", version="0.2.0", ts=1.0)
+
+    b = c.basin(outlets={"base": "0.1.0"})
+    b.resolve(auto_upgrade=True)
+
+    assert b._constraints["base"] == "0.1.0"
+
+
 @pytest.mark.skipif(not (ds_utils._HAVE_IBIS and ds_utils._HAVE_DUCKDB), reason="ibis/duckdb not installed")
 def test_basin_pulse_materializes_duckdb_and_parquet(tmp_path: Path):
     # Create two pond repos with pond.py + manifests:

@@ -38,6 +38,9 @@ from .utils import (
     load_module_from_file as _load_module_from_file,
 )
 from .utils import (
+    parse_semver as _parse_semver,
+)
+from .utils import (
     parse_semver_major as _parse_semver_major,
 )
 from .utils import (
@@ -465,6 +468,17 @@ class SQLiteStateStore:
             )
             con.execute(
                 """
+                CREATE TABLE IF NOT EXISTS pond_versions (
+                    pond_name TEXT NOT NULL,
+                    major INTEGER NOT NULL,
+                    version TEXT NOT NULL,
+                    updated_at REAL NOT NULL,
+                    PRIMARY KEY (pond_name, major)
+                )
+                """
+            )
+            con.execute(
+                """
                 CREATE TABLE IF NOT EXISTS table_success (
                     pond_name TEXT NOT NULL,
                     table_name TEXT NOT NULL,
@@ -479,6 +493,24 @@ class SQLiteStateStore:
 
     def acquire_lock(self, *, node_id: str, holder: str, ttl_secs: int) -> bool:
         import time
+
+        def _format_duration(seconds: float) -> str:
+            if seconds < 1.0:
+                value = seconds * 1000.0
+                unit = "ms"
+            elif seconds < 60.0:
+                value = seconds
+                unit = "s"
+            elif seconds < 3600.0:
+                value = seconds / 60.0
+                unit = "min"
+            elif seconds < 86400.0:
+                value = seconds / 3600.0
+                unit = "h"
+            else:
+                value = seconds / 86400.0
+                unit = "d"
+            return f"{value:.3g}{unit}"
 
         now = float(time.time())
         expires = now + float(ttl_secs)
@@ -533,6 +565,55 @@ class SQLiteStateStore:
                 (pond_name, ts),
             )
             con.commit()
+        finally:
+            con.close()
+
+    def get_pond_version(self, *, pond_name: str, major: int) -> Optional[str]:
+        con = self._connect()
+        try:
+            row = con.execute(
+                "SELECT version FROM pond_versions WHERE pond_name = ? AND major = ?",
+                (pond_name, int(major)),
+            ).fetchone()
+            if row is None:
+                return None
+            return str(row[0])
+        finally:
+            con.close()
+
+    def set_pond_version(self, *, pond_name: str, version: str, ts: float) -> None:
+        major = _parse_semver_major(version)
+        con = self._connect()
+        try:
+            con.execute("BEGIN IMMEDIATE;")
+            row = con.execute(
+                "SELECT version FROM pond_versions WHERE pond_name = ? AND major = ?",
+                (pond_name, int(major)),
+            ).fetchone()
+            if row is None:
+                con.execute(
+                    """
+                    INSERT INTO pond_versions(pond_name, major, version, updated_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (pond_name, int(major), version, ts),
+                )
+                con.commit()
+                return
+
+            existing = str(row[0])
+            if _parse_semver(version) >= _parse_semver(existing):
+                con.execute(
+                    """
+                    UPDATE pond_versions
+                    SET version = ?, updated_at = ?
+                    WHERE pond_name = ? AND major = ?
+                    """,
+                    (version, ts, pond_name, int(major)),
+                )
+                con.commit()
+            else:
+                con.rollback()
         finally:
             con.close()
 
@@ -903,6 +984,7 @@ class Basin(ContractResolver):
         self._edges: Dict[str, Set[str]] = {}
         self._topo: List[str] = []
         self._constraints: Dict[str, str] = {}
+        self._pinned: Set[str] = set()
 
     def _reset_resolution(self) -> None:
         self._resolved = False
@@ -911,6 +993,7 @@ class Basin(ContractResolver):
         self._edges.clear()
         self._topo.clear()
         self._constraints.clear()
+        self._pinned.clear()
 
     def set_catchment(self, catchment: Catchment) -> None:
         self.catchment = catchment
@@ -1032,18 +1115,22 @@ class Basin(ContractResolver):
             raise ValueError("No save path provided and Basin was not loaded from a file.")
         out.write_text(json.dumps(self.to_dict(), indent=2, sort_keys=True), encoding="utf-8")
         self._loaded_from = str(out)
+
     def resolve_contract(self, pond_name: str, constraint: str) -> PondContract:
-        self.resolve()
+        self.resolve(auto_upgrade=True)
         if pond_name not in self._contracts:
             raise KeyError(f"No contract resolved for pond {pond_name!r}. Is it in the dependency graph?")
         expected = self._constraints.get(pond_name)
         if expected is not None and expected != constraint:
-            raise ValueError(
-                f"Constraint mismatch for pond {pond_name!r}: basin expected {expected!r}, got {constraint!r}"
-            )
+            expected_semver = _parse_semver(expected)
+            constraint_semver = _parse_semver(constraint)
+            if expected_semver[0] != constraint_semver[0] or expected_semver < constraint_semver:
+                raise ValueError(
+                    f"Constraint mismatch for pond {pond_name!r}: basin expected {expected!r}, got {constraint!r}"
+                )
         return self._contracts[pond_name]
 
-    def resolve(self) -> None:
+    def resolve(self, *, auto_upgrade: bool = True) -> None:
         if self._resolved:
             return
 
@@ -1092,21 +1179,75 @@ class Basin(ContractResolver):
 
             return mf
 
-        def require_version(pond_name: str, constraint: str) -> None:
+        def resolve_dependency_version(pond_name: str, constraint: str) -> str:
+            if not auto_upgrade:
+                return constraint
+            required_semver = _parse_semver(constraint)
+            major = required_semver[0]
+            prev = catchment.state.get_pond_version(pond_name=pond_name, major=major)
+            if prev is None:
+                return constraint
+
+            prev_semver = _parse_semver(prev)
+            if prev_semver[0] != major:
+                return constraint
+
+            if prev_semver >= required_semver:
+                try:
+                    _ = catchment.get_pond_path(pond_name, prev)
+                except Exception as exc:
+                    raise FileNotFoundError(
+                        f"Previously executed version {prev!r} for pond {pond_name!r} "
+                        f"(major {major}) is not available in the catchment catalog."
+                    ) from exc
+                return prev
+
+            return constraint
+
+        def require_version(pond_name: str, constraint: str, *, pinned: bool) -> str:
             prev = self._constraints.get(pond_name)
-            if prev is not None and prev != constraint:
+            if pinned:
+                if prev is not None and prev != constraint:
+                    raise ValueError(
+                        f"Constraint conflict for pond {pond_name!r}: previously {prev!r}, now {constraint!r}"
+                    )
+                self._constraints[pond_name] = constraint
+                self._pinned.add(pond_name)
+                return constraint
+
+            resolved = resolve_dependency_version(pond_name, constraint)
+            if prev is None:
+                self._constraints[pond_name] = resolved
+                return resolved
+
+            if pond_name in self._pinned:
+                if prev != resolved:
+                    raise ValueError(
+                        f"Constraint conflict for pond {pond_name!r}: pinned to {prev!r}, got {resolved!r}"
+                    )
+                return prev
+
+            prev_semver = _parse_semver(prev)
+            resolved_semver = _parse_semver(resolved)
+            if prev_semver[0] != resolved_semver[0]:
                 raise ValueError(
-                    f"Constraint conflict for pond {pond_name!r}: previously {prev!r}, now {constraint!r}"
+                    f"Constraint conflict for pond {pond_name!r}: {prev!r} vs {resolved!r} (different majors)"
                 )
-            self._constraints[pond_name] = constraint
 
-        def visit(pond_name: str, constraint: str) -> None:
-            require_version(pond_name, constraint)
-            mf = read_manifest(pond_name, constraint)
+            if resolved_semver > prev_semver:
+                self._constraints[pond_name] = resolved
+                return resolved
 
-            if mf.version != constraint:
+            return prev
+
+        def visit(pond_name: str, constraint: str, *, pinned: bool) -> None:
+            resolved_constraint = require_version(pond_name, constraint, pinned=pinned)
+            mf = read_manifest(pond_name, resolved_constraint)
+
+            if mf.version != resolved_constraint:
                 raise ValueError(
-                    f"Pond {pond_name!r} manifest version {mf.version!r} does not match required {constraint!r}. "
+                    f"Pond {pond_name!r} manifest version {mf.version!r} does not match required "
+                    f"{resolved_constraint!r}. "
                     "v1 requires exact versions; ensure the local repo is checked out at the correct version."
                 )
 
@@ -1115,10 +1256,10 @@ class Basin(ContractResolver):
                     raise KeyError(
                         f"Pond {pond_name!r} depends on {up_name!r}, but it is not in the catchment pond catalog."
                     )
-                visit(up_name, up_constraint)
+                visit(up_name, up_constraint, pinned=False)
 
         for out_name, out_constraint in self.outlets.items():
-            visit(out_name, out_constraint)
+            visit(out_name, out_constraint, pinned=True)
 
         reachable = set(self._constraints.keys())
         edges_sub = {k: {u for u in v if u in reachable} for k, v in self._edges.items() if k in reachable}
@@ -1126,9 +1267,9 @@ class Basin(ContractResolver):
 
         self._resolved = True
 
-    def hydrate(self) -> None:
+    def hydrate(self, *, auto_upgrade: bool = False) -> None:
         catchment = self._ensure_catchment()
-        self.resolve()
+        self.resolve(auto_upgrade=auto_upgrade)
         self._ensure_ducks()
 
         root = Path(catchment.root_dir)
@@ -1180,18 +1321,44 @@ class Basin(ContractResolver):
         if not hydrated:
             raise RuntimeError("Basin is not hydrated. Run basin.hydrate() first.")
 
+        def _build_hydrated_catalog(root: Path) -> Dict[str, Dict[str, str]]:
+            ponds_root = root / "ponds"
+            if not ponds_root.exists():
+                raise RuntimeError("Basin is not hydrated. Missing root ponds directory.")
+            catalog: Dict[str, Dict[str, str]] = {}
+            for pond_dir in ponds_root.iterdir():
+                if not pond_dir.is_dir():
+                    continue
+                versions = {
+                    sub.name: str(sub.resolve())
+                    for sub in pond_dir.iterdir()
+                    if sub.is_dir()
+                }
+                if versions:
+                    catalog[pond_dir.name] = versions
+            return catalog
+
         original_ponds = catchment.ponds
-        catchment.ponds = {pond_name: info["path"] for pond_name, info in hydrated.items()}
+        root = Path(catchment.root_dir)
+        hydrated_catalog = _build_hydrated_catalog(root)
+        for pond_name, info in hydrated.items():
+            version = info.get("version")
+            if not version:
+                raise RuntimeError(f"Hydrated pond {pond_name!r} is missing a version.")
+            if pond_name not in hydrated_catalog or version not in hydrated_catalog[pond_name]:
+                raise RuntimeError(
+                    f"Hydrated pond {pond_name!r}@{version!r} not found in {root / 'ponds'}."
+                )
+        catchment.ponds = hydrated_catalog
 
         self._reset_resolution()
-        self.resolve()
+        self.resolve(auto_upgrade=True)
 
         if not _HAVE_DUCKDB:
             raise RuntimeError("duckdb is required for Basin.pulse(). Install 'duckdb'.")
         if not _HAVE_IBIS:
             raise RuntimeError("ibis is required for Basin.pulse(). Install 'ibis-framework'.")
 
-        root = Path(catchment.root_dir)
         (root / "data").mkdir(parents=True, exist_ok=True)
         (root / "state").mkdir(parents=True, exist_ok=True)
 
@@ -1224,8 +1391,39 @@ class Basin(ContractResolver):
 
         import time
 
+        def _format_duration(seconds: float) -> str:
+            if seconds < 1.0:
+                value = seconds * 1000.0
+                unit = "ms"
+            elif seconds < 60.0:
+                value = seconds
+                unit = "s"
+            elif seconds < 3600.0:
+                value = seconds / 60.0
+                unit = "min"
+            elif seconds < 86400.0:
+                value = seconds / 3600.0
+                unit = "h"
+            else:
+                value = seconds / 86400.0
+                unit = "d"
+            return f"{value:.3g}{unit}"
+
         started_at = float(time.time())
         success = False
+        pond_started_at: Dict[str, float] = {}
+        ibis_default_backend = None
+        ibis_backend_set = False
+
+        if _HAVE_IBIS:
+            try:
+                # Ensure ibis.read_parquet and similar helpers register temp views
+                # against the same DuckDB session used for materialization.
+                ibis_default_backend = ibis.options.default_backend
+                ibis.set_backend(ibis_con)
+                ibis_backend_set = True
+            except Exception:
+                ibis_backend_set = False
 
         try:
             for pond_name in self._topo:
@@ -1234,7 +1432,10 @@ class Basin(ContractResolver):
 
                 try:
                     if verbose:
-                        print(f"Running pond {pond_name}...")
+                        version = self._constraints.get(pond_name, "<unknown>")
+                        ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+                        print(f"[{ts}] {pond_name}@{version} > Started")
+                    pond_started_at[pond_name] = float(time.time())
                     pond_obj = self._load_pond_object(pond_name)
                     _ = pond_obj.build(self)
 
@@ -1279,13 +1480,30 @@ class Basin(ContractResolver):
                             catchment.state.set_table_success(pond_name=pond_name, table_name=table_name, ts=ts)
 
                     ts = float(time.time())
+                    version = self._constraints.get(pond_name)
+                    if version is None:
+                        raise RuntimeError(f"Missing version constraint for pond {pond_name!r}.")
+                    catchment.state.set_pond_version(pond_name=pond_name, version=version, ts=ts)
                     catchment.state.set_pond_success(pond_name=pond_name, ts=ts)
+                    if verbose:
+                        version = self._constraints.get(pond_name, "<unknown>")
+                        ts_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+                        elapsed = ts - pond_started_at.get(pond_name, ts)
+                        print(f"[{ts_str}] {pond_name}@{version} > Completed in {_format_duration(elapsed)}")
 
                 finally:
                     catchment.state.release_lock(node_id=f"pond:{pond_name}", holder=run_id)
 
             success = True
         finally:
+            if _HAVE_IBIS and ibis_backend_set:
+                try:
+                    if ibis_default_backend is None:
+                        ibis.options.default_backend = None
+                    else:
+                        ibis.set_backend(ibis_default_backend)
+                except Exception:
+                    pass
             con.close()
             catchment.ponds = original_ponds
 
