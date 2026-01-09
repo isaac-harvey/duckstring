@@ -347,6 +347,7 @@ def pond(resolver=None):
     c.set_default_species("local")
 
     b = c.basin(outlets={"derived": "1.0.0"}, name="pulse_test")
+    b.hydrate()
     _ = b.pulse()
 
     # parquet outputs exist

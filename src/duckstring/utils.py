@@ -4,7 +4,7 @@ import importlib.util
 import sys
 import types
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Set
+from typing import Any, Dict, List, Mapping, Optional, Set, Tuple
 
 # Optional ibis integration (recommended)
 try:
@@ -87,6 +87,62 @@ def toposort(edges: Mapping[str, Set[str]]) -> List[str]:
     if len(out) != len(nodes):
         raise ValueError("Cycle detected in pond dependency graph.")
     return out
+
+
+def layered_toposort(edges: Mapping[str, Set[str]]) -> List[List[str]]:
+    """
+    Return stages as list[list[node]] such that all nodes in a stage can run in parallel.
+    Deterministic ordering: nodes sorted within each stage.
+    """
+    nodes = set(edges.keys())
+    indeg = {n: 0 for n in nodes}
+    downstream = {n: set() for n in nodes}
+
+    for n, ups in edges.items():
+        for u in ups:
+            if u not in nodes:
+                continue
+            indeg[n] += 1
+            downstream[u].add(n)
+
+    stages: List[List[str]] = []
+    ready = sorted([n for n in nodes if indeg[n] == 0])
+
+    processed = set()
+    while ready:
+        stage = list(ready)
+        stages.append(stage)
+        ready = []
+        for n in stage:
+            processed.add(n)
+            for d in downstream.get(n, set()):
+                indeg[d] -= 1
+                if indeg[d] == 0:
+                    ready.append(d)
+        ready = sorted(ready)
+
+    if len(processed) != len(nodes):
+        raise ValueError("Cycle detected in pond dependency graph.")
+    return stages
+
+
+def parse_semver_major(version: str) -> int:
+    # semver-ish: "X.Y.Z"
+    try:
+        return int(version.split(".", 1)[0])
+    except Exception as exc:  # pragma: no cover
+        raise ValueError(f"Invalid version string: {version!r}") from exc
+
+
+def split_pond_ref(pond_ref: str) -> Tuple[str, Optional[str]]:
+    if "@" not in pond_ref:
+        if not pond_ref:
+            raise ValueError("Pond reference must be non-empty.")
+        return pond_ref, None
+    name, version = pond_ref.split("@", 1)
+    if not name or not version:
+        raise ValueError(f"Invalid pond reference: {pond_ref!r}")
+    return name, version
 
 
 def load_module_from_file(name: str, path: Path) -> types.ModuleType:
