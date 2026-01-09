@@ -1263,7 +1263,10 @@ class Basin(ContractResolver):
                                 f'CREATE OR REPLACE VIEW "{pond_name}"."{table_name}" AS SELECT * FROM "{physical}"'
                             )
 
-                            out_dir = root / "data" / pond_name
+                            version = self._constraints.get(pond_name)
+                            if not version:
+                                raise RuntimeError(f"Missing version constraint for pond {pond_name!r}.")
+                            out_dir = root / "data" / f"{pond_name}@{version}"
                             out_dir.mkdir(parents=True, exist_ok=True)
                             out_path = out_dir / f"{table_name}.parquet"
                             if out_path.exists():
