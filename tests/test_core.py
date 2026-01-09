@@ -451,8 +451,8 @@ def pond(resolver=None):
     _ = b.pulse()
 
     # parquet outputs exist
-    assert (catchment_root / "data" / "base" / "t.parquet").exists()
-    assert (catchment_root / "data" / "derived" / "out.parquet").exists()
+    assert (catchment_root / "data" / "base@1.0.0" / "t.parquet").exists()
+    assert (catchment_root / "data" / "derived@1.0.0" / "out.parquet").exists()
 
     # duckdb outputs exist and are queryable
     db_path = catchment_root / "state" / "duckstring.duckdb"
