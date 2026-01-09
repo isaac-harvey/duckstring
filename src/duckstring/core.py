@@ -32,19 +32,19 @@ from .utils import (
     ibis_placeholder_table as _ibis_placeholder_table,
 )
 from .utils import (
+    layered_toposort as _layered_toposort,
+)
+from .utils import (
     load_module_from_file as _load_module_from_file,
+)
+from .utils import (
+    parse_semver_major as _parse_semver_major,
 )
 from .utils import (
     physical_table_name as _physical_table_name,
 )
 from .utils import (
     select_and_alias as _select_and_alias,
-)
-from .utils import (
-    layered_toposort as _layered_toposort,
-)
-from .utils import (
-    parse_semver_major as _parse_semver_major,
 )
 from .utils import (
     split_pond_ref as _split_pond_ref,
@@ -1142,7 +1142,7 @@ class Basin(ContractResolver):
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copytree(src, dest)
 
-        instances = dict(self.ducks.get("instances") or {})
+        _ = dict(self.ducks.get("instances") or {})
         default_duck = self.ducks.get("default")
         pond_ducks = dict(self.ducks.get("ponds") or {})
 
