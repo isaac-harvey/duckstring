@@ -4,7 +4,10 @@ import json
 import os
 import shutil
 import sqlite3
+import time
 import warnings
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import (
@@ -55,6 +58,28 @@ from .utils import (
 from .utils import (
     toposort as _toposort,
 )
+
+# ----------------------------
+# Resolver context
+# ----------------------------
+
+_ACTIVE_RESOLVER: ContextVar[Optional["ContractResolver"]] = ContextVar(
+    "duckstring_active_resolver",
+    default=None,
+)
+
+
+def _get_active_resolver() -> Optional["ContractResolver"]:
+    return _ACTIVE_RESOLVER.get()
+
+
+@contextmanager
+def _resolver_context(resolver: Optional["ContractResolver"]):
+    token = _ACTIVE_RESOLVER.set(resolver)
+    try:
+        yield
+    finally:
+        _ACTIVE_RESOLVER.reset(token)
 
 # ----------------------------
 # Contracts / manifests
@@ -218,10 +243,21 @@ class _UpstreamPond:
     def get(self, table_name: str, mapping: Mapping[str, str]) -> Any:
         contract = self.contract
         if contract is None:
-            raise RuntimeError(
+            if not _HAVE_IBIS:
+                raise RuntimeError(
+                    f"Upstream contract for '{self.name}' is not resolved, and ibis is unavailable."
+                )
+            warnings.warn(
                 f"Upstream contract for '{self.name}' is not resolved. "
-                f"Call pond.attach_resolver(resolver) or pond.build(resolver) before upstream.get()."
+                "Using a placeholder schema for development-time access.",
+                RuntimeWarning,
+                stacklevel=2,
             )
+            fallback_cols = sorted({str(c) for c in mapping.values() if c})
+            schema = {col: "float64" for col in fallback_cols}
+            self._pond._record_upstream_select(self.name, table_name, mapping.values())
+            upstream_expr = _ibis_placeholder_table(self.name, table_name, schema)
+            return _select_and_alias(upstream_expr, mapping)
 
         t_contract = contract.require_table(table_name)
 
@@ -232,6 +268,8 @@ class _UpstreamPond:
                 f"Upstream get({self.name}.{table_name}) requested missing columns: {missing}. "
                 f"Available: {available}"
             )
+
+        self._pond._record_upstream_select(self.name, table_name, mapping.values())
 
         upstream_expr = _ibis_placeholder_table(self.name, table_name, t_contract.schema)
         return _select_and_alias(upstream_expr, mapping)
@@ -271,12 +309,13 @@ class Pond:
 
         self._sources: Dict[str, str] = {}
         self._resolved_contracts: Dict[str, PondContract] = {}
+        self._upstream_selects: Dict[str, Dict[str, Set[str]]] = {}
         self._tables: Dict[str, _TableDef] = {}
         self._stages: List[FlowStage] = []
         self._pending_outputs: List[str] = []
         self.upstream: Mapping[str, _UpstreamPond] = _UpstreamRegistry(self)
 
-        self._resolver: Optional[ContractResolver] = None
+        self._resolver: Optional[ContractResolver] = _get_active_resolver()
 
     def source(self, sources: Mapping[str, str]) -> None:
         for pond_name, constraint in sources.items():
@@ -285,6 +324,7 @@ class Pond:
             if not pond_name or not constraint:
                 raise ValueError(f"Invalid source declaration: {pond_name!r}: {constraint!r}")
             self._sources[pond_name] = constraint
+        self._resolve_upstream_contracts()
 
     def attach_resolver(self, resolver: ContractResolver) -> None:
         self._resolver = resolver
@@ -388,6 +428,22 @@ class Pond:
                 continue
             contract = self._resolver.resolve_contract(pond_name, constraint)
             self._resolved_contracts[pond_name] = contract
+
+    def _record_upstream_select(self, pond_name: str, table_name: str, columns: Sequence[str]) -> None:
+        pond_tables = self._upstream_selects.setdefault(pond_name, {})
+        current = pond_tables.setdefault(table_name, set())
+        for col in columns:
+            if col:
+                current.add(str(col))
+
+    def upstream_select(self, pond_name: str, table_name: str) -> Optional[Set[str]]:
+        pond_tables = self._upstream_selects.get(pond_name)
+        if pond_tables is None:
+            return None
+        cols = pond_tables.get(table_name)
+        if cols is None:
+            return None
+        return set(cols)
 
 
 # ----------------------------
@@ -985,6 +1041,9 @@ class Basin(ContractResolver):
         self._topo: List[str] = []
         self._constraints: Dict[str, str] = {}
         self._pinned: Set[str] = set()
+        self._resolving: bool = False
+        self._auto_upgrade: bool = True
+        self._resolving_stack: Set[str] = set()
 
     def _reset_resolution(self) -> None:
         self._resolved = False
@@ -994,6 +1053,9 @@ class Basin(ContractResolver):
         self._topo.clear()
         self._constraints.clear()
         self._pinned.clear()
+        self._resolving = False
+        self._auto_upgrade = True
+        self._resolving_stack.clear()
 
     def set_catchment(self, catchment: Catchment) -> None:
         self.catchment = catchment
@@ -1117,7 +1179,11 @@ class Basin(ContractResolver):
         self._loaded_from = str(out)
 
     def resolve_contract(self, pond_name: str, constraint: str) -> PondContract:
-        self.resolve(auto_upgrade=True)
+        if self._resolving:
+            self._require_version(pond_name, constraint, pinned=False)
+            self._build_manifest(pond_name, constraint)
+        else:
+            self.resolve(auto_upgrade=True)
         if pond_name not in self._contracts:
             raise KeyError(f"No contract resolved for pond {pond_name!r}. Is it in the dependency graph?")
         expected = self._constraints.get(pond_name)
@@ -1129,6 +1195,101 @@ class Basin(ContractResolver):
                     f"Constraint mismatch for pond {pond_name!r}: basin expected {expected!r}, got {constraint!r}"
                 )
         return self._contracts[pond_name]
+
+    def _resolve_dependency_version(self, pond_name: str, constraint: str) -> str:
+        if not self._auto_upgrade:
+            return constraint
+        required_semver = _parse_semver(constraint)
+        major = required_semver[0]
+        catchment = self._ensure_catchment()
+        prev = catchment.state.get_pond_version(pond_name=pond_name, major=major)
+        if prev is None:
+            return constraint
+
+        prev_semver = _parse_semver(prev)
+        if prev_semver[0] != major:
+            return constraint
+
+        if prev_semver >= required_semver:
+            try:
+                _ = catchment.get_pond_path(pond_name, prev)
+            except Exception as exc:
+                raise FileNotFoundError(
+                    f"Previously executed version {prev!r} for pond {pond_name!r} "
+                    f"(major {major}) is not available in the catchment catalog."
+                ) from exc
+            return prev
+
+        return constraint
+
+    def _require_version(self, pond_name: str, constraint: str, *, pinned: bool) -> str:
+        prev = self._constraints.get(pond_name)
+        if pinned:
+            if prev is not None and prev != constraint:
+                raise ValueError(
+                    f"Constraint conflict for pond {pond_name!r}: previously {prev!r}, now {constraint!r}"
+                )
+            self._constraints[pond_name] = constraint
+            self._pinned.add(pond_name)
+            return constraint
+
+        resolved = self._resolve_dependency_version(pond_name, constraint)
+        if prev is None:
+            self._constraints[pond_name] = resolved
+            return resolved
+
+        if pond_name in self._pinned:
+            if prev != resolved:
+                raise ValueError(
+                    f"Constraint conflict for pond {pond_name!r}: pinned to {prev!r}, got {resolved!r}"
+                )
+            return prev
+
+        prev_semver = _parse_semver(prev)
+        resolved_semver = _parse_semver(resolved)
+        if prev_semver[0] != resolved_semver[0]:
+            raise ValueError(
+                f"Constraint conflict for pond {pond_name!r}: {prev!r} vs {resolved!r} (different majors)"
+            )
+
+        if resolved_semver > prev_semver:
+            self._constraints[pond_name] = resolved
+            return resolved
+
+        return prev
+
+    def _build_manifest(self, pond_name: str, constraint: str) -> PondManifest:
+        if pond_name in self._manifests:
+            return self._manifests[pond_name]
+
+        if pond_name in self._resolving_stack:
+            raise ValueError(f"Cycle detected while resolving pond {pond_name!r}.")
+
+        _ = self._ensure_catchment().get_pond_path(pond_name, constraint)
+
+        self._resolving_stack.add(pond_name)
+        try:
+            pond_obj = self._load_pond_object(pond_name, override_version=constraint)
+            mf = pond_obj.build(self)
+        finally:
+            self._resolving_stack.remove(pond_name)
+
+        if mf.version != constraint:
+            raise ValueError(
+                f"Pond {pond_name!r} manifest version {mf.version!r} does not match required "
+                f"{constraint!r}. v1 requires exact versions; ensure the local repo is checked out "
+                "at the correct version."
+            )
+
+        self._manifests[pond_name] = mf
+        self._edges[pond_name] = set(mf.sources.keys())
+        self._contracts[pond_name] = PondContract(
+            name=mf.name,
+            version=mf.version,
+            description=mf.description,
+            tables=dict(mf.exported_tables),
+        )
+        return mf
 
     def resolve(self, *, auto_upgrade: bool = True) -> None:
         if self._resolved:
@@ -1152,104 +1313,12 @@ class Basin(ContractResolver):
             if pond_name not in catchment.ponds:
                 raise KeyError(f"Outlet pond {pond_name!r} is not present in catchment pond catalog.")
 
-        def read_manifest(pond_name: str, constraint: str) -> PondManifest:
-            if pond_name in self._manifests:
-                return self._manifests[pond_name]
-
-            repo = catchment.get_pond_path(pond_name, constraint)
-            mf_path = repo / catchment.DEFAULT_MANIFEST_NAME
-            if not mf_path.exists():
-                raise FileNotFoundError(
-                    f"Missing manifest for pond {pond_name!r}: {mf_path}. "
-                    f"Generate it in the pond repo (pond.build() -> duckstring.manifest.json)."
-                )
-            data = json.loads(mf_path.read_text(encoding="utf-8"))
-            mf = PondManifest.from_dict(data)
-
-            self._manifests[pond_name] = mf
-            self._edges[pond_name] = set(mf.sources.keys())
-
-            contract = PondContract(
-                name=mf.name,
-                version=mf.version,
-                description=mf.description,
-                tables=dict(mf.exported_tables),
-            )
-            self._contracts[pond_name] = contract
-
-            return mf
-
-        def resolve_dependency_version(pond_name: str, constraint: str) -> str:
-            if not auto_upgrade:
-                return constraint
-            required_semver = _parse_semver(constraint)
-            major = required_semver[0]
-            prev = catchment.state.get_pond_version(pond_name=pond_name, major=major)
-            if prev is None:
-                return constraint
-
-            prev_semver = _parse_semver(prev)
-            if prev_semver[0] != major:
-                return constraint
-
-            if prev_semver >= required_semver:
-                try:
-                    _ = catchment.get_pond_path(pond_name, prev)
-                except Exception as exc:
-                    raise FileNotFoundError(
-                        f"Previously executed version {prev!r} for pond {pond_name!r} "
-                        f"(major {major}) is not available in the catchment catalog."
-                    ) from exc
-                return prev
-
-            return constraint
-
-        def require_version(pond_name: str, constraint: str, *, pinned: bool) -> str:
-            prev = self._constraints.get(pond_name)
-            if pinned:
-                if prev is not None and prev != constraint:
-                    raise ValueError(
-                        f"Constraint conflict for pond {pond_name!r}: previously {prev!r}, now {constraint!r}"
-                    )
-                self._constraints[pond_name] = constraint
-                self._pinned.add(pond_name)
-                return constraint
-
-            resolved = resolve_dependency_version(pond_name, constraint)
-            if prev is None:
-                self._constraints[pond_name] = resolved
-                return resolved
-
-            if pond_name in self._pinned:
-                if prev != resolved:
-                    raise ValueError(
-                        f"Constraint conflict for pond {pond_name!r}: pinned to {prev!r}, got {resolved!r}"
-                    )
-                return prev
-
-            prev_semver = _parse_semver(prev)
-            resolved_semver = _parse_semver(resolved)
-            if prev_semver[0] != resolved_semver[0]:
-                raise ValueError(
-                    f"Constraint conflict for pond {pond_name!r}: {prev!r} vs {resolved!r} (different majors)"
-                )
-
-            if resolved_semver > prev_semver:
-                self._constraints[pond_name] = resolved
-                return resolved
-
-            return prev
+        self._auto_upgrade = auto_upgrade
+        self._resolving = True
 
         def visit(pond_name: str, constraint: str, *, pinned: bool) -> None:
-            resolved_constraint = require_version(pond_name, constraint, pinned=pinned)
-            mf = read_manifest(pond_name, resolved_constraint)
-
-            if mf.version != resolved_constraint:
-                raise ValueError(
-                    f"Pond {pond_name!r} manifest version {mf.version!r} does not match required "
-                    f"{resolved_constraint!r}. "
-                    "v1 requires exact versions; ensure the local repo is checked out at the correct version."
-                )
+            resolved_constraint = self._require_version(pond_name, constraint, pinned=pinned)
+            mf = self._build_manifest(pond_name, resolved_constraint)
 
             for up_name, up_constraint in mf.sources.items():
                 if up_name not in catchment.ponds:
@@ -1258,14 +1327,17 @@ class Basin(ContractResolver):
                     )
                 visit(up_name, up_constraint, pinned=False)
 
-        for out_name, out_constraint in self.outlets.items():
-            visit(out_name, out_constraint, pinned=True)
+        try:
+            for out_name, out_constraint in self.outlets.items():
+                visit(out_name, out_constraint, pinned=True)
 
-        reachable = set(self._constraints.keys())
-        edges_sub = {k: {u for u in v if u in reachable} for k, v in self._edges.items() if k in reachable}
-        self._topo = _toposort(edges_sub)
+            reachable = set(self._constraints.keys())
+            edges_sub = {k: {u for u in v if u in reachable} for k, v in self._edges.items() if k in reachable}
+            self._topo = _toposort(edges_sub)
 
-        self._resolved = True
+            self._resolved = True
+        finally:
+            self._resolving = False
 
     def hydrate(self, *, auto_upgrade: bool = False) -> None:
         catchment = self._ensure_catchment()
@@ -1282,6 +1354,10 @@ class Basin(ContractResolver):
             if not dest.exists():
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copytree(src, dest)
+            mf = self._manifests.get(pond_name)
+            if mf is not None:
+                mf_path = dest / catchment.DEFAULT_MANIFEST_NAME
+                mf_path.write_text(json.dumps(mf.to_dict(), indent=2), encoding="utf-8")
 
         _ = dict(self.ducks.get("instances") or {})
         default_duck = self.ducks.get("default")
@@ -1467,7 +1543,7 @@ class Basin(ContractResolver):
                             version = self._constraints.get(pond_name)
                             if not version:
                                 raise RuntimeError(f"Missing version constraint for pond {pond_name!r}.")
-                            out_dir = root / "data" / f"{pond_name}@{version}"
+                            out_dir = root / "data" / pond_name / version
                             out_dir.mkdir(parents=True, exist_ok=True)
                             out_path = out_dir / f"{table_name}.parquet"
                             if out_path.exists():
@@ -1516,9 +1592,9 @@ class Basin(ContractResolver):
             success=success,
         )
 
-    def _load_pond_object(self, pond_name: str) -> Pond:
+    def _load_pond_object(self, pond_name: str, *, override_version: Optional[str] = None) -> Pond:
         catchment = self._ensure_catchment()
-        version = self._constraints.get(pond_name)
+        version = override_version or self._constraints.get(pond_name)
         repo = catchment.get_pond_path(pond_name, version)
         entry = repo / catchment.DEFAULT_POND_ENTRYPOINT
         if not entry.exists():
@@ -1527,7 +1603,8 @@ class Basin(ContractResolver):
                 f"{catchment.DEFAULT_POND_FACTORY_NAME}()."
             )
 
-        module_name = f"duckstring_pond_{pond_name}"
+        version_tag = (version or "unknown").replace(".", "_")
+        module_name = f"duckstring_pond_{pond_name}_{version_tag}"
         mod = _load_module_from_file(module_name, entry)
 
         factory_name = catchment.DEFAULT_POND_FACTORY_NAME
@@ -1537,20 +1614,469 @@ class Basin(ContractResolver):
         if not callable(factory):
             raise TypeError(f"{factory_name} in {entry} is not callable.")
 
-        try:
-            pond_obj = factory(resolver=self)
-        except TypeError:
+        with _resolver_context(self):
             try:
-                pond_obj = factory(basin=self)
-            except TypeError:
                 pond_obj = factory()
-                if hasattr(pond_obj, "attach_resolver"):
-                    pond_obj.attach_resolver(self)
-                warnings.warn(
-                    f"Pond factory for {pond_name!r} did not accept resolver=...; "
-                    f"attached resolver after construction. Upstream preflight checks may be skipped.",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
+            except TypeError:
+                try:
+                    pond_obj = factory(basin=self)
+                except TypeError:
+                    pond_obj = factory(resolver=self)
+                    warnings.warn(
+                        f"Pond factory for {pond_name!r} requires resolver=...; "
+                        "prefer running under Basin/Snapshot context instead.",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
 
         return pond_obj
+
+
+# ----------------------------
+# Snapshot (dev/offline UX)
+# ----------------------------
+
+@dataclass(frozen=True)
+class _SnapshotTableRef:
+    kind: str
+    pond_name: str
+    pond_version: str
+    table_name: str
+
+
+class _SnapshotUpstreamPond:
+    def __init__(self, snapshot: "Snapshot", name: str, constraint: str):
+        self._snapshot = snapshot
+        self.name = name
+        self.constraint = constraint
+
+    def get(
+        self,
+        table_name: str,
+        *,
+        infer_select: bool = False,
+        select: Optional[Sequence[str]] = None,
+    ) -> Any:
+        pond = self._snapshot.pond
+        if infer_select:
+            columns = pond.upstream_select(self.name, table_name)
+            if columns is None:
+                raise KeyError(
+                    f"No select-map metadata available for {self.name}.{table_name}. "
+                    "Ensure the pond uses upstream.get(..., mapping=...) for this table."
+                )
+            select_cols = sorted(columns)
+        elif select is not None:
+            select_cols = [str(c) for c in select if c]
+        else:
+            select_cols = []
+
+        table = self._snapshot._read_source_table(self.name, self.constraint, table_name)
+        if select_cols:
+            table = table.select(select_cols)
+
+        ref = _SnapshotTableRef(
+            kind="upstream",
+            pond_name=self.name,
+            pond_version=self.constraint,
+            table_name=table_name,
+        )
+        table._duckstring_snapshot_ref = ref
+        return table
+
+
+class _SnapshotDownstreamRegistry:
+    def __init__(self, snapshot: "Snapshot"):
+        self._snapshot = snapshot
+
+    def get(self, table_name: str) -> Any:
+        table = self._snapshot._read_downstream_table(table_name)
+        ref = _SnapshotTableRef(
+            kind="downstream",
+            pond_name=self._snapshot.pond.name,
+            pond_version=self._snapshot.pond.version,
+            table_name=table_name,
+        )
+        table._duckstring_snapshot_ref = ref
+        return table
+
+
+class _SnapshotUpstreamRegistry(Mapping[str, _SnapshotUpstreamPond]):
+    def __init__(self, snapshot: "Snapshot"):
+        self._snapshot = snapshot
+
+    def __getitem__(self, key: str) -> _SnapshotUpstreamPond:
+        pond = self._snapshot.pond
+        if key not in pond._sources:
+            available = ", ".join(sorted(pond._sources.keys())) or "<none>"
+            raise KeyError(f"Unknown upstream pond '{key}'. Declared sources: {available}")
+        return _SnapshotUpstreamPond(self._snapshot, key, pond._sources[key])
+
+    def __iter__(self):
+        return iter(self._snapshot.pond._sources.keys())
+
+    def __len__(self):
+        return len(self._snapshot.pond._sources)
+
+
+class Snapshot(ContractResolver):
+    def __init__(
+        self,
+        *,
+        name: str,
+        description: Optional[str],
+        pond: Pond | Any,
+        source_catchment: Catchment,
+        sink_catchment: Catchment,
+    ):
+        self.name = name
+        self.description = description
+        self.source_catchment = source_catchment
+        self.sink_catchment = sink_catchment
+        self._pond_factory = pond if callable(pond) and not isinstance(pond, Pond) else None
+        self._pond: Optional[Pond] = pond if isinstance(pond, Pond) else None
+        self._sinks: List[Any] = []
+
+        self.upstream: Mapping[str, _SnapshotUpstreamPond] = _SnapshotUpstreamRegistry(self)
+        self.downstream = _SnapshotDownstreamRegistry(self)
+
+    @property
+    def pond(self) -> Pond:
+        if self._pond is None:
+            factory = self._pond_factory
+            if factory is None:
+                raise ValueError("Snapshot has no pond factory or pond instance attached.")
+            with _resolver_context(self):
+                try:
+                    self._pond = factory()
+                except TypeError:
+                    try:
+                        self._pond = factory(snapshot=self)
+                    except TypeError:
+                        self._pond = factory(resolver=self)
+        return self._pond
+
+    def _snapshot_root(self) -> Path:
+        return (
+            Path(self.sink_catchment.root_dir)
+            / "snapshots"
+            / self.pond.name
+            / self.pond.version
+        )
+
+    def _data_table_path(self, catchment: Catchment, pond_name: str, version: str, table_name: str) -> Path:
+        root = Path(catchment.root_dir)
+        new_path = root / "data" / pond_name / version / f"{table_name}.parquet"
+        if new_path.exists():
+            return new_path
+        legacy = root / "data" / f"{pond_name}@{version}" / f"{table_name}.parquet"
+        return legacy
+
+    def _read_parquet_schema(self, path: Path) -> Dict[str, str]:
+        if _HAVE_DUCKDB:
+            con = duckdb.connect()
+            try:
+                rows = con.execute(
+                    f"DESCRIBE SELECT * FROM read_parquet('{path.as_posix()}')"
+                ).fetchall()
+                return {str(name): str(dtype) for name, dtype, *_ in rows}
+            finally:
+                con.close()
+        if _HAVE_IBIS:
+            t = ibis.read_parquet(str(path))
+            return {k: str(v) for k, v in t.schema().items()}
+        raise RuntimeError("duckdb or ibis is required to read parquet schemas.")
+
+    def _read_source_table(self, pond_name: str, version: str, table_name: str) -> Any:
+        if not _HAVE_IBIS:
+            raise RuntimeError("ibis is required for Snapshot upstream access.")
+        path = self._data_table_path(self.source_catchment, pond_name, version, table_name)
+        if not path.exists():
+            raise FileNotFoundError(f"Source table not found: {path}")
+        return ibis.read_parquet(str(path))
+
+    def _read_downstream_table(self, table_name: str) -> Any:
+        if not _HAVE_IBIS:
+            raise RuntimeError("ibis is required for Snapshot downstream access.")
+        base = self._snapshot_root()
+        output_path = base / "output" / f"{table_name}.parquet"
+        downstream_path = base / "downstream" / f"{table_name}.parquet"
+        path = output_path if output_path.exists() else downstream_path
+        if not path.exists():
+            raise FileNotFoundError(f"Snapshot downstream table not found: {path}")
+        return ibis.read_parquet(str(path))
+
+    def resolve_contract(self, pond_name: str, constraint: str) -> PondContract:
+        base = self._snapshot_root() / "upstream" / pond_name / constraint
+        if not base.exists():
+            source_dir = (
+                Path(self.source_catchment.root_dir)
+                / "data"
+                / pond_name
+                / constraint
+            )
+            if source_dir.exists():
+                base = source_dir
+            else:
+                legacy = Path(self.source_catchment.root_dir) / "data" / f"{pond_name}@{constraint}"
+                if legacy.exists():
+                    base = legacy
+                else:
+                    raise FileNotFoundError(
+                        f"Snapshot upstream data not found for {pond_name!r}@{constraint!r}: {base}"
+                    )
+
+        tables: Dict[str, TableContract] = {}
+        for path in sorted(base.glob("*.parquet")):
+            schema = self._read_parquet_schema(path)
+            tables[path.stem] = TableContract(
+                name=path.stem,
+                schema=schema,
+                description=None,
+            )
+
+        if not tables:
+            raise FileNotFoundError(f"No upstream tables found for {pond_name!r}@{constraint!r} in {base}")
+
+        return PondContract(
+            name=pond_name,
+            version=constraint,
+            description=None,
+            tables=tables,
+        )
+
+    def sink(self, expr: Any) -> None:
+        ref = getattr(expr, "_duckstring_snapshot_ref", None)
+        if not isinstance(ref, _SnapshotTableRef):
+            raise ValueError("Snapshot.sink(expr) requires expr from snap.upstream or snap.downstream.")
+        self._sinks.append(expr)
+
+    def _ensure_sink_catchment(self) -> None:
+        root = Path(self.sink_catchment.root_dir)
+        root.mkdir(parents=True, exist_ok=True)
+        catchment_path = root / "catchment.json"
+        if not catchment_path.exists():
+            self.sink_catchment.save(catchment_path)
+
+    def materialize(self, *, registry_path: str, activate: bool = True, verbose: bool = False) -> None:
+        if not _HAVE_DUCKDB or not _HAVE_IBIS:
+            raise RuntimeError("duckdb and ibis are required for Snapshot.materialize().")
+
+        self._ensure_sink_catchment()
+        base = self._snapshot_root()
+        base.mkdir(parents=True, exist_ok=True)
+
+        db_path = Path(self.sink_catchment.root_dir) / "state" / "duckstring_snapshot.duckdb"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        con = duckdb.connect(str(db_path))
+        ibis_con = None
+        if _HAVE_IBIS:
+            try:
+                backend_cls = getattr(getattr(getattr(ibis, "backends", None), "duckdb", None), "Backend", None)
+                if backend_cls is not None and hasattr(backend_cls, "from_connection"):
+                    ibis_con = backend_cls.from_connection(con)
+            except Exception:
+                ibis_con = None
+        if ibis_con is None:
+            ibis_con = ibis.duckdb.connect(database=str(db_path))
+
+        ibis_default_backend = None
+        ibis_backend_set = False
+        try:
+            ibis_default_backend = ibis.options.default_backend
+            ibis.set_backend(ibis_con)
+            ibis_backend_set = True
+        except Exception:
+            ibis_backend_set = False
+
+        try:
+            for idx, expr in enumerate(self._sinks):
+                ref = expr._duckstring_snapshot_ref
+                if ref.kind == "upstream":
+                    out_dir = base / "upstream" / ref.pond_name / ref.pond_version
+                else:
+                    out_dir = base / "downstream"
+                out_dir.mkdir(parents=True, exist_ok=True)
+                out_path = out_dir / f"{ref.table_name}.parquet"
+
+                tmp_name = f"snapshot_tmp_{idx}"
+                if hasattr(ibis_con, "create_table"):
+                    ibis_con.create_table(tmp_name, obj=expr, overwrite=True)
+                    con.execute(f"COPY (SELECT * FROM \"{tmp_name}\") TO '{out_path.as_posix()}' (FORMAT PARQUET)")
+                else:  # pragma: no cover
+                    sql = ibis_con.compile(expr)
+                    con.execute(f"COPY ({sql}) TO '{out_path.as_posix()}' (FORMAT PARQUET)")
+
+                if verbose:
+                    print(f"[snapshot] wrote {out_path}")
+        finally:
+            if _HAVE_IBIS and ibis_backend_set:
+                try:
+                    if ibis_default_backend is None:
+                        ibis.options.default_backend = None
+                    else:
+                        ibis.set_backend(ibis_default_backend)
+                except Exception:
+                    pass
+            con.close()
+
+        registry = {}
+        reg_path = Path(registry_path)
+        if reg_path.exists():
+            registry = json.loads(reg_path.read_text(encoding="utf-8"))
+        registry = dict(registry or {})
+        snapshots = dict(registry.get("snapshots") or {})
+        entry = {
+            "name": self.name,
+            "description": self.description,
+            "pond": {"name": self.pond.name, "version": self.pond.version},
+            "source_catchment": {"root_dir": self.source_catchment.root_dir},
+            "sink_catchment": {"root_dir": self.sink_catchment.root_dir},
+            "materialized_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        }
+        snapshots[self.name] = entry
+        registry["snapshots"] = snapshots
+        if activate:
+            registry["active"] = self.name
+        reg_path.write_text(json.dumps(registry, indent=2, sort_keys=True), encoding="utf-8")
+
+    def flow(self, *, in_place: bool = True, duck: Optional[str] = None, verbose: bool = False) -> None:
+        if not _HAVE_DUCKDB or not _HAVE_IBIS:
+            raise RuntimeError("duckdb and ibis are required for Snapshot.flow().")
+
+        _ = duck
+        pond = self.pond
+        base = self._snapshot_root()
+        upstream_root = base / "upstream"
+        output_root = base / "output"
+        output_root.mkdir(parents=True, exist_ok=True)
+
+        db_path = Path(self.sink_catchment.root_dir) / "state" / "duckstring_snapshot.duckdb"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        con = duckdb.connect(str(db_path))
+        ibis_con = None
+        if _HAVE_IBIS:
+            try:
+                backend_cls = getattr(getattr(getattr(ibis, "backends", None), "duckdb", None), "Backend", None)
+                if backend_cls is not None and hasattr(backend_cls, "from_connection"):
+                    ibis_con = backend_cls.from_connection(con)
+            except Exception:
+                ibis_con = None
+        if ibis_con is None:
+            ibis_con = ibis.duckdb.connect(database=str(db_path))
+
+        ibis_default_backend = None
+        ibis_backend_set = False
+        try:
+            ibis_default_backend = ibis.options.default_backend
+            ibis.set_backend(ibis_con)
+            ibis_backend_set = True
+        except Exception:
+            ibis_backend_set = False
+
+        try:
+            # Register upstream tables
+            for up_name, up_version in pond._sources.items():
+                up_dir = upstream_root / up_name / up_version
+                if not up_dir.exists():
+                    raise FileNotFoundError(
+                        f"Snapshot upstream data not found for {up_name!r}@{up_version!r}: {up_dir}"
+                    )
+                for path in sorted(up_dir.glob("*.parquet")):
+                    physical = _physical_table_name(up_name, path.stem)
+                    con.execute(
+                        f"CREATE OR REPLACE VIEW \"{physical}\" AS SELECT * FROM read_parquet('{path.as_posix()}')"
+                    )
+
+            # Register downstream tables (for in-place runs)
+            if in_place:
+                downstream_dir = base / "output"
+                if not downstream_dir.exists():
+                    downstream_dir = base / "downstream"
+                if downstream_dir.exists():
+                    for path in sorted(downstream_dir.glob("*.parquet")):
+                        physical = _physical_table_name(pond.name, path.stem)
+                        con.execute(
+                            f"CREATE OR REPLACE VIEW \"{physical}\" AS SELECT * FROM read_parquet('{path.as_posix()}')"
+                        )
+
+            for stage in pond._stages:
+                for table_name in stage.outputs:
+                    tdef = pond._tables.get(table_name)
+                    if tdef is None or tdef.expr is None:
+                        raise RuntimeError(f"Snapshot pond has no expression for table {table_name!r}.")
+
+                    physical = _physical_table_name(pond.name, table_name)
+                    if hasattr(ibis_con, "create_table"):
+                        ibis_con.create_table(physical, obj=tdef.expr, overwrite=True)
+                    else:  # pragma: no cover
+                        sql = ibis_con.compile(tdef.expr)
+                        con.execute(f'CREATE OR REPLACE TABLE "{physical}" AS {sql}')
+
+                    out_path = output_root / f"{table_name}.parquet"
+                    if out_path.exists():
+                        out_path.unlink()
+                    con.execute(
+                        f"COPY (SELECT * FROM \"{physical}\") TO '{out_path.as_posix()}' (FORMAT PARQUET)"
+                    )
+                    if verbose:
+                        print(f"[snapshot] wrote {out_path}")
+        finally:
+            if _HAVE_IBIS and ibis_backend_set:
+                try:
+                    if ibis_default_backend is None:
+                        ibis.options.default_backend = None
+                    else:
+                        ibis.set_backend(ibis_default_backend)
+                except Exception:
+                    pass
+            con.close()
+
+    def get(self, table_name: str) -> Any:
+        if not _HAVE_IBIS:
+            raise RuntimeError("ibis is required for Snapshot.get().")
+        output_path = self._snapshot_root() / "output" / f"{table_name}.parquet"
+        if not output_path.exists():
+            raise FileNotFoundError(f"Snapshot output table not found: {output_path}")
+        return ibis.read_parquet(str(output_path))
+
+    @classmethod
+    def load_active(cls, registry_path: str) -> "Snapshot":
+        reg_path = Path(registry_path)
+        data = json.loads(reg_path.read_text(encoding="utf-8"))
+        active = data.get("active")
+        if not active:
+            raise KeyError("snapshot registry has no active snapshot.")
+        entry = dict((data.get("snapshots") or {}).get(active) or {})
+        if not entry:
+            raise KeyError(f"snapshot {active!r} not found in registry.")
+
+        def _load_catchment(info: Mapping[str, Any]) -> Catchment:
+            info = dict(info or {})
+            path = info.get("path")
+            if isinstance(path, str) and path:
+                return Catchment.load(path)
+            root_dir = info.get("root_dir")
+            if isinstance(root_dir, str) and root_dir:
+                catchment_path = Path(root_dir) / "catchment.json"
+                if catchment_path.exists():
+                    return Catchment.load(catchment_path)
+                return Catchment(root_dir=root_dir)
+            return Catchment()
+
+        source = _load_catchment(entry.get("source_catchment") or {})
+        sink = _load_catchment(entry.get("sink_catchment") or {})
+
+        pond_path = reg_path.parent / "pond.py"
+        mod = _load_module_from_file("duckstring_snapshot_pond", pond_path)
+        if not hasattr(mod, "pond"):
+            raise AttributeError(f"Snapshot pond file {pond_path} does not define pond().")
+        pond_factory = mod.pond
+
+        return cls(
+            name=active,
+            description=entry.get("description"),
+            pond=pond_factory,
+            source_catchment=source,
+            sink_catchment=sink,
+        )

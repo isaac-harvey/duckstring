@@ -9,6 +9,7 @@ from .core import (
     PondManifest,
     PulsePlan,
     PulseResult,
+    Snapshot,
     Species,
     TableContract,
 )
@@ -24,6 +25,7 @@ __all__ = [
     "PondManifest",
     "PulsePlan",
     "PulseResult",
+    "Snapshot",
     "Species",
     "TableContract",
 ]

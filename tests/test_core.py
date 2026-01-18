@@ -1,4 +1,3 @@
-import json
 from pathlib import Path
 
 import pytest
@@ -26,32 +25,6 @@ class _FakeResolver(ContractResolver):
             raise ValueError("constraint mismatch")
         return c
 
-
-def _manifest_dict(
-    *,
-    name: str,
-    version: str,
-    sources: dict,
-    exported_tables: dict,
-    private_tables: dict | None = None,
-    stages: list | None = None,
-    description: str | None = None,
-):
-    private_tables = private_tables or {}
-    stages = stages or []
-    return {
-        "name": name,
-        "version": version,
-        "description": description,
-        "sources": sources,
-        "stages": stages,
-        "exported_tables": exported_tables,
-        "private_tables": private_tables,
-    }
-
-
-def _write_manifest(repo_dir: Path, manifest: dict):
-    (repo_dir / "duckstring.manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
 
 def test_pond_source_rejects_self():
@@ -95,8 +68,12 @@ def test_pond_sink_duplicate_table_raises():
 def test_upstream_get_requires_resolved_contract():
     p = Pond(name="derived", description=None, version="1.0.0")
     p.source({"base": "1.0.0"})
-    with pytest.raises(RuntimeError):
-        _ = p.upstream["base"].get("t", {"x": "a"})
+    if ds_utils._HAVE_IBIS:
+        t = p.upstream["base"].get("t", {"x": "a"})
+        assert t is not None
+    else:
+        with pytest.raises(RuntimeError):
+            _ = p.upstream["base"].get("t", {"x": "a"})
 
 
 @pytest.mark.skipif(not ds_utils._HAVE_IBIS, reason="ibis not installed")
@@ -151,37 +128,38 @@ def test_catchment_mode_rejects_non_pulse():
 
 
 def test_basin_plan_toposort_from_manifests(tmp_path: Path):
-    # Build two fake pond repos with manifests:
+    # Build two fake pond repos with pond.py:
     # base <- derived
     base_repo = tmp_path / "base_repo"
     derived_repo = tmp_path / "derived_repo"
     base_repo.mkdir()
     derived_repo.mkdir()
 
-    _write_manifest(
-        base_repo,
-        _manifest_dict(
-            name="base",
-            version="1.0.0",
-            sources={},
-            exported_tables={
-                "t": {"name": "t", "schema": {"id": "int64", "val": "int64"}, "description": None}
-            },
-            stages=[{"index": 0, "parallelizable": True, "outputs": ["t"], "notes": None}],
-        ),
+    (base_repo / "pond.py").write_text(
+        """
+from duckstring import Pond
+
+def pond():
+    p = Pond(name="base", description=None, version="1.0.0")
+    p.sink({"t": object()})
+    p.flow([None])
+    return p
+""".lstrip(),
+        encoding="utf-8",
     )
 
-    _write_manifest(
-        derived_repo,
-        _manifest_dict(
-            name="derived",
-            version="1.0.0",
-            sources={"base": "1.0.0"},
-            exported_tables={
-                "out": {"name": "out", "schema": {"total": "int64"}, "description": None}
-            },
-            stages=[{"index": 0, "parallelizable": True, "outputs": ["out"], "notes": None}],
-        ),
+    (derived_repo / "pond.py").write_text(
+        """
+from duckstring import Pond
+
+def pond():
+    p = Pond(name="derived", description=None, version="1.0.0")
+    p.source({"base": "1.0.0"})
+    p.sink({"out": object()})
+    p.flow([None])
+    return p
+""".lstrip(),
+        encoding="utf-8",
     )
 
     c = Catchment(root_dir=str(tmp_path / "catchment_root"))
@@ -202,15 +180,14 @@ def test_basin_version_mismatch_raises(tmp_path: Path):
     repo = tmp_path / "p_repo"
     repo.mkdir()
 
-    _write_manifest(
-        repo,
-        _manifest_dict(
-            name="p",
-            version="1.0.1",
-            sources={},
-            exported_tables={},
-            stages=[],
-        ),
+    (repo / "pond.py").write_text(
+        """
+from duckstring import Pond
+
+def pond():
+    return Pond(name="p", description=None, version="1.0.1")
+""".lstrip(),
+        encoding="utf-8",
     )
 
     c = Catchment(root_dir=str(tmp_path / "catchment_root"))
@@ -230,26 +207,26 @@ def test_basin_constraint_conflict_raises(tmp_path: Path):
     base_repo.mkdir()
     derived_repo.mkdir()
 
-    _write_manifest(
-        base_repo,
-        _manifest_dict(
-            name="base",
-            version="1.0.0",
-            sources={},
-            exported_tables={},
-            stages=[],
-        ),
+    (base_repo / "pond.py").write_text(
+        """
+from duckstring import Pond
+
+def pond():
+    return Pond(name="base", description=None, version="1.0.0")
+""".lstrip(),
+        encoding="utf-8",
     )
 
-    _write_manifest(
-        derived_repo,
-        _manifest_dict(
-            name="derived",
-            version="1.0.0",
-            sources={"base": "2.0.0"},
-            exported_tables={},
-            stages=[],
-        ),
+    (derived_repo / "pond.py").write_text(
+        """
+from duckstring import Pond
+
+def pond():
+    p = Pond(name="derived", description=None, version="1.0.0")
+    p.source({"base": "2.0.0"})
+    return p
+""".lstrip(),
+        encoding="utf-8",
     )
 
     c = Catchment(root_dir=str(tmp_path / "catchment_root"))
@@ -270,37 +247,36 @@ def test_basin_resolve_upgrades_dependency_to_prior_major_max(tmp_path: Path):
     base_v2.mkdir()
     derived_repo.mkdir()
 
-    _write_manifest(
-        base_v1,
-        _manifest_dict(
-            name="base",
-            version="0.1.0",
-            sources={},
-            exported_tables={},
-            stages=[],
-        ),
+    (base_v1 / "pond.py").write_text(
+        """
+from duckstring import Pond
+
+def pond():
+    return Pond(name="base", description=None, version="0.1.0")
+""".lstrip(),
+        encoding="utf-8",
     )
 
-    _write_manifest(
-        base_v2,
-        _manifest_dict(
-            name="base",
-            version="0.2.0",
-            sources={},
-            exported_tables={},
-            stages=[],
-        ),
+    (base_v2 / "pond.py").write_text(
+        """
+from duckstring import Pond
+
+def pond():
+    return Pond(name="base", description=None, version="0.2.0")
+""".lstrip(),
+        encoding="utf-8",
     )
 
-    _write_manifest(
-        derived_repo,
-        _manifest_dict(
-            name="derived",
-            version="1.0.0",
-            sources={"base": "0.1.0"},
-            exported_tables={},
-            stages=[],
-        ),
+    (derived_repo / "pond.py").write_text(
+        """
+from duckstring import Pond
+
+def pond():
+    p = Pond(name="derived", description=None, version="1.0.0")
+    p.source({"base": "0.1.0"})
+    return p
+""".lstrip(),
+        encoding="utf-8",
     )
 
     c = Catchment(root_dir=str(tmp_path / "catchment_root"))
@@ -325,26 +301,24 @@ def test_basin_resolve_keeps_outlet_pinned(tmp_path: Path):
     base_v1.mkdir()
     base_v2.mkdir()
 
-    _write_manifest(
-        base_v1,
-        _manifest_dict(
-            name="base",
-            version="0.1.0",
-            sources={},
-            exported_tables={},
-            stages=[],
-        ),
+    (base_v1 / "pond.py").write_text(
+        """
+from duckstring import Pond
+
+def pond():
+    return Pond(name="base", description=None, version="0.1.0")
+""".lstrip(),
+        encoding="utf-8",
     )
 
-    _write_manifest(
-        base_v2,
-        _manifest_dict(
-            name="base",
-            version="0.2.0",
-            sources={},
-            exported_tables={},
-            stages=[],
-        ),
+    (base_v2 / "pond.py").write_text(
+        """
+from duckstring import Pond
+
+def pond():
+    return Pond(name="base", description=None, version="0.2.0")
+""".lstrip(),
+        encoding="utf-8",
     )
 
     c = Catchment(root_dir=str(tmp_path / "catchment_root"))
@@ -364,7 +338,7 @@ def test_basin_resolve_keeps_outlet_pinned(tmp_path: Path):
 
 @pytest.mark.skipif(not (ds_utils._HAVE_IBIS and ds_utils._HAVE_DUCKDB), reason="ibis/duckdb not installed")
 def test_basin_pulse_materializes_duckdb_and_parquet(tmp_path: Path):
-    # Create two pond repos with pond.py + manifests:
+    # Create two pond repos with pond.py:
     # base exports t via memtable
     # derived consumes base.t and exports out = sum(val)
     base_repo = tmp_path / "base_repo"
@@ -378,10 +352,8 @@ def test_basin_pulse_materializes_duckdb_and_parquet(tmp_path: Path):
 import ibis
 from duckstring import Pond
 
-def pond(resolver=None):
+def pond():
     p = Pond(name="base", description=None, version="1.0.0")
-    if resolver is not None:
-        p.attach_resolver(resolver)
 
     t = ibis.memtable(
         [{"id": 1, "val": 10}, {"id": 2, "val": 20}],
@@ -398,11 +370,9 @@ def pond(resolver=None):
         """
 from duckstring import Pond
 
-def pond(resolver=None):
+def pond():
     p = Pond(name="derived", description=None, version="1.0.0")
     p.source({"base": "1.0.0"})
-    if resolver is not None:
-        p.attach_resolver(resolver)
 
     base = p.upstream["base"].get("t", {"id": "id", "val": "val"})
     out = base.aggregate(total=base.val.sum())
@@ -411,33 +381,6 @@ def pond(resolver=None):
     return p
 """.lstrip(),
         encoding="utf-8",
-    )
-
-    # manifests
-    _write_manifest(
-        base_repo,
-        _manifest_dict(
-            name="base",
-            version="1.0.0",
-            sources={},
-            exported_tables={
-                "t": {"name": "t", "schema": {"id": "int64", "val": "int64"}, "description": None}
-            },
-            stages=[{"index": 0, "parallelizable": True, "outputs": ["t"], "notes": None}],
-        ),
-    )
-
-    _write_manifest(
-        derived_repo,
-        _manifest_dict(
-            name="derived",
-            version="1.0.0",
-            sources={"base": "1.0.0"},
-            exported_tables={
-                "out": {"name": "out", "schema": {"total": "int64"}, "description": None}
-            },
-            stages=[{"index": 0, "parallelizable": True, "outputs": ["out"], "notes": None}],
-        ),
     )
 
     catchment_root = tmp_path / "catchment_root"
@@ -451,8 +394,8 @@ def pond(resolver=None):
     _ = b.pulse()
 
     # parquet outputs exist
-    assert (catchment_root / "data" / "base@1.0.0" / "t.parquet").exists()
-    assert (catchment_root / "data" / "derived@1.0.0" / "out.parquet").exists()
+    assert (catchment_root / "data" / "base" / "1.0.0" / "t.parquet").exists()
+    assert (catchment_root / "data" / "derived" / "1.0.0" / "out.parquet").exists()
 
     # duckdb outputs exist and are queryable
     db_path = catchment_root / "state" / "duckstring.duckdb"
