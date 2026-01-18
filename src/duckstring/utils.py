@@ -48,7 +48,51 @@ def ibis_placeholder_table(pond_name: str, table_name: str, schema: Dict[str, st
         raise RuntimeError(
             "Ibis is not available. Install 'ibis-framework' to use contract-backed preflight checks."
         )
-    ibis_schema = ibis.schema({k: ibis.dtype(v) for k, v in schema.items()})
+    def _normalize_dtype(value: str) -> Any:
+        raw = str(value)
+        lowered = raw.strip().lower()
+        compact = lowered.replace(" ", "")
+        if compact.startswith("decimal") or compact.startswith("numeric"):
+            try:
+                return ibis.dtype(compact)
+            except Exception:
+                return ibis.dtype("decimal")
+        if "timestamp" in compact:
+            return ibis.dtype("timestamp")
+        if compact.startswith("date"):
+            return ibis.dtype("date")
+        if compact.startswith("time"):
+            return ibis.dtype("time")
+        if compact.startswith("varchar") or compact.startswith("text") or compact.startswith("string"):
+            return ibis.dtype("string")
+        if compact in ("bool", "boolean"):
+            return ibis.dtype("boolean")
+        if compact in ("bigint", "int64"):
+            return ibis.dtype("int64")
+        if compact in ("integer", "int", "int32"):
+            return ibis.dtype("int32")
+        if compact in ("smallint", "int16"):
+            return ibis.dtype("int16")
+        if compact in ("tinyint", "int8"):
+            return ibis.dtype("int8")
+        if compact in ("ubigint", "uint64"):
+            return ibis.dtype("uint64")
+        if compact in ("uinteger", "uint32", "uint"):
+            return ibis.dtype("uint32")
+        if compact in ("usmallint", "uint16"):
+            return ibis.dtype("uint16")
+        if compact in ("utinyint", "uint8"):
+            return ibis.dtype("uint8")
+        if compact in ("double", "float64"):
+            return ibis.dtype("float64")
+        if compact in ("float", "float32", "real"):
+            return ibis.dtype("float32")
+        try:
+            return ibis.dtype(lowered)
+        except Exception:
+            return ibis.dtype("string")
+
+    ibis_schema = ibis.schema({k: _normalize_dtype(v) for k, v in schema.items()})
     return ibis.table(ibis_schema, name=physical_table_name(pond_name, table_name))
 
 

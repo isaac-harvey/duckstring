@@ -21,6 +21,7 @@ from typing import (
     Set,
     Tuple,
 )
+from weakref import WeakKeyDictionary
 
 from .utils import (
     _HAVE_DUCKDB,
@@ -1681,7 +1682,11 @@ class _SnapshotUpstreamPond:
             pond_version=self.constraint,
             table_name=table_name,
         )
-        table._duckstring_snapshot_ref = ref
+        self._snapshot._refs[table] = ref
+        try:
+            self._snapshot._ref_ops[table.op()] = ref
+        except Exception:
+            pass
         return table
 
 
@@ -1697,7 +1702,11 @@ class _SnapshotDownstreamRegistry:
             pond_version=self._snapshot.pond.version,
             table_name=table_name,
         )
-        table._duckstring_snapshot_ref = ref
+        self._snapshot._refs[table] = ref
+        try:
+            self._snapshot._ref_ops[table.op()] = ref
+        except Exception:
+            pass
         return table
 
 
@@ -1728,6 +1737,8 @@ class Snapshot(ContractResolver):
         pond: Pond | Any,
         source_catchment: Catchment,
         sink_catchment: Catchment,
+        pond_name: Optional[str] = None,
+        pond_version: Optional[str] = None,
     ):
         self.name = name
         self.description = description
@@ -1735,7 +1746,16 @@ class Snapshot(ContractResolver):
         self.sink_catchment = sink_catchment
         self._pond_factory = pond if callable(pond) and not isinstance(pond, Pond) else None
         self._pond: Optional[Pond] = pond if isinstance(pond, Pond) else None
+        if self._pond is not None:
+            pond_name = pond_name or self._pond.name
+            pond_version = pond_version or self._pond.version
+        self._pond_name = pond_name
+        self._pond_version = pond_version
         self._sinks: List[Any] = []
+        self._refs: "WeakKeyDictionary[Any, _SnapshotTableRef]" = WeakKeyDictionary()
+        self._ref_ops: "WeakKeyDictionary[Any, _SnapshotTableRef]" = WeakKeyDictionary()
+        self._duckdb_con: Optional[Any] = None
+        self._ibis_con: Optional[Any] = None
 
         self.upstream: Mapping[str, _SnapshotUpstreamPond] = _SnapshotUpstreamRegistry(self)
         self.downstream = _SnapshotDownstreamRegistry(self)
@@ -1754,23 +1774,52 @@ class Snapshot(ContractResolver):
                         self._pond = factory(snapshot=self)
                     except TypeError:
                         self._pond = factory(resolver=self)
+            if self._pond_name is None:
+                self._pond_name = self._pond.name
+            if self._pond_version is None:
+                self._pond_version = self._pond.version
         return self._pond
 
     def _snapshot_root(self) -> Path:
+        if not self._pond_name or not self._pond_version:
+            raise RuntimeError("Snapshot pond identity is not available yet.")
         return (
             Path(self.sink_catchment.root_dir)
             / "snapshots"
-            / self.pond.name
-            / self.pond.version
+            / self._pond_name
+            / self._pond_version
         )
+
+    def _ensure_backend(self) -> Tuple[Any, Any]:
+        if self._duckdb_con is not None and self._ibis_con is not None:
+            return self._duckdb_con, self._ibis_con
+        if not _HAVE_DUCKDB or not _HAVE_IBIS:
+            raise RuntimeError("duckdb and ibis are required for Snapshot operations.")
+        db_path = Path(self.sink_catchment.root_dir) / "state" / "duckstring_snapshot.duckdb"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        con = duckdb.connect(str(db_path))
+        ibis_con = None
+        try:
+            backend_cls = getattr(getattr(getattr(ibis, "backends", None), "duckdb", None), "Backend", None)
+            if backend_cls is not None and hasattr(backend_cls, "from_connection"):
+                ibis_con = backend_cls.from_connection(con)
+        except Exception:
+            ibis_con = None
+        if ibis_con is None:
+            ibis_con = ibis.duckdb.connect(database=str(db_path))
+        self._duckdb_con = con
+        self._ibis_con = ibis_con
+        return con, ibis_con
 
     def _data_table_path(self, catchment: Catchment, pond_name: str, version: str, table_name: str) -> Path:
         root = Path(catchment.root_dir)
         new_path = root / "data" / pond_name / version / f"{table_name}.parquet"
+        legacy = root / "data" / f"{pond_name}@{version}" / f"{table_name}.parquet"
         if new_path.exists():
             return new_path
-        legacy = root / "data" / f"{pond_name}@{version}" / f"{table_name}.parquet"
-        return legacy
+        if legacy.exists():
+            return legacy
+        return new_path
 
     def _read_parquet_schema(self, path: Path) -> Dict[str, str]:
         if _HAVE_DUCKDB:
@@ -1793,18 +1842,104 @@ class Snapshot(ContractResolver):
         path = self._data_table_path(self.source_catchment, pond_name, version, table_name)
         if not path.exists():
             raise FileNotFoundError(f"Source table not found: {path}")
-        return ibis.read_parquet(str(path))
+        _, ibis_con = self._ensure_backend()
+        return ibis_con.read_parquet(str(path))
 
     def _read_downstream_table(self, table_name: str) -> Any:
         if not _HAVE_IBIS:
             raise RuntimeError("ibis is required for Snapshot downstream access.")
-        base = self._snapshot_root()
-        output_path = base / "output" / f"{table_name}.parquet"
-        downstream_path = base / "downstream" / f"{table_name}.parquet"
-        path = output_path if output_path.exists() else downstream_path
+        path = self._data_table_path(
+            self.source_catchment,
+            self._pond_name or self.pond.name,
+            self._pond_version or self.pond.version,
+            table_name,
+        )
         if not path.exists():
             raise FileNotFoundError(f"Snapshot downstream table not found: {path}")
-        return ibis.read_parquet(str(path))
+        _, ibis_con = self._ensure_backend()
+        return ibis_con.read_parquet(str(path))
+
+    def _expr_op(self, expr: Any) -> Optional[Any]:
+        op = getattr(expr, "op", None)
+        if callable(op):
+            try:
+                return op()
+            except Exception:
+                return None
+        return None
+
+    def _iter_op_children(self, op: Any) -> List[Any]:
+        children = []
+        if op is None:
+            return children
+        if hasattr(op, "__children__") and callable(getattr(op, "__children__")):
+            try:
+                return list(op.__children__())  # type: ignore[attr-defined]
+            except Exception:
+                return children
+        args = getattr(op, "args", None)
+        if args is None:
+            return children
+
+        def _extend_from(arg: Any) -> None:
+            if arg is None:
+                return
+            if isinstance(arg, Mapping):
+                for v in arg.values():
+                    _extend_from(v)
+                return
+            if isinstance(arg, (list, tuple, set)):
+                for v in arg:
+                    _extend_from(v)
+                return
+            op_child = self._expr_op(arg)
+            if op_child is not None:
+                children.append(op_child)
+                return
+            if hasattr(arg, "args") or hasattr(arg, "__children__"):
+                children.append(arg)
+
+        _extend_from(args)
+        return children
+
+    def _find_ref_in_op(self, op: Any) -> Set[_SnapshotTableRef]:
+        refs: Set[_SnapshotTableRef] = set()
+        stack = [op]
+        seen: Set[int] = set()
+        while stack:
+            node = stack.pop()
+            node_id = id(node)
+            if node_id in seen:
+                continue
+            seen.add(node_id)
+            try:
+                ref = self._ref_ops.get(node)
+            except TypeError:
+                ref = None
+            if ref is not None:
+                refs.add(ref)
+            stack.extend(self._iter_op_children(node))
+        return refs
+
+    def _find_ref(self, expr: Any) -> Optional[_SnapshotTableRef]:
+        ref = self._refs.get(expr)
+        if ref is not None:
+            return ref
+        op = self._expr_op(expr)
+        if op is None:
+            return None
+        try:
+            ref = self._ref_ops.get(op)
+        except TypeError:
+            ref = None
+        if ref is not None:
+            return ref
+        refs = self._find_ref_in_op(op)
+        if len(refs) == 1:
+            return next(iter(refs))
+        if len(refs) > 1:
+            raise ValueError("Snapshot.sink(expr) is ambiguous: multiple upstream/downstream sources detected.")
+        return None
 
     def resolve_contract(self, pond_name: str, constraint: str) -> PondContract:
         base = self._snapshot_root() / "upstream" / pond_name / constraint
@@ -1846,7 +1981,7 @@ class Snapshot(ContractResolver):
         )
 
     def sink(self, expr: Any) -> None:
-        ref = getattr(expr, "_duckstring_snapshot_ref", None)
+        ref = self._find_ref(expr)
         if not isinstance(ref, _SnapshotTableRef):
             raise ValueError("Snapshot.sink(expr) requires expr from snap.upstream or snap.downstream.")
         self._sinks.append(expr)
@@ -1866,19 +2001,7 @@ class Snapshot(ContractResolver):
         base = self._snapshot_root()
         base.mkdir(parents=True, exist_ok=True)
 
-        db_path = Path(self.sink_catchment.root_dir) / "state" / "duckstring_snapshot.duckdb"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        con = duckdb.connect(str(db_path))
-        ibis_con = None
-        if _HAVE_IBIS:
-            try:
-                backend_cls = getattr(getattr(getattr(ibis, "backends", None), "duckdb", None), "Backend", None)
-                if backend_cls is not None and hasattr(backend_cls, "from_connection"):
-                    ibis_con = backend_cls.from_connection(con)
-            except Exception:
-                ibis_con = None
-        if ibis_con is None:
-            ibis_con = ibis.duckdb.connect(database=str(db_path))
+        con, ibis_con = self._ensure_backend()
 
         ibis_default_backend = None
         ibis_backend_set = False
@@ -1891,7 +2014,9 @@ class Snapshot(ContractResolver):
 
         try:
             for idx, expr in enumerate(self._sinks):
-                ref = expr._duckstring_snapshot_ref
+                ref = self._find_ref(expr)
+                if ref is None:
+                    raise ValueError("Snapshot.sink(expr) requires expr from snap.upstream or snap.downstream.")
                 if ref.kind == "upstream":
                     out_dir = base / "upstream" / ref.pond_name / ref.pond_version
                 else:
@@ -1918,7 +2043,6 @@ class Snapshot(ContractResolver):
                         ibis.set_backend(ibis_default_backend)
                 except Exception:
                     pass
-            con.close()
 
         registry = {}
         reg_path = Path(registry_path)
@@ -1946,24 +2070,13 @@ class Snapshot(ContractResolver):
 
         _ = duck
         pond = self.pond
+        _ = pond.build(self)
         base = self._snapshot_root()
         upstream_root = base / "upstream"
         output_root = base / "output"
         output_root.mkdir(parents=True, exist_ok=True)
 
-        db_path = Path(self.sink_catchment.root_dir) / "state" / "duckstring_snapshot.duckdb"
-        db_path.parent.mkdir(parents=True, exist_ok=True)
-        con = duckdb.connect(str(db_path))
-        ibis_con = None
-        if _HAVE_IBIS:
-            try:
-                backend_cls = getattr(getattr(getattr(ibis, "backends", None), "duckdb", None), "Backend", None)
-                if backend_cls is not None and hasattr(backend_cls, "from_connection"):
-                    ibis_con = backend_cls.from_connection(con)
-            except Exception:
-                ibis_con = None
-        if ibis_con is None:
-            ibis_con = ibis.duckdb.connect(database=str(db_path))
+        con, ibis_con = self._ensure_backend()
 
         ibis_default_backend = None
         ibis_backend_set = False
@@ -2030,15 +2143,18 @@ class Snapshot(ContractResolver):
                         ibis.set_backend(ibis_default_backend)
                 except Exception:
                     pass
-            con.close()
 
     def get(self, table_name: str) -> Any:
         if not _HAVE_IBIS:
             raise RuntimeError("ibis is required for Snapshot.get().")
-        output_path = self._snapshot_root() / "output" / f"{table_name}.parquet"
-        if not output_path.exists():
-            raise FileNotFoundError(f"Snapshot output table not found: {output_path}")
-        return ibis.read_parquet(str(output_path))
+        base = self._snapshot_root()
+        output_path = base / "output" / f"{table_name}.parquet"
+        if output_path.exists():
+            return ibis.read_parquet(str(output_path))
+        downstream_path = base / "downstream" / f"{table_name}.parquet"
+        if downstream_path.exists():
+            return ibis.read_parquet(str(downstream_path))
+        raise FileNotFoundError(f"Snapshot output table not found: {output_path}")
 
     @classmethod
     def load_active(cls, registry_path: str) -> "Snapshot":
@@ -2079,4 +2195,6 @@ class Snapshot(ContractResolver):
             pond=pond_factory,
             source_catchment=source,
             sink_catchment=sink,
+            pond_name=(entry.get("pond") or {}).get("name"),
+            pond_version=(entry.get("pond") or {}).get("version"),
         )
