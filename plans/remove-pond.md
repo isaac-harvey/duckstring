@@ -1,6 +1,12 @@
 # Removing a Pond (a `name@major` line)
 
-Status: **designed, unbuilt.** Retire one deployed major line — the executable object `name@major` — from a
+Status: **implemented.** `Driver.remove_pond(name, major)` + `DELETE /api/ponds/{name}` +
+`duckstring pond remove` + a Sidebar **Remove Pond** button (type-`name@version` confirm). Prerequisite
+(alerts → `name@major` scope) landed first. Tests: `test_remove_pond_retires_line` (real-Duck: scrub +
+history kept + artifact survives + Spout/scoped-alert cascade + catchment-wide-alert survives + downstream
+blocks) and `test_remove_pond_rejects_with_demand`.
+
+Retire one deployed major line — the executable object `name@major` — from a
 Catchment. The main use case is dropping an old major that nothing runs any more. The sibling of
 [reset](reset.md): reset scrubs a Pond's runtime and keeps it live; remove takes the Pond out of the live
 system entirely, **keeping its deployment record + run history**.

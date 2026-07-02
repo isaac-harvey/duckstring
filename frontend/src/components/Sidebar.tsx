@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-import { fetchAlerts, fetchSecrets, testSpout, fetchTables, fetchObjects, type RawAlertChannel } from '@/lib/api';
+import { fetchAlerts, fetchSecrets, testSpout, fetchTables, fetchObjects, removePond, type RawAlertChannel } from '@/lib/api';
 import { ConfirmDialog, type ConfirmOpts } from './ConfirmDialog';
 import { useLiveStore, atLeast, formatAge, formatDuration, parseTs, THEME_PULL, THEME_PUSH, THEME_SUCCESS, THEME_DANGER, THEME_BLOCKED, THEME_WAKE, THEME_BRAND } from '@/lib/store';
 import type { FreqUnit, Pond, PondId, PondInfo, PondRun } from '@/lib/types';
@@ -459,7 +459,8 @@ export function Sidebar({ mobile = false }: { mobile?: boolean }) {
   const resetPond = useLiveStore((s) => s.resetPond);
   const enterRepair = useLiveStore((s) => s.enterRepair);
   const repairMode = useLiveStore((s) => s.repairMode);
-  const [confirm, setConfirm] = useState<ConfirmOpts | null>(null);  // themed confirm dialog (Reset)
+  const [confirm, setConfirm] = useState<ConfirmOpts | null>(null);  // themed confirm dialog (Reset / Remove)
+  const [removeErr, setRemoveErr] = useState<string | null>(null);   // surfaced 409 (running / has demand)
 
   // Access level gates the action surface (the backend enforces it too — this just avoids dead buttons).
   // read: status/history/data only · demand: + the Triggers menu · full: + Control/Windows/Failures.
@@ -725,6 +726,42 @@ export function Sidebar({ mobile = false }: { mobile?: boolean }) {
           <Section>
             <TraceChart {...pondTrace(selectedPondRuns)} />
           </Section>
+
+          {/* Remove (retire) this Pond line — data + config + Spouts + alerts go; history is kept.
+              Type-to-confirm (name@version), like the catchment Reset. Full only; not for Spouts/Draws. */}
+          {canControl && !selectedPond.isSpout && !selectedPond.isDraw && (
+          <Section>
+            <Label>Danger</Label>
+            <Btn
+              block
+              color={THEME_DANGER}
+              onClick={() => {
+                const ver = selectedInfo?.version;
+                const target = ver ? `${selectedPond.name}@${ver}` : selectedPond.id;
+                setRemoveErr(null);
+                setConfirm({
+                  title: `Remove “${target}”?`,
+                  body:
+                    'This deletes the Pond line — its data, live state, and on-disk runtime, plus its own ' +
+                    'Spouts and alert channels. Its deployment record and run history are kept (a redeploy ' +
+                    'restores it). Downstream Ponds that read it will block until you fix them.',
+                  confirmLabel: 'Remove Pond',
+                  requireTyped: target,
+                  action: async () => {
+                    try {
+                      await removePond(selectedPond.id);
+                    } catch (e) {
+                      setRemoveErr(e instanceof Error ? e.message : String(e));
+                    }
+                  },
+                });
+              }}
+            >
+              Remove Pond…
+            </Btn>
+            {removeErr && <div style={{ marginTop: 6, fontSize: 11.5, color: THEME_DANGER }}>{removeErr}</div>}
+          </Section>
+          )}
 
           </>
           )}

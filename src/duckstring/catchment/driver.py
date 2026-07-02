@@ -601,6 +601,63 @@ class Driver:
             self._process(_now())
             return {"ponds": len(lines)}
 
+    def remove_pond(self, name: str, major: int) -> dict:
+        """Remove (retire) one deployed major line ``name@major`` — delete its live ``pond`` selection, its
+        ``pond(id)``-keyed config, its on-disk runtime, and its **own** Spouts + alert channels — while
+        **keeping** its deployment record and run history (a redeploy un-retires it). Downstream sinks that
+        pin it re-derive ``has_missing_source`` and hard-block. Requires the line idle + demand-free (per the
+        thesis it never checks or refuses on dependents). See plans/remove-pond.md."""
+        import shutil
+        from pathlib import Path
+
+        from .registry import pond_data_dir, pond_major_dir
+
+        key = pond_key(name, major)
+        with self.lock:
+            meta = self.meta.get(key)
+            if meta is None or meta.get("is_draw") or meta.get("is_spout"):
+                raise ValueError(f"no removable Pond '{key}'")
+            ps = self.state.pond_states.get(key)
+            if ps is not None:  # guard: idle + demand-free (the whole op is atomic under the lock)
+                if ps.start_f > ps.end_f:
+                    raise ValueError("the Pond is running — sleep it first, then remove")
+                if ps.has_pull or ps.targets or ps.standing_wake or key in self.state.triggers:
+                    raise ValueError("the Pond has demand — clear it first (duckstring control sleep)")
+            pond_id = meta["pond_id"]
+            (pn_id,) = self.db.execute("SELECT pond_name_id FROM pond WHERE id = ?", (pond_id,)).fetchone()
+            # Blast radius: sinks that pin this line (they'll block on the missing Source) + its own Spouts.
+            now_blocked = sorted({r[0] for r in self.db.execute(
+                "SELECT pn.name FROM pond_to_pond ptp JOIN pond p ON p.id = ptp.pond_id "
+                "JOIN pond_name pn ON pn.id = p.pond_name_id "
+                "WHERE ptp.source_pond_name_id = ? AND ptp.source_major = ? AND p.is_spout = 0",
+                (pn_id, major))})  # Spouts of this line are removed with it, not left blocked
+            spouts = sorted(k for k, m in self.meta.items() if m.get("is_spout") and m.get("source_key") == key)
+
+            # 1. Quiesce + scrub the on-disk runtime (registry + pond.db ledger + local data). Keep the
+            #    {version}/ artifacts + the deployment/history rows.
+            self.launcher.terminate(key, wait=True)
+            self._idle_since.pop(key, None)
+            shutil.rmtree(pond_major_dir(Path(self.root), name, major), ignore_errors=True)
+            if self.data_root is not None:  # published data outside the state root
+                pond_data_dir(Path(self.root), name, major, self.data_root).rmtree()
+            # 2. Remove its attachments: its Spouts (full purge) + its name@major alert channels
+            #    (alert_delivery cascades via the FK).
+            for skey in spouts:
+                self._destroy_spout(skey)
+            self.db.execute("DELETE FROM alert_channel WHERE scope_name = ? AND scope_major = ?", (name, major))
+            # 3. Delete the pond(id)-keyed config + the pond selection row. Keep pond_version / ripple /
+            #    ripple_run / pond_run / pond_version_schema / pond_name (the retained record).
+            for tbl in ("pond_state", "pond_target", "pond_open", "pond_trigger", "pond_retry",
+                        "pond_window", "pond_spout", "pond_to_pond"):
+                self.db.execute(f"DELETE FROM {tbl} WHERE pond_id = ?", (pond_id,))
+            self.db.execute("DELETE FROM pond WHERE id = ?", (pond_id,))
+            self.db.commit()
+            # 4. Rebuild the engine — the line is gone; sinks re-derive has_missing_source.
+            self.reload()
+            self.state_version += 1
+            self._process(_now())
+            return {"removed": key, "spouts_removed": spouts, "now_blocked": now_blocked}
+
     def is_pond_running(self, pond: str) -> bool:
         """Whether a Pond has a Run in flight (start_f advanced past end_f) — the idle gate for an Object
         delete (which must not race a run's commit_objects). Best-effort: unknown Pond ⇒ not running."""

@@ -345,6 +345,72 @@ def test_reset_pond_rejects_while_running(runtime):
     assert saw_409, "reset was allowed mid-run (should 409)"
 
 
+def test_remove_pond_retires_line(runtime):
+    """`pond remove` (a name@major line): scrub its runtime, delete its live selection + its own Spout +
+    its name@major alert channel, keep its deployment record + run history, and leave downstream pinning it
+    blocked-on-missing-source. A catchment-wide alert survives. See plans/remove-pond.md."""
+    import sqlite3
+
+    url, root = runtime
+    _deploy(url, _TRICKLE_PONDS)
+    httpx.post(f"{url}/api/ponds/revenue/pulse", timeout=5.0)
+    assert _wait(lambda: (_pond_status(url, "revenue") or {}).get("end_f") is not None)
+    time.sleep(1.0)  # settle to idle (a pulse is one-shot → no standing demand)
+
+    # Attach a Spout + a scoped alert + a catchment-wide alert to catalog.
+    sp = httpx.post(f"{url}/api/ponds/catalog/spouts", json={
+        "destination": f"file://{root}/out", "table": "product", "mode": "auto"}, timeout=5.0).json()
+    spout_name = f"catalog#{sp['name']}"       # the Spout's pond name (as it appears in status)
+    spout_key = f"{spout_name}@1"              # its pond key (as returned in spouts_removed)
+    httpx.post(f"{url}/api/alerts", json={"name": "cat-line", "destination": "https://x/a", "scope": "catalog@1"}, timeout=5.0)
+    httpx.post(f"{url}/api/alerts", json={"name": "wide", "destination": "https://x/w", "scope": None}, timeout=5.0)
+
+    def catalog_runs():
+        db = sqlite3.connect(root / "duck.db")
+        try:
+            return db.execute(
+                "SELECT count(*) FROM pond_run pr JOIN pond_version pv ON pv.id = pr.pond_version_id "
+                "JOIN pond_name pn ON pn.id = pv.pond_name_id WHERE pn.name = 'catalog'").fetchone()[0]
+        finally:
+            db.close()
+
+    runs_before = catalog_runs()
+    assert runs_before > 0 and (root / "ponds" / "catalog" / "m1").exists()
+
+    r = httpx.request("DELETE", f"{url}/api/ponds/catalog", params={"major": 1}, timeout=15.0)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["removed"] == "catalog@1"
+    assert body["now_blocked"] == ["priced"] and spout_key in body["spouts_removed"]
+
+    # Gone from the live system + its runtime scrubbed; the deployed artifact + run history survive.
+    assert _pond_status(url, "catalog") is None
+    assert not (root / "ponds" / "catalog" / "m1").exists()
+    assert any(d.is_dir() and d.name[0].isdigit() for d in (root / "ponds" / "catalog").iterdir()), "artifact removed"
+    assert catalog_runs() == runs_before, "run history was not kept"
+    # Its Spout went with it; the scoped alert went, the catchment-wide one survived.
+    assert all(p["name"] != spout_name for p in httpx.get(f"{url}/api/status", timeout=5.0).json()["ponds"])
+    alert_names = {c["name"] for c in httpx.get(f"{url}/api/alerts", timeout=5.0).json()["channels"]}
+    assert "cat-line" not in alert_names and "wide" in alert_names
+    # Downstream that pinned catalog@1 blocks on the missing Source.
+    assert _wait(lambda: (_pond_status(url, "priced") or {}).get("is_blocked") is True, timeout=10.0)
+
+
+def test_remove_pond_rejects_with_demand(runtime):
+    """Remove requires the line idle + demand-free — a standing Wave is demand, so remove 409s until it's
+    cleared (sleep)."""
+    url, _ = runtime
+    _deploy(url, _TRICKLE_PONDS)
+    httpx.post(f"{url}/api/ponds/catalog/wave", timeout=5.0)  # a standing pull = demand
+    time.sleep(0.5)
+    r = httpx.request("DELETE", f"{url}/api/ponds/catalog", params={"major": 1}, timeout=5.0)
+    assert r.status_code == 409, r.text
+    httpx.post(f"{url}/api/ponds/catalog/sleep", timeout=5.0)  # clears demand + the standing trigger
+    time.sleep(0.5)
+    r = httpx.request("DELETE", f"{url}/api/ponds/catalog", params={"major": 1}, timeout=15.0)
+    assert r.status_code == 200, r.text
+
+
 def test_refresh_flag_rebuilds_and_bumps_floor(runtime):
     """`control refresh` is lazy: it flags the Pond (refresh_pending) but runs nothing. The next run is a
     cold wipe-and-rebuild that raises the published changelog floor, so downstream coverage-misses."""

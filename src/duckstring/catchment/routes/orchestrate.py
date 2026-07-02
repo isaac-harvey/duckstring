@@ -187,6 +187,19 @@ def reset(
     return {"ok": True}
 
 
+@router.delete("/ponds/{name}", dependencies=[auth.full])
+def remove_pond(name: str, request: Request, major: int | None = None, version: str | None = None):
+    """Remove (retire) one deployed major line — delete its live selection, config, on-disk runtime, and
+    its own Spouts + alert channels, keeping its deployment record + run history. Downstream sinks that pin
+    it block on the missing Source. Requires the line idle + demand-free (409). See plans/remove-pond.md."""
+    key = _resolve(request, name, major, version)
+    n, _, mj = key.rpartition("@")
+    try:
+        return _driver(request).remove_pond(n, int(mj))
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
 @router.delete("/ponds/{name}/tables/{table}", dependencies=[auth.full])
 def delete_table(
     name: str, table: str, request: Request, major: int | None = None, version: str | None = None,

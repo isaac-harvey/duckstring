@@ -59,6 +59,7 @@ Conduits that draw a Pond from an upstream Catchment into the consuming one (`-c
 | `pond hydrate [-s SOURCE] [--from-catchment] [-c NAME]` | Materialise the project's [Puddles](../guides/local-testing.md) into `puddles/`. Sources without a definition are skipped with a warning; `--from-catchment` fills them from the Catchment's exported tables; `-s` restricts to specific Sources. |
 | `pond run [--ripple NAME] [--fresh]` | Execute the Pond locally against its hydrated Puddles, output to `puddles/out/`. `--ripple` runs a single Ripple against the last run's state; `--fresh` ignores a self-puddle seed. |
 | `pond deploy [-c NAME] [--git REF] [-y] [--all]` | Deploy the current Pond project (reads `pond.toml`). `--all` deploys every subdirectory containing a `pond.toml`; `--git` deploys from a git ref (branch/tag/commit) of the project's `origin` remote instead of uploading the working tree; `-y` skips confirmations. |
+| `pond remove {name} [-m M] [-c NAME] [-y]` | Remove (retire) a deployed Pond major line — deletes its data, live state, and on-disk runtime plus its own Spouts and alert channels, **keeping** its deployment record + run history (a redeploy restores it). `--major` picks the line (default: highest deployed). Downstream Ponds that read it block on the missing Source until fixed. Requires the line idle with no demand (`control sleep` it first). |
 
 ## `duckstring puddle` — inspect local test data
 

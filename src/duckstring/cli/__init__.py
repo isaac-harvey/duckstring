@@ -12,6 +12,7 @@ from . import spout as spout_cmd
 from .control import clear, failure_budget, force, kill, refresh, repair, reset, sleep, wake
 from .data import delete_object, delete_table, get, get_object, objects, query
 from .deploy import deploy
+from .deploy import remove as remove_pond
 from .status import status
 from .trigger import pulse, remove, tap, tide, wave
 from .window import app as window_app
@@ -75,6 +76,7 @@ app.add_typer(secret_cmd.app, name="secret")
 app.add_typer(alert_cmd.app, name="alert")
 
 pond_cmd.app.command("deploy")(deploy)
+pond_cmd.app.command("remove")(remove_pond)
 app.command("status")(status)
 app.command("get")(get)
 app.command("query")(query)

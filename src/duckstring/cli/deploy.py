@@ -148,3 +148,28 @@ def deploy(
             _deploy_one(console, pond_dir, url, cfg, catchment_name, git, yes)
     else:
         _deploy_one(console, Path.cwd(), url, cfg, catchment_name, git, yes)
+
+
+def remove(
+    name: str = typer.Argument(..., help="Pond name to remove."),
+    catchment: Optional[str] = typer.Option(None, "--catchment", "-c", help="Catchment to use (uses default if omitted)."),
+    major: Optional[int] = typer.Option(None, "--major", "-m", help="Major line to remove (default: highest deployed)."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation prompt."),
+) -> None:
+    """Remove (retire) a deployed Pond major line — delete its data, live state, and on-disk runtime plus
+    its own Spouts and alert channels, keeping its deployment record and run history (a redeploy un-retires
+    it). Downstream Ponds that read it will block until fixed. Requires the line idle with no demand
+    (`control sleep` it first)."""
+    from . import _http
+    from .config import resolve_catchment
+
+    _, cfg = resolve_catchment(catchment)
+    label = f"{name}@{major}" if major is not None else name
+    if not yes:
+        typer.confirm(f"Remove Pond '{label}' (deletes its data + config; keeps run history)?", abort=True)
+    resp = _http.delete(f"{cfg['url']}/api/ponds/{name}", auth=cfg, params=_http.pond_params(major, None)).json()
+    typer.echo(f"Removed '{resp['removed']}'.")
+    if resp.get("spouts_removed"):
+        typer.echo(f"  Spouts removed with it: {', '.join(resp['spouts_removed'])}")
+    if resp.get("now_blocked"):
+        typer.echo(f"  Now blocked (missing source): {', '.join(resp['now_blocked'])}")
