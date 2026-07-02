@@ -115,7 +115,7 @@ export function AlertChannelForm({ fixedScope, onAdded }: { fixedScope?: string;
       <div style={{ display: 'flex', gap: 6 }}>
         <input value={name} onChange={(e) => setName(e.target.value)} placeholder="name (optional)" style={{ ...input, flex: 1 }} />
         {fixedScope === undefined && (
-          <input value={scope} onChange={(e) => setScope(e.target.value)} placeholder="pond (blank = all)" style={{ ...input, flex: 1 }} />
+          <input value={scope} onChange={(e) => setScope(e.target.value)} placeholder="pond name@major (blank = all)" style={{ ...input, flex: 1 }} />
         )}
       </div>
       <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5 }}>

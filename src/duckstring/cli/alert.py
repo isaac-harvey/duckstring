@@ -32,7 +32,10 @@ def add(
     to: str = typer.Option(..., "--to", "-t", help="Destination URI (https://…, http://…, mailto:…); "
                                                    "credentials as ${env:NAME}/${secret:NAME}."),
     name: Optional[str] = typer.Option(None, "--name", "-n", help="Channel name (default: derived from the scheme)."),
-    pond: Optional[str] = typer.Option(None, "--pond", "-p", help="Scope to one Pond (default: catchment-wide)."),
+    pond: Optional[str] = typer.Option(None, "--pond", "-p", help="Scope to one Pond (name; default: "
+                                                                  "catchment-wide). Combine with --major for one line."),
+    major: Optional[int] = typer.Option(None, "--major", "-m", help="Scope to a specific major of --pond "
+                                                                    "(default: any major of the name)."),
     on: str = typer.Option("all", "--on", help="Event kinds, comma-separated: "
                                               "failure,contract,spout,recovery,freshness (or 'all')."),
     stale: Optional[str] = typer.Option(None, "--stale", help="Freshness-SLA bound, e.g. 1h, 30m — alert when a "
@@ -47,13 +50,14 @@ def add(
 
     stale_ms = _parse_duration(stale) * 1000 if stale else None
     final = name or urlparse(to).scheme.lower() or "alert"
+    scope = f"{pond}@{major}" if pond and major is not None else pond  # "name@major" | "name" | None
     url, cfg = _resolve(catchment)
     resp = _http.post(
         f"{url}/api/alerts", auth=cfg,
-        json={"name": final, "destination": to, "scope": pond, "events": on, "stale_ms": stale_ms},
+        json={"name": final, "destination": to, "scope": scope, "events": on, "stale_ms": stale_ms},
     ).json()
-    scope = f" on '{pond}'" if pond else " (catchment-wide)"
-    typer.echo(f"Alert channel '{resp['name']}'{scope} → {to}")
+    label = f" on '{scope}'" if scope else " (catchment-wide)"
+    typer.echo(f"Alert channel '{resp['name']}'{label} → {to}")
 
 
 @app.command("ls")

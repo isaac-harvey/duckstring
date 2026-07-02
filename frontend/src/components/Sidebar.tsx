@@ -357,7 +357,7 @@ function AlertEditor({ pond, canControl }: { pond: Pond; canControl: boolean }) 
   const [open, setOpen] = useState(false);
 
   const load = () =>
-    fetchAlerts().then((cs) => setChannels(cs.filter((c) => c.scope === pond.name))).catch(() => setChannels([]));
+    fetchAlerts().then((cs) => setChannels(cs.filter((c) => c.scope === pond.id))).catch(() => setChannels([]));
   // Load once on mount — the parent keys this component by pond id, so a pond switch remounts it fresh.
   useEffect(() => { if (canControl) void load(); }, [canControl]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -369,7 +369,7 @@ function AlertEditor({ pond, canControl }: { pond: Pond; canControl: boolean }) 
       {channels.map((c) => <ChannelRow key={c.name} channel={c} onChanged={load} />)}
       {open ? (
         <div style={{ marginTop: 8 }}>
-          <AlertChannelForm fixedScope={pond.name} onAdded={() => { setOpen(false); void load(); }} />
+          <AlertChannelForm fixedScope={pond.id} onAdded={() => { setOpen(false); void load(); }} />
           <div style={{ marginTop: 6 }}>
             <Btn small onClick={() => setOpen(false)} color={THEME_BLOCKED}>Cancel</Btn>
           </div>

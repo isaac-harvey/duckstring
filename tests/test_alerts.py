@@ -136,8 +136,8 @@ def test_webhook_send_sanitises_http_error(monkeypatch):
 
 def test_channel_crud_and_persistence_across_restart(tmp_path):
     d = _driver(tmp_path)
-    d.add_channel("ops", "https://hooks.example/x", scope_name=None, events="failure,recovery")
-    d.add_channel("sales-sla", "mailto:me@x.com?smtp=h:25", scope_name="sales", events="freshness",
+    d.add_channel("ops", "https://hooks.example/x", scope=None, events="failure,recovery")
+    d.add_channel("sales-sla", "mailto:me@x.com?smtp=h:25", scope="sales", events="freshness",
                   stale_ms=3_600_000)
     chans = {c["name"]: c for c in d.list_channels()}
     assert chans["ops"]["scope"] is None and chans["ops"]["events"] == "failure,recovery"
@@ -154,10 +154,10 @@ def test_channel_crud_and_persistence_across_restart(tmp_path):
 def test_add_channel_rejects_bad_destination_and_duplicate(tmp_path):
     d = _driver(tmp_path)
     with pytest.raises(ValueError):
-        d.add_channel("bad", "ftp://x", scope_name=None)
-    d.add_channel("ops", "https://x/y", scope_name=None)
+        d.add_channel("bad", "ftp://x", scope=None)
+    d.add_channel("ops", "https://x/y", scope=None)
     with pytest.raises(ValueError, match="already exists"):
-        d.add_channel("ops", "https://x/z", scope_name=None)
+        d.add_channel("ops", "https://x/z", scope=None)
 
 
 # ─── _emit_alert: routing, scope, event filter, dedup ───────────────────────────
@@ -165,10 +165,10 @@ def test_add_channel_rejects_bad_destination_and_duplicate(tmp_path):
 
 def test_emit_routes_by_scope_and_event_filter(tmp_path):
     d = _driver(tmp_path)
-    d.add_channel("wide", "https://x/wide", scope_name=None, events="failure")
-    d.add_channel("sales-only", "https://x/sales", scope_name="sales", events="failure")
-    d.add_channel("other-pond", "https://x/other", scope_name="orders", events="failure")
-    d.add_channel("recovery-only", "https://x/rec", scope_name=None, events="recovery")
+    d.add_channel("wide", "https://x/wide", scope=None, events="failure")
+    d.add_channel("sales-only", "https://x/sales", scope="sales", events="failure")
+    d.add_channel("other-pond", "https://x/other", scope="orders", events="failure")
+    d.add_channel("recovery-only", "https://x/rec", scope=None, events="recovery")
 
     d._emit_alert("failure", scope_pond="sales", severity="error", title="t", message="m", f="F1")
     # wide (catchment-wide) + sales-only (scope match) fire; other-pond (scope miss) + recovery-only
@@ -179,9 +179,32 @@ def test_emit_routes_by_scope_and_event_filter(tmp_path):
     assert sorted(r[0] for r in got) == ["sales-only", "wide"]
 
 
+def test_emit_scope_is_name_at_major(tmp_path):
+    """A channel scoped to name@major matches only that line; a bare-name scope matches any major;
+    catchment-wide matches all (plans/remove-pond.md prerequisite)."""
+    d = _driver(tmp_path)
+    d.add_channel("wide", "https://x/wide", scope=None, events="failure")
+    d.add_channel("sales-any", "https://x/any", scope="sales", events="failure")     # any major
+    d.add_channel("sales-m1", "https://x/m1", scope="sales@1", events="failure")      # one line
+    d.add_channel("sales-m2", "https://x/m2", scope="sales@2", events="failure")
+
+    def fired(major):
+        d.db.execute("DELETE FROM alert_delivery")
+        d._emit_alert("failure", scope_pond="sales", scope_major=major, severity="error",
+                      title="t", message="m", f="F1")
+        return sorted(r[0] for r in d.db.execute(
+            "SELECT c.name FROM alert_delivery a JOIN alert_channel c ON c.id = a.channel_id"))
+
+    assert fired(1) == ["sales-any", "sales-m1", "wide"]
+    assert fired(2) == ["sales-any", "sales-m2", "wide"]
+    # The scope round-trips through the DB as "name@major" / "name".
+    scopes = {c["name"]: c["scope"] for c in d.list_channels()}
+    assert scopes["sales-m1"] == "sales@1" and scopes["sales-any"] == "sales" and scopes["wide"] is None
+
+
 def test_emit_dedup_is_per_episode(tmp_path):
     d = _driver(tmp_path)
-    d.add_channel("wide", "https://x/wide", scope_name=None, events="failure")
+    d.add_channel("wide", "https://x/wide", scope=None, events="failure")
     d._emit_alert("failure", scope_pond="sales", severity="error", title="t", message="m", f="F1")
     d._emit_alert("failure", scope_pond="sales", severity="error", title="t", message="m", f="F1")
     assert len(_deliveries(d)) == 1  # same episode (same f) → one alert
@@ -200,7 +223,7 @@ def test_emit_noop_without_channels(tmp_path):
 
 def test_failure_then_recovery_lifecycle(tmp_path):
     d = _driver(tmp_path)
-    d.add_channel("ops", "https://x/ops", scope_name=None, events="failure,recovery")
+    d.add_channel("ops", "https://x/ops", scope=None, events="failure,recovery")
     key = pond_key("sales", 1)
     ps = d.state.pond_states[key]
 
@@ -223,7 +246,7 @@ def test_failure_then_recovery_lifecycle(tmp_path):
 
 def test_killed_pond_is_not_a_recovery(tmp_path):
     d = _driver(tmp_path)
-    d.add_channel("ops", "https://x/ops", scope_name=None, events="failure,recovery")
+    d.add_channel("ops", "https://x/ops", scope=None, events="failure,recovery")
     key = pond_key("sales", 1)
     now = _now()
     d.state.pond_states[key].start_f = now
@@ -237,7 +260,7 @@ def test_killed_pond_is_not_a_recovery(tmp_path):
 
 def test_freshness_breach_then_recovery(tmp_path):
     d = _driver(tmp_path)
-    d.add_channel("sla", "https://x/sla", scope_name="sales", events="freshness", stale_ms=60_000)
+    d.add_channel("sla", "https://x/sla", scope="sales", events="freshness", stale_ms=60_000)
     key = pond_key("sales", 1)
     ps = d.state.pond_states[key]
 
@@ -258,7 +281,7 @@ def test_freshness_breach_then_recovery(tmp_path):
 
 def test_freshness_skips_never_run_pond(tmp_path):
     d = _driver(tmp_path)
-    d.add_channel("sla", "https://x/sla", scope_name=None, events="freshness", stale_ms=1_000)
+    d.add_channel("sla", "https://x/sla", scope=None, events="freshness", stale_ms=1_000)
     assert d.state.pond_states[pond_key("sales", 1)].end_f == NEVER
     d._check_freshness(_now())
     assert _deliveries(d) == []  # never-run → nothing to be stale about
@@ -269,8 +292,8 @@ def test_freshness_skips_never_run_pond(tmp_path):
 
 def test_worker_marks_sent_and_parks_failed(tmp_path):
     d = _driver(tmp_path)
-    d.add_channel("ok", "https://x/ok", scope_name=None, events="failure")
-    d.add_channel("bad", "https://x/bad", scope_name=None, events="failure")
+    d.add_channel("ok", "https://x/ok", scope=None, events="failure")
+    d.add_channel("bad", "https://x/bad", scope=None, events="failure")
     d._emit_alert("failure", scope_pond="sales", severity="error", title="t", message="m", f="F1")
 
     pending = d.take_alert_deliveries()

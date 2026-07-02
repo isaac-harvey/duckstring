@@ -74,6 +74,25 @@ def _iso(dt: datetime) -> str:
     return dt.isoformat()
 
 
+def _split_scope(scope: str | None) -> tuple[str | None, int | None]:
+    """An alert-channel scope string → ``(scope_name, scope_major)``. ``"name@major"`` → one line;
+    ``"name"`` → any major of that name (legacy name-scope); ``None``/``""`` → catchment-wide."""
+    if not scope:
+        return None, None
+    base, sep, mj = scope.rpartition("@")
+    if sep and base and mj.isdigit():
+        return base, int(mj)
+    return scope, None
+
+
+def _format_scope(scope_name: str | None, scope_major: int | None) -> str | None:
+    """The inverse of :func:`_split_scope` — ``(name, major)`` → ``"name@major"``; ``(name, None)`` →
+    ``"name"``; ``(None, _)`` → ``None`` (catchment-wide)."""
+    if scope_name is None:
+        return None
+    return f"{scope_name}@{scope_major}" if scope_major is not None else scope_name
+
+
 # ─── Repair scope graph helpers (D3 — see plans/refresh.md) ────────────────────
 
 
@@ -1033,7 +1052,8 @@ class Driver:
             src_name = self.meta.get(src_key, {}).get("name") if src_key else None
             spout_label = sm.get("name", spout_key)
             self._alert_failure(
-                spout_key, "spout", scope_pond=src_name, f=f,
+                spout_key, "spout", scope_pond=src_name,
+                scope_major=self.meta.get(src_key, {}).get("major"), f=f,
                 title=f"Spout '{spout_label}' delivery failed",
                 message=f"Egress delivery for spout '{spout_label}' failed: {error or 'unknown error'}",
             )
@@ -1041,34 +1061,37 @@ class Driver:
 
     # ─── Alerts (failure & freshness notifications — see plans/alerts.md) ────────
 
-    def add_channel(self, name: str, destination: str, scope_name: str | None,
+    def add_channel(self, name: str, destination: str, scope: str | None,
                     events: str = "all", stale_ms: int | None = None) -> None:
-        """Create a notification channel (operational config, like a Spout). Validates the destination URI
-        + the event list; a not-yet-deployed scope name is allowed (a channel may precede its Pond)."""
+        """Create a notification channel (operational config, like a Spout). ``scope`` is ``"name@major"``
+        (one line), ``"name"`` (any major of that name), or ``None`` (catchment-wide) — like every other
+        Pond-attached construct. Validates the destination URI + the event list; a not-yet-deployed scope
+        is allowed (a channel may precede its Pond)."""
         from ..alerts import normalise_events, parse_notifier_destination
 
         parse_notifier_destination(destination)  # scheme + ${...} syntax (does not resolve credentials)
         events = ",".join(normalise_events(events)) if events else "all"
+        scope_name, scope_major = _split_scope(scope)
         with self.lock:
             existing = self.db.execute("SELECT 1 FROM alert_channel WHERE name = ?", (name,)).fetchone()
             if existing:
                 raise ValueError(f"An alert channel named '{name}' already exists")
             self.db.execute(
-                "INSERT INTO alert_channel (name, destination, scope_name, events, stale_ms) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (name, destination, scope_name, events, stale_ms),
+                "INSERT INTO alert_channel (name, destination, scope_name, scope_major, events, stale_ms) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (name, destination, scope_name, scope_major, events, stale_ms),
             )
             self.db.commit()
 
     def list_channels(self) -> list[dict]:
         with self.lock:
             rows = self.db.execute(
-                "SELECT name, destination, scope_name, events, stale_ms, enabled, created_at "
+                "SELECT name, destination, scope_name, scope_major, events, stale_ms, enabled, created_at "
                 "FROM alert_channel ORDER BY name"
             ).fetchall()
             return [
-                {"name": r[0], "destination": r[1], "scope": r[2], "events": r[3],
-                 "stale_ms": r[4], "enabled": bool(r[5]), "created_at": r[6]}
+                {"name": r[0], "destination": r[1], "scope": _format_scope(r[2], r[3]), "events": r[4],
+                 "stale_ms": r[5], "enabled": bool(r[6]), "created_at": r[7]}
                 for r in rows
             ]
 
@@ -1135,9 +1158,9 @@ class Driver:
         name = self.db.execute("SELECT value FROM catchment_meta WHERE key = 'name'").fetchone()
         return name[0] if name and name[0] else None
 
-    def _emit_alert(self, kind: str, *, scope_pond: str | None, severity: str,
-                    title: str, message: str, f: str | None = None, detail: dict | None = None,
-                    match_kinds: tuple[str, ...] | None = None) -> None:
+    def _emit_alert(self, kind: str, *, scope_pond: str | None, scope_major: int | None = None,
+                    severity: str, title: str, message: str, f: str | None = None,
+                    detail: dict | None = None, match_kinds: tuple[str, ...] | None = None) -> None:
         """Enqueue one ``alert_delivery`` per matching enabled channel (dedup-fenced), then wake the alert
         worker. Matching = the channel's scope (catchment-wide, or this Pond's name) AND its ``events``
         including any of ``match_kinds`` (default: just ``kind``). A ``recovery`` passes the originating kind
@@ -1148,14 +1171,17 @@ class Driver:
 
             wanted = match_kinds or (kind,)
             channels = self.db.execute(
-                "SELECT id, events, scope_name FROM alert_channel WHERE enabled = 1"
+                "SELECT id, events, scope_name, scope_major FROM alert_channel WHERE enabled = 1"
             ).fetchall()
             if not channels:
                 return
             enqueued = False
-            for cid, events, scope_name in channels:
-                if scope_name is not None and scope_name != scope_pond:
-                    continue  # a pond-scoped channel ignores other Ponds / catchment-wide events
+            for cid, events, scope_name, ch_major in channels:
+                # A scoped channel matches its name, and its major if pinned (NULL major = any major).
+                if scope_name is not None and (
+                    scope_name != scope_pond or (ch_major is not None and ch_major != scope_major)
+                ):
+                    continue
                 subscribed = normalise_events(events)
                 if not any(k in subscribed for k in wanted):
                     continue
@@ -1177,18 +1203,19 @@ class Driver:
         except Exception as exc:  # noqa: BLE001 — alerting must never break the engine
             print(f"[catchment] alert emit failed ({kind}): {exc}", flush=True)
 
-    def _alert_failure(self, key: str, kind: str, *, scope_pond: str | None, f: str | None,
-                       title: str, message: str) -> None:
+    def _alert_failure(self, key: str, kind: str, *, scope_pond: str | None, scope_major: int | None,
+                       f: str | None, title: str, message: str) -> None:
         """Fire a failure/contract/spout alert and remember the key so its recovery is emitted when it
-        clears (in _process). ``scope_pond`` is the Pond name a channel scopes against."""
+        clears (in _process). ``scope_pond``/``scope_major`` are the Pond name@major a channel scopes
+        against."""
         blocked = sorted(
             self.meta[k]["name"] for k, ps in self.state.pond_states.items()
             if ps.is_blocked and k in self.meta and not self.meta[k].get("is_spout")
         )
         detail = {"blocked_downstream": blocked} if blocked else {}
-        self._emit_alert(kind, scope_pond=scope_pond, severity="error", title=title, message=message,
-                         f=f, detail=detail)
-        self._alerted_failures[key] = (kind, scope_pond, f)
+        self._emit_alert(kind, scope_pond=scope_pond, scope_major=scope_major, severity="error",
+                         title=title, message=message, f=f, detail=detail)
+        self._alerted_failures[key] = (kind, scope_pond, scope_major, f)
 
     def _emit_recoveries(self) -> None:
         """Emit a `recovery` for any Pond/Spout that was alerted as failed and has since cleared. Called
@@ -1197,10 +1224,10 @@ class Driver:
             ps = self.state.pond_states.get(key)
             if ps is not None and (ps.is_failed or ps.is_killed):
                 continue  # still down (or killed — a kill is intentional, not a recovery)
-            kind, scope_pond, _f = self._alerted_failures.pop(key)
+            kind, scope_pond, scope_major, _f = self._alerted_failures.pop(key)
             label = self.meta.get(key, {}).get("name", key)
             self._emit_alert(
-                "recovery", scope_pond=scope_pond, severity="info",
+                "recovery", scope_pond=scope_pond, scope_major=scope_major, severity="info",
                 title=f"Recovered: {label}", message=f"'{label}' recovered from a {kind} failure.",
                 f=_iso(ps.end_f) if ps is not None and ps.end_f != NEVER else None,
                 match_kinds=("recovery", kind),  # also reaches channels that only asked for the failure kind
@@ -1210,11 +1237,12 @@ class Driver:
         """The tick-driven freshness-SLA sweep (alongside _check_liveness). For each enabled channel with a
         ``stale_ms`` bound, alert a scoped Pond whose staleness exceeds it, and recover it when it advances."""
         channels = self.db.execute(
-            "SELECT id, scope_name, events, stale_ms FROM alert_channel WHERE enabled = 1 AND stale_ms IS NOT NULL"
+            "SELECT id, scope_name, scope_major, events, stale_ms FROM alert_channel "
+            "WHERE enabled = 1 AND stale_ms IS NOT NULL"
         ).fetchall()
         if not channels:
             return
-        for cid, scope_name, events, stale_ms in channels:
+        for cid, scope_name, ch_major, events, stale_ms in channels:
             from ..alerts import normalise_events
             if "freshness" not in normalise_events(events):
                 continue
@@ -1223,8 +1251,10 @@ class Driver:
                 m = self.meta.get(key)
                 if m is None or m.get("is_spout") or m.get("is_draw"):
                     continue
-                name = m["name"]
-                if scope_name is not None and scope_name != name:
+                name, major = m["name"], m["major"]
+                if scope_name is not None and (
+                    scope_name != name or (ch_major is not None and ch_major != major)
+                ):
                     continue
                 if ps.end_f == NEVER:  # never run → nothing to be stale about yet
                     continue
@@ -1234,7 +1264,7 @@ class Driver:
                     self._stale_breached.add(token)
                     age = int((now - ps.end_f).total_seconds())
                     self._emit_alert(
-                        "freshness", scope_pond=name, severity="warning",
+                        "freshness", scope_pond=name, scope_major=major, severity="warning",
                         title=f"'{name}' is stale", f=_iso(ps.end_f),
                         message=f"'{name}' has not been fresh for {age}s (SLA {int(stale_ms / 1000)}s).",
                         detail={"stale_seconds": age},
@@ -1242,7 +1272,7 @@ class Driver:
                 elif not stale and token in self._stale_breached:
                     self._stale_breached.discard(token)
                     self._emit_alert(
-                        "recovery", scope_pond=name, severity="info", f=_iso(ps.end_f),
+                        "recovery", scope_pond=name, scope_major=major, severity="info", f=_iso(ps.end_f),
                         title=f"'{name}' is fresh again",
                         message=f"'{name}' advanced back within its freshness SLA.",
                         match_kinds=("recovery", "freshness"),
@@ -1298,7 +1328,8 @@ class Driver:
                     )
                     self._process(now)  # settle the cascade first, so the blast radius is accurate
                     name = self.meta.get(pond, {}).get("name", pond)
-                    self._alert_failure(pond, "failure", scope_pond=name, f=f,
+                    self._alert_failure(pond, "failure", scope_pond=name,
+                                        scope_major=self.meta.get(pond, {}).get("major"), f=f,
                                         title=f"Pond '{name}' failed",
                                         message=f"Ripple '{rname}' failed: {err or 'unknown error'}")
             elif kind == "missing_source":
@@ -1948,7 +1979,8 @@ class Driver:
         self._process(now)  # settle the cascade first, so the blast radius (blocked downstream) is accurate
         name = self.meta.get(pond, {}).get("name", pond)
         verb = "broke its version contract" if alert_kind == "contract" else "failed"
-        self._alert_failure(pond, alert_kind, scope_pond=name, f=f,
+        self._alert_failure(pond, alert_kind, scope_pond=name,
+                            scope_major=self.meta.get(pond, {}).get("major"), f=f,
                             title=f"Pond '{name}' {verb}",
                             message=f"Pond '{name}' {verb}: {error or 'unknown error'}")
 

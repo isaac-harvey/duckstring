@@ -24,7 +24,7 @@ def _driver(request: Request):
 class _ChannelBody(BaseModel):
     name: str
     destination: str
-    scope: Optional[str] = None          # a pond name, or None for catchment-wide
+    scope: Optional[str] = None          # "name@major" (one line), "name" (any major), or None (catchment-wide)
     events: str = "all"                  # CSV of kinds, or "all"
     stale_ms: Optional[int] = None       # freshness-SLA bound; None = no freshness monitoring
 
