@@ -76,7 +76,8 @@ def _iso(dt: datetime) -> str:
 
 def _split_scope(scope: str | None) -> tuple[str | None, int | None]:
     """An alert-channel scope string → ``(scope_name, scope_major)``. ``"name@major"`` → one line;
-    ``"name"`` → any major of that name (legacy name-scope); ``None``/``""`` → catchment-wide."""
+    ``"name"`` → ``(name, None)`` (a bare name — ``add_channel`` resolves it to the highest deployed major);
+    ``None``/``""`` → catchment-wide."""
     if not scope:
         return None, None
     base, sep, mj = scope.rpartition("@")
@@ -1064,14 +1065,22 @@ class Driver:
     def add_channel(self, name: str, destination: str, scope: str | None,
                     events: str = "all", stale_ms: int | None = None) -> None:
         """Create a notification channel (operational config, like a Spout). ``scope`` is ``"name@major"``
-        (one line), ``"name"`` (any major of that name), or ``None`` (catchment-wide) — like every other
-        Pond-attached construct. Validates the destination URI + the event list; a not-yet-deployed scope
-        is allowed (a channel may precede its Pond)."""
+        (one line) or ``None`` (catchment-wide) — a Pond-scoped channel is always a specific major. A bare
+        ``"name"`` resolves to the Pond's **highest deployed major** (like every other CLI/API surface); an
+        explicit ``"name@major"`` may precede deployment. Validates the destination URI + the event list."""
         from ..alerts import normalise_events, parse_notifier_destination
 
         parse_notifier_destination(destination)  # scheme + ${...} syntax (does not resolve credentials)
         events = ",".join(normalise_events(events)) if events else "all"
         scope_name, scope_major = _split_scope(scope)
+        if scope_name is not None and scope_major is None:  # bare name → its highest deployed major
+            row = self.db.execute(
+                "SELECT MAX(p.major) FROM pond p JOIN pond_name pn ON pn.id = p.pond_name_id WHERE pn.name = ?",
+                (scope_name,),
+            ).fetchone()
+            if row is None or row[0] is None:
+                raise ValueError(f"Pond '{scope_name}' is not deployed — give a major, e.g. '{scope_name}@1'")
+            scope_major = row[0]
         with self.lock:
             existing = self.db.execute("SELECT 1 FROM alert_channel WHERE name = ?", (name,)).fetchone()
             if existing:
@@ -1177,10 +1186,8 @@ class Driver:
                 return
             enqueued = False
             for cid, events, scope_name, ch_major in channels:
-                # A scoped channel matches its name, and its major if pinned (NULL major = any major).
-                if scope_name is not None and (
-                    scope_name != scope_pond or (ch_major is not None and ch_major != scope_major)
-                ):
+                # A Pond-scoped channel matches exactly its (name, major); catchment-wide (name NULL) matches all.
+                if scope_name is not None and (scope_name != scope_pond or ch_major != scope_major):
                     continue
                 subscribed = normalise_events(events)
                 if not any(k in subscribed for k in wanted):
@@ -1252,9 +1259,7 @@ class Driver:
                 if m is None or m.get("is_spout") or m.get("is_draw"):
                     continue
                 name, major = m["name"], m["major"]
-                if scope_name is not None and (
-                    scope_name != name or (ch_major is not None and ch_major != major)
-                ):
+                if scope_name is not None and (scope_name != name or ch_major != major):
                     continue
                 if ps.end_f == NEVER:  # never run → nothing to be stale about yet
                     continue

@@ -134,7 +134,7 @@ Two destinations work today: a **webhook** (`https://…`/`http://…`, a Slack-
 
 | Command | Description |
 |---|---|
-| `alert add --to {uri} [--pond N [--major M]] [--on failure,…\|all] [--stale 1h] [--name N]` | Add a channel. `--to` is an `https://`/`http://`/`mailto:` URI; `--pond` scopes it to a Pond (with `--major` for one line, else any major of the name; default: catchment-wide); `--on` is the event kinds (default `all`); `--stale` sets a freshness SLA (e.g. `1h`, `30m`) — required for `freshness` to fire; `--name` defaults to the scheme/scope. |
+| `alert add --to {uri} [--pond N [--major M]] [--on failure,…\|all] [--stale 1h] [--name N]` | Add a channel. `--to` is an `https://`/`http://`/`mailto:` URI; `--pond` scopes it to one Pond line (`--major` picks the major, default: the Pond's highest deployed major; omit `--pond` for catchment-wide); `--on` is the event kinds (default `all`); `--stale` sets a freshness SLA (e.g. `1h`, `30m`) — required for `freshness` to fire; `--name` defaults to the scheme/scope. |
 | `alert ls` | List channels with their scope, events, SLA, and destination. |
 | `alert rm {name}` | Remove a channel. |
 | `alert test {name}` | Send a test notification through the channel (validates connectivity + credentials). |

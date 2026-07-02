@@ -141,7 +141,8 @@ def test_channel_crud_and_persistence_across_restart(tmp_path):
                   stale_ms=3_600_000)
     chans = {c["name"]: c for c in d.list_channels()}
     assert chans["ops"]["scope"] is None and chans["ops"]["events"] == "failure,recovery"
-    assert chans["sales-sla"]["scope"] == "sales" and chans["sales-sla"]["stale_ms"] == 3_600_000
+    # A bare "sales" resolves to its highest deployed major (sales@1).
+    assert chans["sales-sla"]["scope"] == "sales@1" and chans["sales-sla"]["stale_ms"] == 3_600_000
 
     # A restart (a fresh Driver over the same DB) sees the persisted channels.
     d2 = Driver(connect(tmp_path / "duck.db"), tmp_path, "http://x", NoopLauncher())
@@ -166,11 +167,11 @@ def test_add_channel_rejects_bad_destination_and_duplicate(tmp_path):
 def test_emit_routes_by_scope_and_event_filter(tmp_path):
     d = _driver(tmp_path)
     d.add_channel("wide", "https://x/wide", scope=None, events="failure")
-    d.add_channel("sales-only", "https://x/sales", scope="sales", events="failure")
-    d.add_channel("other-pond", "https://x/other", scope="orders", events="failure")
+    d.add_channel("sales-only", "https://x/sales", scope="sales", events="failure")   # → sales@1
+    d.add_channel("other-pond", "https://x/other", scope="orders@1", events="failure")  # explicit (undeployed OK)
     d.add_channel("recovery-only", "https://x/rec", scope=None, events="recovery")
 
-    d._emit_alert("failure", scope_pond="sales", severity="error", title="t", message="m", f="F1")
+    d._emit_alert("failure", scope_pond="sales", scope_major=1, severity="error", title="t", message="m", f="F1")
     # wide (catchment-wide) + sales-only (scope match) fire; other-pond (scope miss) + recovery-only
     # (event miss) do not.
     got = d.db.execute(
@@ -180,13 +181,13 @@ def test_emit_routes_by_scope_and_event_filter(tmp_path):
 
 
 def test_emit_scope_is_name_at_major(tmp_path):
-    """A channel scoped to name@major matches only that line; a bare-name scope matches any major;
-    catchment-wide matches all (plans/remove-pond.md prerequisite)."""
-    d = _driver(tmp_path)
+    """A channel scoped to name@major matches only that line; catchment-wide matches all. A bare pond name
+    resolves to its highest deployed major (no "all majors"); scoping a bare undeployed name is rejected."""
+    d = _driver(tmp_path)  # sales@1 is deployed
     d.add_channel("wide", "https://x/wide", scope=None, events="failure")
-    d.add_channel("sales-any", "https://x/any", scope="sales", events="failure")     # any major
-    d.add_channel("sales-m1", "https://x/m1", scope="sales@1", events="failure")      # one line
-    d.add_channel("sales-m2", "https://x/m2", scope="sales@2", events="failure")
+    d.add_channel("bare", "https://x/bare", scope="sales", events="failure")     # bare → sales@1 (max deployed)
+    d.add_channel("m1", "https://x/m1", scope="sales@1", events="failure")        # explicit same line
+    d.add_channel("m2", "https://x/m2", scope="sales@2", events="failure")        # explicit, may precede deploy
 
     def fired(major):
         d.db.execute("DELETE FROM alert_delivery")
@@ -195,11 +196,13 @@ def test_emit_scope_is_name_at_major(tmp_path):
         return sorted(r[0] for r in d.db.execute(
             "SELECT c.name FROM alert_delivery a JOIN alert_channel c ON c.id = a.channel_id"))
 
-    assert fired(1) == ["sales-any", "sales-m1", "wide"]
-    assert fired(2) == ["sales-any", "sales-m2", "wide"]
-    # The scope round-trips through the DB as "name@major" / "name".
+    assert fired(1) == ["bare", "m1", "wide"]  # bare resolved to @1
+    assert fired(2) == ["m2", "wide"]           # @1 channels do not fire for @2
     scopes = {c["name"]: c["scope"] for c in d.list_channels()}
-    assert scopes["sales-m1"] == "sales@1" and scopes["sales-any"] == "sales" and scopes["wide"] is None
+    assert scopes["bare"] == "sales@1" and scopes["m2"] == "sales@2" and scopes["wide"] is None
+
+    with pytest.raises(ValueError, match="not deployed"):  # a bare undeployed name has no major to resolve
+        d.add_channel("x", "https://x/x", scope="orders", events="failure")
 
 
 def test_emit_dedup_is_per_episode(tmp_path):
