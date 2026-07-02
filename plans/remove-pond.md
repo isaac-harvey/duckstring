@@ -5,6 +5,15 @@ Catchment. The main use case is dropping an old major that nothing runs any more
 [reset](reset.md): reset scrubs a Pond's runtime and keeps it live; remove takes the Pond out of the live
 system entirely, **keeping its deployment record + run history**.
 
+## Prerequisite — alert channels become `name@major`-scoped
+
+Today a scoped `alert_channel` is bound to a Pond **name** (it "survives version/major changes"). That is
+inconsistent with every other Pond-attached construct (Spouts, windows, triggers, retry — all `name@major`)
+and it means a per-major removal can't cleanly take its alerts. **Fix first:** re-scope a Pond alert
+channel to `name@major` (a `major` alongside the scope name; a catchment-wide channel stays unscoped).
+Once that lands, removal treats alerts exactly like Spouts. See the "prerequisite fix" note below and the
+separate alerts-scoping change.
+
 ## Scope — the removable unit is `name@major`
 
 The runtime identity is the pond key `name@major` (the `pond` row = the selected version of one major
@@ -39,11 +48,14 @@ and parks **hard-blocked** with the source named — the honest, source-driven s
 fixes each sink on its own schedule (redeploy without the pin, repoint, or remove it too). There is **no
 auto-cascade** to independent sinks.
 
-The one thing removal *does* clean up is the line's **own Spouts** — a Spout is a real `pond` (kind
-`outlet`, named `{source}#{spout}`) wired to a specific source major via `pond_to_pond`; it has no meaning
-once its source line is gone, so each Spout bound to this `name@major` is removed with it (itself a line
-removal — Spouts have no downstream). **Alerts are left alone** — `alert_channel` is scoped by *name*, not
-major, so it survives for the other majors / a redeploy.
+What removal *does* clean up is the line's **own attachments** — its Spouts and its alert channels:
+
+- **Spouts** — a Spout is a real `pond` (kind `outlet`, named `{source}#{spout}`) wired to a specific
+  source major via `pond_to_pond`; it has no meaning once its source line is gone, so each Spout bound to
+  this `name@major` is removed with it (itself a line removal — Spouts have no downstream).
+- **Alert channels** — scoped to `name@major` (like every other Pond-attached config; this scoping is a
+  **prerequisite fix**, below), so the line's channels are removed with it. A catchment-wide channel
+  (unscoped) is untouched.
 
 ## Guard — idle and demand-free
 
@@ -66,8 +78,9 @@ transient "blocked" marking is needed):
 2. **Quiesce + scrub disk** — terminate the Duck (`wait=True`, freeing `registry.duckdb`), `rmtree` the
    `ponds/{name}/m{major}/` runtime tree (registry + `pond.db` ledger + local `data/`), and if a remote
    `data_root` is set, `rmtree` the line's remote data dir (reuse `reset_pond`'s disk-scrub).
-3. **Remove its Spouts** — for each `is_spout` Pond whose `pond_to_pond` source is this `(name, major)`,
-   remove that Spout line (its `pond(id)` config + `pond` row + any egress worker state).
+3. **Remove its attachments** — each `is_spout` Pond whose `pond_to_pond` source is this `(name, major)`
+   (remove that Spout line: its `pond(id)` config + `pond` row + egress worker state), and every
+   `alert_channel` scoped to this `name@major` (+ its `alert_delivery` outbox rows).
 4. **Delete the `pond(id)`-keyed config** — `pond_state`, `pond_target`, `pond_retry`, `pond_window`,
    `pond_trigger`, `pond_spout`, and `pond_to_pond WHERE pond_id = ?` (this line as a *sink*). FK order:
    these children first.
@@ -101,7 +114,9 @@ the caller can report the blast radius).
 
 ## Build order
 
-1. `Driver.remove_pond(name, major)` — the guard + quiesce/scrub (reuse reset) + Spout removal + row
+0. **Prerequisite:** re-scope Pond alert channels to `name@major` (schema + CRUD + matching + UI). Build
+   and land this first.
+1. `Driver.remove_pond(name, major)` — the guard + quiesce/scrub (reuse reset) + Spout/alert removal + row
    deletes + `reload()`. Return the blast radius.
 2. The `DELETE` route + `pond remove` CLI.
 3. The Sidebar Remove button + type-to-confirm dialog (reuse `ConfirmDialog`).
@@ -113,6 +128,7 @@ the caller can report the blast radius).
   goes blocked-with `has_missing_source` naming `catalog`.
 - Guard: remove is rejected (409) while running and while a standing Wave is active; succeeds after
   `sleep`.
-- A Spout on the removed line is removed with it; a name-scoped alert channel survives.
+- A Spout on the removed line is removed with it; an alert channel scoped to the line is removed too, while
+  a catchment-wide (unscoped) channel survives.
 - Removing `name@1` leaves `name@2` (if deployed) fully intact.
 - Redeploying the removed `name@major` restores it, with the pre-removal history still present.
