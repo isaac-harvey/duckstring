@@ -247,6 +247,41 @@ def _record_meta(con, table: str, mode: str, pk: tuple[str, ...]) -> None:
     )
 
 
+def drop_meta(con, table: str) -> None:
+    """Remove a Trickle table's meta row (mode/pk/floor/watermarks). After this the table is absent from
+    :func:`read_meta`, which is how a delete signals "no prior state" so the builder recomputes it whole
+    (see ``plans/deletes.md``)."""
+    if _table_exists(con, META_TABLE):
+        con.execute(f'DELETE FROM {_q(META_TABLE)} WHERE table_name = ?', [table])
+
+
+# The published companion suffixes of a Trickle base table — a delete of any of these resolves to (and
+# takes) the whole base collection: deleting a changelog/band alone would corrupt the reconstructable main.
+_COMPANION_SUFFIXES = ("__changelog", "__band", DROPLOG_SUFFIX, BASE_SUFFIX)
+
+
+def base_table_name(name: str) -> str:
+    """Map a Trickle **companion** (``X__changelog`` / ``X__band`` / ``X__droplog`` / ``X__base``) to its
+    base table ``X``; any other name is returned unchanged. A delete acts on the whole collection, so a
+    companion target resolves to its base (see ``plans/deletes.md``)."""
+    for suf in _COMPANION_SUFFIXES:
+        if name.endswith(suf) and len(name) > len(suf):
+            return name[: -len(suf)]
+    return name
+
+
+def drop_table(con, name: str) -> None:
+    """Drop a table's **entire registry collection** — the deletable unit (see ``plans/deletes.md``). For a
+    Trickle that is the base/main + ``__changelog`` + warm ``__band`` + ``__droplog`` + the aggregate/scan
+    state companions + the meta row/floor; for a plain overwrite table just the one table. Idempotent."""
+    for t in (
+        name, changelog_name(name), warm_name(name), f"{name}{DROPLOG_SUFFIX}",
+        f"{AGG_STATE_PREFIX}{name}", f"{ACC_STATE_PREFIX}{name}",
+    ):
+        con.execute(f'DROP TABLE IF EXISTS {_q(t)}')
+    drop_meta(con, name)
+
+
 def _f_base(con, table: str):
     """The merge main's **fold watermark** — the freshness up to which the ``__changelog`` has been folded
     into the base table. ``None`` before the first checkpoint (the whole changelog is still the main)."""

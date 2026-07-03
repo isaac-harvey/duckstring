@@ -30,7 +30,7 @@ from __future__ import annotations
 import re
 
 from .context import SYSTEM_PREFIX
-from .io import D_COL, RESCAN_KINDS, _q, _table_exists, normalize_pk, read_registry_delta, unique_name
+from .io import D_COL, RESCAN_KINDS, _q, _table_exists, normalize_pk, read_meta, read_registry_delta, unique_name
 
 _W = "_duckstring_w"  # scratch weight column for prior-state reconstruction (distinct from the Z-set D_COL)
 
@@ -677,8 +677,12 @@ class TrickleBuilder:
           join inputs to ``key ∈ K`` (the affected keys). ``False`` keeps the delta composition but skips the
           ``IN (…)`` restriction (joins the full new/old states and diffs) — useful when the change is large
           enough to trip ``p`` anyway, so the filter buys nothing. (No effect when ``ivm=False``.)"""
-        if not ivm:
-            # ivm=False escape: ignore deltas, recompute the whole output and diff vs the stored main.
+        # Absent output (dropped by a delete, or a genuine bootstrap) ⇒ recompute whole: the incremental
+        # path only *appends* ΔO to the changelog and never reads the sink, so composing a partial delta
+        # onto a nonexistent log would persist just that delta as a false bootstrap. `name not in read_meta`
+        # (not raw table-existence — a young merge main has only a changelog pre-checkpoint) is the signal.
+        # See plans/deletes.md. `ivm=False` is the manual sibling escape.
+        if not ivm or name not in read_meta(self.ctx.con):
             o_prime = self._full_join()
             self._require_pk(out_pk, o_prime.columns)
             return "comprehensive", o_prime

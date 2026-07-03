@@ -87,6 +87,12 @@ def _seed(project: Project) -> bool:
     return True
 
 
+def _staging_dir(project: Project) -> Path:
+    from ..objects import STAGING_DIR
+
+    return project.out_dir / STAGING_DIR
+
+
 def _export(project: Project, f=None) -> None:
     registry = project.out_dir / "registry.duckdb"
     if not registry.exists():
@@ -94,6 +100,7 @@ def _export(project: Project, f=None) -> None:
     import duckdb
 
     from ..dataplane import get_data_plane
+    from ..objects import commit_objects
 
     def _copy() -> None:
         con = duckdb.connect(str(registry))
@@ -103,6 +110,9 @@ def _export(project: Project, f=None) -> None:
             con.close()
 
     retry_on_lock(_copy)
+    # Objects publish after the table export (which writes the sidecar); the staging under out_dir is
+    # created during the run and cleared here.
+    commit_objects(_staging_dir(project), project.out_dir, f)
 
 
 def run_pond(project: Project, ripple: str | None = None, fresh: bool = False) -> RunResult:
@@ -140,7 +150,8 @@ def run_pond(project: Project, ripple: str | None = None, fresh: bool = False) -
             try:
                 by_name[name]["func"](
                     Pond(project.name, project.version, con, root=project.puddles_dir,
-                         f=run_f, previous_f=previous_f)
+                         f=run_f, previous_f=previous_f,
+                         staging_dir=_staging_dir(project), own_data_dir=project.out_dir)
                 )
             finally:
                 con.close()

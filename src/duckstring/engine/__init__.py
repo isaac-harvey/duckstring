@@ -16,6 +16,8 @@ from __future__ import annotations
 from . import pond, worker
 from .catchment import (
     EngineState,
+    block_on_missing_asset,
+    clear_missing_asset,
     clear_pond,
     complete_ripple,
     derive_blocked,
@@ -82,6 +84,8 @@ __all__ = [
     "fail_pond",
     "required_sinks",
     "derive_blocked",
+    "block_on_missing_asset",
+    "clear_missing_asset",
     "tap_pond",
     "pulse_pond",
     "sleep_pond",

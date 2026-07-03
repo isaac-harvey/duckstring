@@ -1,12 +1,14 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { useLiveStore, THEME_BLOCKED, THEME_BRAND } from '@/lib/store';
+import { useLiveStore, atLeast, THEME_BLOCKED, THEME_BRAND } from '@/lib/store';
 import {
-  fetchTables, fetchFreshness, fetchHistory, fetchCount, fetchPage,
-  type DataQuery, type TableInfo, type TrickleMode, type PageResult, UnauthorizedError,
+  fetchTables, fetchFreshness, fetchHistory, fetchCount, fetchPage, fetchObjects, downloadObject,
+  deleteTable, deleteObject,
+  type DataQuery, type TableInfo, type TrickleMode, type PageResult, type ObjectInfo, UnauthorizedError,
 } from '@/lib/api';
 import type { PondId } from '@/lib/types';
+import { ConfirmDialog, type ConfirmOpts } from './ConfirmDialog';
 
 const ROW_H = 26;
 const NUM_W = 60;
@@ -24,6 +26,15 @@ const COL_LABELS: Record<string, string> = { [FRESH]: 'freshness', [UPDATES]: 'u
 // History event → label colour (reusing the theme): create = white, update = brand cyan, delete = blocked red.
 const EVENT_COLOR: Record<string, string> = { create: '#f4f4f5', update: THEME_BRAND, delete: THEME_BLOCKED };
 
+// A Trickle companion (X__changelog / X__band / X__droplog / X__base) belongs to base table X — a delete
+// takes the whole collection, so a companion resolves to its base (mirrors trickle_io.base_table_name).
+function baseTableName(name: string): string {
+  for (const s of ['__changelog', '__band', '__droplog', '__base']) {
+    if (name.endsWith(s) && name.length > s.length) return name.slice(0, -s.length);
+  }
+  return name;
+}
+
 const browseSql = (pond: string, table: string) => `SELECT * FROM "${pond}"."${table}" LIMIT 1000`;
 const on401 = (e: unknown) => e instanceof UnauthorizedError && useLiveStore.setState({ needsKey: true });
 // A freshness ISO → compact, stable 'YYYY-MM-DD HH:MM:SS' (backend serialises in UTC).
@@ -38,7 +49,11 @@ export function DataViewerModal() {
 function DataViewer({ pondId }: { pondId: PondId }) {
   const close = useLiveStore((s) => s.closeDataViewer);
   const pondName = useLiveStore((s) => s.ponds[pondId]?.name ?? pondId);
+  const hasObjects = useLiveStore((s) => s.pondInfo[pondId]?.hasObjects ?? false);
+  const canManage = useLiveStore((s) => atLeast(s.accessLevel, 'full'));
 
+  // Tabular data vs non-tabular Objects (models/blobs). Objects are a separate published surface.
+  const [view, setView] = useState<'tables' | 'objects'>('tables');
   const [tables, setTables] = useState<TableInfo[] | null>(null);
   const [table, setTable] = useState<string | null>(null);
   const [mode, setMode] = useState<'browse' | 'query'>('browse');
@@ -54,6 +69,8 @@ function DataViewer({ pondId }: { pondId: PondId }) {
   const [fHi, setFHi] = useState<string | null>(null);
   // The record whose changelog history is open (merge only).
   const [historyPk, setHistoryPk] = useState<Record<string, unknown> | null>(null);
+  // A pending destructive confirmation (themed in-app dialog), shared by the table + object deletes.
+  const [confirm, setConfirm] = useState<ConfirmOpts | null>(null);
   // Opt-in column sort (null = the efficient base order). Clicking a header cycles asc → desc → off.
   const [sort, setSort] = useState<{ col: string | null; desc: boolean }>({ col: null, desc: false });
   const cycleSort = (col: string) =>
@@ -92,6 +109,8 @@ function DataViewer({ pondId }: { pondId: PondId }) {
           setTable(ts[0].name);
           setSqlText(browseSql(pondName, ts[0].name));
           void loadFreshness(ts[0].name, ts[0]);
+        } else if (hasObjects) {
+          setView('objects'); // no tables — open straight to the Objects tab
         }
       } catch (e) {
         on401(e);
@@ -104,10 +123,12 @@ function DataViewer({ pondId }: { pondId: PondId }) {
   }, []);
 
   useEffect(() => {
-    const onKey = (e: KeyboardEvent) => e.key === 'Escape' && (historyPk ? setHistoryPk(null) : close());
+    // When a confirm dialog is open it owns Escape (it closes itself); don't also close the modal.
+    const onKey = (e: KeyboardEvent) =>
+      e.key === 'Escape' && !confirm && (historyPk ? setHistoryPk(null) : close());
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [close, historyPk]);
+  }, [close, historyPk, confirm]);
 
   const expand = () => {
     setExpanded(true);
@@ -129,6 +150,37 @@ function DataViewer({ pondId }: { pondId: PondId }) {
     setTotal(null);
     setSort({ col: null, desc: false }); // columns differ between tables
     void loadFreshness(t, ti);
+  };
+  const deleteCurrentTable = () => {
+    if (!table) return;
+    const target = table;
+    // A Trickle companion (changelog/band/droplog/base) is one deletable unit with its base table.
+    const base = baseTableName(target);
+    const baseMode = tables?.find((t) => t.name === base)?.trickle ?? null;
+    const notes: string[] = [];
+    if (base !== target) notes.push(`“${target}” is part of table “${base}”, so the whole table is deleted.`);
+    if (baseMode === 'merge') notes.push('Its changelog is removed too.');
+    else if (baseMode === 'append') notes.push('It is an append Trickle — its droplog and accumulated history are dropped.');
+    setConfirm({
+      title: `Delete “${base}”?`,
+      body: `This cannot be undone.${notes.length ? ' ' + notes.join(' ') : ''}`,
+      confirmLabel: 'Delete table',
+      action: async () => {
+        try {
+          await deleteTable(pondId, target); // the Catchment resolves a companion to its base
+          const ts = await fetchTables(pondId);
+          setTables(ts);
+          setTable(ts[0]?.name ?? null);
+          if (ts[0]) {
+            setSqlText(browseSql(pondName, ts[0].name));
+            void loadFreshness(ts[0].name, ts[0]);
+          }
+        } catch (e) {
+          on401(e);
+          setTablesError(e instanceof Error ? e.message : String(e));
+        }
+      },
+    });
   };
   const runQuery = () => {
     if (!sqlText.trim()) return;
@@ -177,7 +229,24 @@ function DataViewer({ pondId }: { pondId: PondId }) {
         {/* Header */}
         <div style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '10px 14px', borderBottom: '1px solid #27272a', flexShrink: 0 }}>
           <span style={{ fontSize: 13, fontWeight: 700, color: '#e4e4e7' }}>{pondName}</span>
-          {tables && tables.length > 0 && (
+          {hasObjects && tables && tables.length > 0 && (
+            <span style={{ display: 'inline-flex', border: '1px solid #3f3f46', borderRadius: 6, overflow: 'hidden' }}>
+              {(['tables', 'objects'] as const).map((v) => (
+                <button
+                  key={v}
+                  onClick={() => setView(v)}
+                  style={{
+                    background: view === v ? '#27272a' : 'transparent', border: 'none', padding: '5px 11px',
+                    color: view === v ? '#e4e4e7' : '#71717a', fontSize: 12, fontWeight: 700, cursor: 'pointer',
+                    fontFamily: 'inherit',
+                  }}
+                >
+                  {v === 'tables' ? 'Tables' : 'Objects'}
+                </button>
+              ))}
+            </span>
+          )}
+          {view === 'tables' && tables && tables.length > 0 && (
             <span style={{ position: 'relative', display: 'inline-flex', alignItems: 'center' }}>
               <select
                 value={mode === 'browse' ? table ?? '' : ''}
@@ -196,12 +265,27 @@ function DataViewer({ pondId }: { pondId: PondId }) {
               <span style={{ position: 'absolute', right: 9, pointerEvents: 'none', color: '#71717a', fontSize: 9 }}>▼</span>
             </span>
           )}
-          {mode === 'query' && (
+          {view === 'tables' && mode === 'browse' && table && canManage && (
+            <button
+              onClick={deleteCurrentTable}
+              title={`Delete "${table}" (drops its data + state, then rebuilds)`}
+              style={{
+                background: 'transparent', border: `1px solid ${THEME_BLOCKED}66`, borderRadius: 5,
+                color: THEME_BLOCKED, fontSize: 11.5, fontWeight: 700, padding: '4px 9px', cursor: 'pointer',
+                fontFamily: 'inherit',
+              }}
+            >
+              Delete
+            </button>
+          )}
+          {view === 'tables' && mode === 'query' && (
             <span style={{ fontSize: 10, fontWeight: 700, color: '#ee9333', letterSpacing: '0.06em' }}>QUERY</span>
           )}
-          <span style={{ fontSize: 11, color: '#71717a' }}>
-            {total == null ? '' : `${total.toLocaleString()} row${total === 1 ? '' : 's'}`}
-          </span>
+          {view === 'tables' && (
+            <span style={{ fontSize: 11, color: '#71717a' }}>
+              {total == null ? '' : `${total.toLocaleString()} row${total === 1 ? '' : 's'}`}
+            </span>
+          )}
           <button
             onClick={close}
             title="Close (Esc)"
@@ -215,7 +299,7 @@ function DataViewer({ pondId }: { pondId: PondId }) {
         </div>
 
         {/* Freshness window — only for a Trickle table being browsed */}
-        {mode === 'browse' && trickle && (
+        {view === 'tables' && mode === 'browse' && trickle && (
           <FreshnessWindow
             freshness={freshness}
             floor={floor}
@@ -227,6 +311,7 @@ function DataViewer({ pondId }: { pondId: PondId }) {
         )}
 
         {/* SQL box */}
+        {view === 'tables' && (
         <div style={{ display: 'flex', alignItems: 'flex-start', gap: 8, padding: '10px 14px', borderBottom: '1px solid #27272a', flexShrink: 0 }}>
           <textarea
             ref={taRef}
@@ -274,15 +359,20 @@ function DataViewer({ pondId }: { pondId: PondId }) {
             )}
           </div>
         </div>
+        )}
 
-        {/* Grid */}
+        {/* Body: the tabular grid, or the Objects list */}
         <div style={{ flex: 1, minHeight: 0 }}>
-          {tablesError ? (
+          {view === 'objects' ? (
+            <ObjectsPanel pondId={pondId} canManage={canManage} requestConfirm={setConfirm} />
+          ) : tablesError ? (
             <div style={{ padding: 16, color: '#ef4444', fontSize: 12.5 }}>{tablesError}</div>
           ) : tables == null ? (
             <div style={{ padding: 16, color: '#71717a', fontSize: 12.5 }}>Loading…</div>
           ) : query == null ? (
-            <div style={{ padding: 16, color: '#71717a', fontSize: 12.5 }}>This Pond has no exported tables.</div>
+            <div style={{ padding: 16, color: '#71717a', fontSize: 12.5 }}>
+              This Pond has no exported tables.{hasObjects ? ' See the Objects tab.' : ''}
+            </div>
           ) : (
             <VirtualGrid key={queryKey} query={query} onTotal={setTotal} onRowClick={setHistoryPk} sort={sort} onSort={cycleSort} />
           )}
@@ -291,7 +381,138 @@ function DataViewer({ pondId }: { pondId: PondId }) {
         {historyPk && table && (
           <HistoryOverlay pond={pondId} pondName={pondName} table={table} pk={historyPk} onClose={() => setHistoryPk(null)} />
         )}
+
+        {confirm && <ConfirmDialog opts={confirm} onClose={() => setConfirm(null)} />}
       </div>
+    </div>
+  );
+}
+
+// ─── Objects list ────────────────────────────────────────────────────────────
+
+function fmtBytes(n: number | null): string {
+  if (n == null) return '';
+  if (n < 1024) return `${n} B`;
+  const units = ['KB', 'MB', 'GB', 'TB'];
+  let v = n / 1024;
+  let i = 0;
+  while (v >= 1024 && i < units.length - 1) {
+    v /= 1024;
+    i += 1;
+  }
+  return `${v.toFixed(v < 10 ? 1 : 0)} ${units[i]}`;
+}
+
+function ObjectsPanel({ pondId, canManage, requestConfirm }: {
+  pondId: PondId; canManage: boolean; requestConfirm: (o: ConfirmOpts) => void;
+}) {
+  const [objects, setObjects] = useState<ObjectInfo[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    try {
+      setObjects(await fetchObjects(pondId));
+    } catch (e) {
+      on401(e);
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }, [pondId]);
+
+  useEffect(() => {
+    const t = setTimeout(() => void load(), 0);
+    return () => clearTimeout(t);
+  }, [load]);
+
+  const download = async (o: ObjectInfo) => {
+    setBusy(o.name);
+    try {
+      await downloadObject(pondId, o);
+    } catch (e) {
+      on401(e);
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const remove = (o: ObjectInfo) => {
+    requestConfirm({
+      title: `Delete “${o.name}”?`,
+      body: 'This Object is removed. It returns only if a Ripple writes it again.',
+      confirmLabel: 'Delete object',
+      action: async () => {
+        setBusy(o.name);
+        try {
+          await deleteObject(pondId, o.name);
+          await load();
+        } catch (e) {
+          on401(e);
+          setError(e instanceof Error ? e.message : String(e));
+        } finally {
+          setBusy(null);
+        }
+      },
+    });
+  };
+
+  if (error) return <div style={{ padding: 16, color: '#ef4444', fontSize: 12.5 }}>{error}</div>;
+  if (objects == null) return <div style={{ padding: 16, color: '#71717a', fontSize: 12.5 }}>Loading…</div>;
+  if (objects.length === 0) return <div style={{ padding: 16, color: '#71717a', fontSize: 12.5 }}>No objects.</div>;
+
+  return (
+    <div style={{ height: '100%', overflow: 'auto' }}>
+      <table style={{ borderCollapse: 'collapse', width: '100%', fontSize: 12, color: '#d4d4d8' }}>
+        <thead style={{ position: 'sticky', top: 0, zIndex: 1 }}>
+          <tr>
+            <th style={th({})}>name</th>
+            <th style={th({})}>kind</th>
+            <th style={th({ textAlign: 'right' })}>size</th>
+            <th style={th({})}>freshness</th>
+            <th style={th({ textAlign: 'right' })}></th>
+          </tr>
+        </thead>
+        <tbody>
+          {objects.map((o, i) => (
+            <tr key={o.name} style={{ height: ROW_H, background: i % 2 ? '#121217' : 'transparent' }}>
+              <td style={td({ color: '#e4e4e7', fontWeight: 600 })} title={o.name}>{o.name}</td>
+              <td style={td({ color: '#a1a1aa' })}>{o.is_dir ? 'directory' : `file${o.ext ? ` · ${o.ext}` : ''}`}</td>
+              <td style={td({ textAlign: 'right', color: '#a1a1aa' })}>{fmtBytes(o.size)}</td>
+              <td style={td({ color: '#a1a1aa' })}>{o.f ? fmtTs(o.f) : <span style={{ color: '#3f3f46' }}>·</span>}</td>
+              <td style={td({ textAlign: 'right' })}>
+                <span style={{ display: 'inline-flex', gap: 6, justifyContent: 'flex-end' }}>
+                  <button
+                    onClick={() => download(o)}
+                    disabled={busy === o.name}
+                    title={o.is_dir ? 'Download as a zip' : 'Download'}
+                    style={{
+                      background: 'transparent', border: '1px solid #3f3f46', borderRadius: 5, padding: '2px 10px',
+                      color: busy === o.name ? '#52525b' : '#06c4e6', fontSize: 11.5, fontWeight: 700,
+                      cursor: busy === o.name ? 'default' : 'pointer', fontFamily: 'inherit',
+                    }}
+                  >
+                    {busy === o.name ? '…' : o.is_dir ? 'Download .zip' : 'Download'}
+                  </button>
+                  {canManage && (
+                    <button
+                      onClick={() => remove(o)}
+                      disabled={busy === o.name}
+                      title="Delete this Object"
+                      style={{
+                        background: 'transparent', border: `1px solid ${THEME_BLOCKED}66`, borderRadius: 5,
+                        padding: '2px 10px', color: THEME_BLOCKED, fontSize: 11.5, fontWeight: 700,
+                        cursor: busy === o.name ? 'default' : 'pointer', fontFamily: 'inherit',
+                      }}
+                    >
+                      Delete
+                    </button>
+                  )}
+                </span>
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
     </div>
   );
 }
@@ -638,6 +859,7 @@ function HistoryOverlay({
     </div>
   );
 }
+
 
 function th(extra: React.CSSProperties): React.CSSProperties {
   return {

@@ -261,6 +261,86 @@ def list_pond_tables(
     return {"tables": out}
 
 
+@router.get("/ponds/{name}/objects", dependencies=[auth.read])
+def list_pond_objects(
+    name: str, request: Request, major: Optional[int] = None, version: Optional[str] = None,
+):
+    """The non-tabular Objects this Pond's selected major line has published (name, byte size, last
+    freshness, file-vs-directory) — the Data Viewer's Objects list. See ``plans/objects.md``."""
+    from ...objects import list_objects
+
+    m = _resolve_major(request, name, major, version)
+    try:
+        objs = list_objects(_data_dir(request, name, m))
+    except Exception:
+        objs = {}
+    out = [
+        {"name": n, "size": e.get("size"), "f": e.get("f"), "is_dir": bool(e.get("is_dir")), "ext": e.get("ext", "")}
+        for n, e in sorted(objs.items())
+    ]
+    return {"objects": out}
+
+
+@router.get("/ponds/{name}/objects/{obj}", dependencies=[auth.read])
+def get_pond_object(
+    name: str, obj: str, request: Request, major: Optional[int] = None, version: Optional[str] = None,
+):
+    """Download one Object — a single file inline, a directory Object zipped."""
+    from ...objects import OBJECTS_DIR, list_objects, object_path
+
+    m = _resolve_major(request, name, major, version)
+    data_dir = _data_dir(request, name, m)
+    entry = list_objects(data_dir).get(obj)
+    if entry is None:
+        raise HTTPException(status_code=404, detail=f"No object '{obj}' for {name} (major {m})")
+    if entry["is_dir"]:
+        scratch = Path(tempfile.mkdtemp(prefix="duckstring-obj-dl-"))
+        try:
+            local = object_path(data_dir, obj, scratch)  # real path (local) or a download (object store)
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                for f in sorted(local.rglob("*")):
+                    if f.is_file():
+                        zf.writestr(str(f.relative_to(local)), f.read_bytes())
+            body = buf.getvalue()
+        finally:
+            import shutil
+
+            shutil.rmtree(scratch, ignore_errors=True)
+        return Response(
+            content=body, media_type="application/zip",
+            headers={"Content-Disposition": f'attachment; filename="{obj}.zip"'},
+        )
+    data = data_dir.read_bytes(OBJECTS_DIR, obj, f"data{entry['ext']}")
+    return Response(
+        content=data, media_type="application/octet-stream",
+        headers={"Content-Disposition": f'attachment; filename="{obj}{entry["ext"]}"'},
+    )
+
+
+@router.delete("/ponds/{name}/objects/{obj}", dependencies=[auth.full])
+def delete_pond_object(
+    name: str, obj: str, request: Request, major: Optional[int] = None, version: Optional[str] = None,
+):
+    """Delete one non-tabular Object from a Pond — its payload + sidecar entry (no registry, no run).
+    Gated on the Pond being idle so it can't race a run's commit_objects re-adding the entry (409)."""
+    from ...objects import delete_object
+
+    m = _resolve_major(request, name, major, version)
+    driver = getattr(request.app.state, "driver", None)
+    if driver is not None:
+        try:
+            key = driver.resolve(name, major, version)
+            if driver.is_pond_running(key):
+                raise HTTPException(status_code=409, detail="the Pond is running — delete an Object when it is idle")
+        except HTTPException:
+            raise
+        except Exception:
+            pass  # not a live engine Pond (exported data outlives a deployment) — allow the delete
+    delete_object(_data_dir(request, name, m), obj)
+    return {"ok": True}
+
+
 @router.get("/ponds/{name}/freshness", dependencies=[auth.read])
 def pond_freshness(
     name: str, request: Request, table: str,

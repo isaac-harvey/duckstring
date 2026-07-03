@@ -71,7 +71,7 @@ def test_freshness_lag_and_failure_flag(tmp_path):
 
 def test_alert_delivery_counts(tmp_path):
     d = _driver(tmp_path)
-    d.add_channel("ops", "https://x/ops", scope_name=None, events="failure")
+    d.add_channel("ops", "https://x/ops", scope=None, events="failure")
     d._emit_alert("failure", scope_pond="sales", severity="error", title="t", message="m", f="F1")
     samples = _parse(render_metrics(d.metrics_snapshot()))
     assert samples['duckstring_alert_deliveries_total{status="pending"}'] == 1

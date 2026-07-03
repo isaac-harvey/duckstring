@@ -13,7 +13,8 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 
-from ..catchment.registry import pond_registry_path
+from ..catchment.registry import pond_data_dir, pond_major_dir, pond_registry_path
+from ..objects import STAGING_DIR
 
 _import_lock = threading.Lock()
 
@@ -54,6 +55,7 @@ def _run_ripple(
     func, pond_name: str, version: str, con, root_str: str,
     source_majors: dict[str, int], f: datetime | None, previous_f: datetime | None,
     data_root: str | None = None, sources_changed: bool = True, skip_sink=None,
+    staging_dir=None, own_data_dir=None,
 ) -> None:
     from ..core import Pond
 
@@ -65,6 +67,7 @@ def _run_ripple(
             name=pond_name, version=version, con=con, root=Path(root_str),
             source_majors=source_majors, f=f, previous_f=previous_f, data_root=data_root,
             sources_changed=sources_changed, skip_sink=skip_sink,
+            staging_dir=staging_dir, own_data_dir=own_data_dir,
         ))
     finally:
         con.close()
@@ -107,6 +110,9 @@ class RippleExecutor:
         self.data_root = data_root
         self.registry_path = pond_registry_path(root, pond_name, major)
         self.registry_path.parent.mkdir(parents=True, exist_ok=True)
+        # Object (non-tabular output) staging + own published location — see objects.py.
+        self.staging_dir = pond_major_dir(root, pond_name, major) / STAGING_DIR
+        self.own_data_dir = pond_data_dir(root, pond_name, major, data_root)
         # ONE registry instance for the Duck's life: ripples (and the export) each run on a `.cursor()`
         # off it. Separate `connect()`s to the same file in one process raise a "file handle conflict"
         # (a Binder error, not a transient lock) the moment two overlap — single instance avoids it.
@@ -139,6 +145,7 @@ class RippleExecutor:
                 func, self.pond_name, self.version, self._cursor(), str(self.root),
                 self.source_majors, f, previous_f, self.data_root,
                 sources_changed=sources_changed, skip_sink=skip_sink,
+                staging_dir=self.staging_dir, own_data_dir=self.own_data_dir,
             )
 
         fut = self._pool.submit(_task)
@@ -160,10 +167,13 @@ class RippleExecutor:
         run's freshness ``f`` (recorded by snapshotting backends). ``contract`` is the major line's
         additive contract — a violation raises :class:`ContractViolation` *before* publishing (last-good
         is left intact). Returns the published output schema (for the Catchment to capture)."""
-        from ..catchment.registry import pond_data_dir
+        from ..objects import commit_objects
 
-        data_dir = pond_data_dir(self.root, self.pond_name, self.major, self.data_root)
-        return _export_data(self._cursor(), data_dir, f, contract)
+        schema = _export_data(self._cursor(), self.own_data_dir, f, contract)
+        # Objects commit only after the table publish passed the contract gate — a failed run leaves the
+        # last-good Object intact (the staged writes are discarded on the next run / wipe).
+        commit_objects(self.staging_dir, self.own_data_dir, f)
+        return schema
 
     def wipe(self) -> None:
         """Drop every table in the Pond's registry — a Refresh's cold reset. The next run then reads its
@@ -189,6 +199,9 @@ class RippleExecutor:
                 cur.close()
 
         retry_on_lock(_drop)
+        import shutil
+
+        shutil.rmtree(self.staging_dir, ignore_errors=True)  # discard any uncommitted staged Objects
 
     def shutdown(self) -> None:
         self._pool.shutdown(wait=True)

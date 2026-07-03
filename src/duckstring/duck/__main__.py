@@ -100,11 +100,20 @@ def serve(core: DuckCore, executor: RippleExecutor, client: CatchmentClient) -> 
                     inflight -= 1
                     last_progress = _now()
                     name, exc, started, finished = data
-                    print(f"[duck:{core.pond_name}] ripple {name} failed: {exc}", flush=True)
-                    _launch(core.ripple_failed(
-                        name, _now(), started_at=started, finished_at=finished,
-                        error=_msg(exc), traceback=_tb(exc),
-                    ))
+                    from ..core import MissingSourceAsset
+                    if isinstance(exc, MissingSourceAsset):
+                        # A read of an unpublished Source asset — waiting, not broken. Park it (no retry,
+                        # no failure); the Catchment blocks the Pond with a reason. See plans/reset.md.
+                        print(f"[duck:{core.pond_name}] ripple {name} waiting on {exc.source}.{exc.table}", flush=True)
+                        _launch(core.ripple_missing_source(
+                            name, exc.source, exc.table, _now(), started_at=started, finished_at=finished,
+                        ))
+                    else:
+                        print(f"[duck:{core.pond_name}] ripple {name} failed: {exc}", flush=True)
+                        _launch(core.ripple_failed(
+                            name, _now(), started_at=started, finished_at=finished,
+                            error=_msg(exc), traceback=_tb(exc),
+                        ))
 
                 core.flush(client.post_event)
             except Exception as exc:

@@ -47,6 +47,18 @@ def identity(request: Request):
     return {"id": rows.get("id"), "name": rows.get("name")}
 
 
+class _ResetBody(BaseModel):
+    clear_history: bool = False
+
+
+@router.post("/catchment/reset", dependencies=[auth.full])
+def reset_catchment(request: Request, body: _ResetBody = _ResetBody()):
+    """Reset the whole Catchment to a fresh-deploy state — scrub every Pond's registry, data, and ledger
+    and rewind all freshness, keeping the deployed bundles, operational config, secrets, and keys. The
+    sanctioned replacement for ``rm -rf .duckstring``; stop-the-world. See plans/reset.md."""
+    return request.app.state.driver.reset_catchment(clear_history=body.clear_history)
+
+
 class _RotateBody(BaseModel):
     levels: list[str] | None = None  # subset to reroll; None = all three
 

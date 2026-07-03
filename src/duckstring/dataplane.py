@@ -271,8 +271,32 @@ def publish_plan(con, data_dir: Path, f=None) -> list[str]:
         if m["mode"] == "merge":
             entry["f_base"] = m.get("f_base")  # fold watermark — the read reconstructs base ⊎ changelog>f_base
         payload[base] = entry
+    # Objects persist until overwritten (not per-run declared), so carry their sidecar section forward —
+    # this run's staged Object commits fold their fresh entries in afterwards (see objects.commit_objects).
+    existing_objects = trickle.load_sidecar(data_dir).get("objects")
+    if existing_objects:
+        payload["objects"] = existing_objects
     trickle.write_sidecar(data_dir, payload)
     return tables
+
+
+def unpublish_table(data_dir, name: str) -> None:
+    """Remove a table's **published** collection from ``data_dir`` — every physical form (wholesale
+    ``{name}.parquet``, the per-run parts dir ``{name}/``, the ``__changelog`` / ``__band`` / ``__base`` /
+    ``__droplog`` companion dirs) **and** its sidecar entry. The registry side is dropped separately
+    (:func:`duckstring.trickle.io.drop_table`); together they are one table delete (see plans/deletes.md).
+    Idempotent — missing forms are skipped."""
+    from . import trickle_io as trickle
+
+    store = _as_storage(data_dir)
+    store.remove(f"{name}.parquet")
+    for d in (name, trickle.changelog_name(name), trickle.warm_name(name),
+              trickle.base_dir_name(name), f"{name}{trickle.DROPLOG_SUFFIX}"):
+        store.rmtree(d)
+    sidecar = trickle.load_sidecar(store)
+    if name in sidecar:
+        del sidecar[name]
+        trickle.write_sidecar(store, sidecar)
 
 
 class ParquetDataPlane(DataPlane):

@@ -184,6 +184,233 @@ def test_trickle_chain_runs_end_to_end(runtime):
         assert n > 0, f"{name}: empty reconstructed main"
 
 
+def test_delete_table_removes_now_and_rebuilds_on_next_run(runtime):
+    """`delete-table` removes a table (data + registry state) **immediately** — no run, no freshness
+    change — and it reappears only when the Pond next genuinely runs, rebuilt whole by the builder's
+    absent⇒comprehensive trigger (plans/deletes.md)."""
+    import duckdb
+
+    from duckstring.dataplane import ParquetDataPlane
+
+    url, root = runtime
+    _deploy(url, _TRICKLE_PONDS)
+    httpx.post(f"{url}/api/ponds/revenue/pulse", timeout=5.0)
+    assert _wait(lambda: (_pond_status(url, "revenue") or {}).get("end_f") is not None)
+    time.sleep(1.0)  # let the chain settle to idle
+
+    data_dir = root / "ponds" / "priced" / "m1" / "data"
+
+    def state_count():
+        con = duckdb.connect()
+        try:
+            sql = ParquetDataPlane().read_select(data_dir, "priced_line")
+            return con.sql(f"SELECT count(*) FROM ({sql})").fetchone()[0]
+        except Exception:
+            return None  # not published (removed)
+        finally:
+            con.close()
+
+    def run_count():
+        return len(httpx.get(f"{url}/api/runs", params={"pond": "priced", "limit": 1000}, timeout=5.0).json()["runs"])
+
+    n_before = state_count()
+    assert n_before and n_before > 0
+    end_f_before = (_pond_status(url, "priced") or {}).get("end_f")
+    runs_before = run_count()
+
+    # Delete → gone at once. No run, no freshness bump.
+    r = httpx.request("DELETE", f"{url}/api/ponds/priced/tables/priced_line", timeout=10.0)
+    assert r.status_code == 200, r.text
+    assert state_count() is None, "priced_line was not removed"
+    time.sleep(2.0)  # give any (erroneous) run a chance to appear
+    assert state_count() is None, "priced_line came back with no genuine run (a rebuild was forced)"
+    assert (_pond_status(url, "priced") or {}).get("end_f") == end_f_before, "freshness advanced on a delete"
+    assert run_count() == runs_before, "a Pond Run was logged for a delete"
+
+    # A genuine new run (fresh pulse) rebuilds it whole via the absence trigger. The source has grown a
+    # batch since, so it comes back at the *current* full state (≥ the old count), not just a delta.
+    httpx.post(f"{url}/api/ponds/revenue/pulse", timeout=5.0)
+    assert _wait(lambda: (state_count() or 0) >= n_before, timeout=45.0), \
+        f"priced_line did not rebuild on the next run (count now {state_count()}, was {n_before})"
+    time.sleep(1.0)
+
+    # Deleting the *changelog* companion resolves to the base table — the whole merge collection goes,
+    # never a changelog stranded from its main.
+    assert (root / "ponds" / "priced" / "m1" / "data" / "priced_line__changelog").exists()
+    r = httpx.request("DELETE", f"{url}/api/ponds/priced/tables/priced_line__changelog", timeout=10.0)
+    assert r.status_code == 200, r.text
+    assert state_count() is None, "deleting the changelog left the main"
+    assert not (root / "ponds" / "priced" / "m1" / "data" / "priced_line__changelog").exists()
+
+
+def test_missing_source_asset_blocks_downstream_with_reason(runtime):
+    """A downstream that reads a deleted Source table parks **blocked-with-a-reason** — not failed, no
+    retry-budget burn (plans/reset.md Mechanism 2) — and recovers when the Source republishes."""
+    url, root = runtime
+    _deploy(url, _TRICKLE_PONDS)
+    httpx.post(f"{url}/api/ponds/revenue/pulse", timeout=5.0)
+    assert _wait(lambda: (_pond_status(url, "revenue") or {}).get("end_f") is not None)
+    time.sleep(1.0)
+
+    # Delete catalog.product — priced reads it. Then force priced to hit the (now missing) read.
+    r = httpx.request("DELETE", f"{url}/api/ponds/catalog/tables/product", timeout=10.0)
+    assert r.status_code == 200, r.text
+    httpx.post(f"{url}/api/ponds/priced/force", timeout=5.0)
+
+    def priced():
+        return _pond_status(url, "priced") or {}
+
+    assert _wait(lambda: priced().get("is_blocked") and priced().get("blocked_reason"), timeout=30.0), \
+        f"priced never blocked (status={priced()})"
+    st = priced()
+    assert "catalog.product" in st["blocked_reason"]
+    assert st["is_failed"] is False, "a missing Source asset must not fail the Pond"
+    assert st["failures"] == 0, "a missing Source asset must not burn the retry budget"
+
+    # Recover: rebuild catalog.product at a fresh freshness → priced re-reads clean → unblocks.
+    httpx.post(f"{url}/api/ponds/catalog/pulse", timeout=5.0)
+    assert _wait(lambda: not priced().get("is_blocked") and not priced().get("blocked_reason"), timeout=30.0), \
+        f"priced never recovered (status={priced()})"
+
+
+def test_reset_pond_scrubs_and_rebuilds(runtime):
+    """`reset {pond}` scrubs a Pond's registry, published data, and ledger and rewinds its freshness —
+    keeping code + config + demand — and it rebuilds from scratch when next demanded (plans/reset.md).
+    Lazy: nothing runs until re-triggered; the Pond survives (identity/config intact)."""
+    url, root = runtime
+    _deploy(url, _TRICKLE_PONDS)
+    httpx.post(f"{url}/api/ponds/revenue/pulse", timeout=5.0)
+    assert _wait(lambda: (_pond_status(url, "revenue") or {}).get("end_f") is not None)
+    time.sleep(1.0)
+
+    line = root / "ponds" / "catalog" / "m1"
+    assert (line / "registry.duckdb").exists() and (line / "data").exists()
+    assert (_pond_status(url, "catalog") or {}).get("has_tables") is True
+
+    r = httpx.post(f"{url}/api/ponds/catalog/reset", timeout=15.0)
+    assert r.status_code == 200, r.text
+    assert not (line / "registry.duckdb").exists(), "registry not scrubbed"
+    assert not (line / "data").exists(), "published data not scrubbed"
+    st = _pond_status(url, "catalog") or {}
+    assert st.get("has_tables") is False and st.get("end_f") is None, f"freshness not rewound ({st})"
+    assert st.get("version"), "the Pond (identity/config) must survive a reset"
+
+    # Lazy: it rebuilds from scratch on the next genuine demand.
+    httpx.post(f"{url}/api/ponds/catalog/pulse", timeout=5.0)
+    assert _wait(lambda: (_pond_status(url, "catalog") or {}).get("has_tables") is True, timeout=30.0), \
+        "catalog did not rebuild after reset + pulse"
+
+
+def test_reset_catchment_scrubs_all_keeps_artifacts(runtime):
+    """`catchment reset` scrubs every line's registry/data/ledger and rewinds all freshness — keeping the
+    deployed artifacts + config — and the whole chain rebuilds from the Inlets down (plans/reset.md)."""
+    url, root = runtime
+    _deploy(url, _TRICKLE_PONDS)
+    httpx.post(f"{url}/api/ponds/revenue/pulse", timeout=5.0)
+    assert _wait(lambda: (_pond_status(url, "revenue") or {}).get("end_f") is not None)
+    time.sleep(1.0)
+    assert all((root / "ponds" / p / "m1" / "registry.duckdb").exists() for p in _TRICKLE_PONDS)
+
+    r = httpx.post(f"{url}/api/catchment/reset", timeout=30.0)
+    assert r.status_code == 200, r.text
+    assert r.json()["ponds"] == len(_TRICKLE_PONDS)
+    for p in _TRICKLE_PONDS:
+        assert not (root / "ponds" / p / "m1").exists(), f"{p} runtime not scrubbed"
+        # The deployed artifact ({name}/{version}/) survives.
+        assert any(d.is_dir() and d.name[0].isdigit() for d in (root / "ponds" / p).iterdir()), \
+            f"{p} artifact was removed"
+        assert (_pond_status(url, p) or {}).get("has_tables") is False
+
+    # The whole chain rebuilds from scratch on the next demand.
+    httpx.post(f"{url}/api/ponds/revenue/pulse", timeout=5.0)
+    assert _wait(lambda: (_pond_status(url, "revenue") or {}).get("end_f") is not None
+                 and (_pond_status(url, "priced") or {}).get("has_tables") is True, timeout=45.0), \
+        "chain did not rebuild after catchment reset"
+
+
+def test_reset_pond_rejects_while_running(runtime):
+    """A reset requires the Pond idle (409 while a Run is in flight)."""
+    url, _ = runtime
+    _deploy(url, _TRICKLE_PONDS)
+    httpx.post(f"{url}/api/ponds/orders/wave", timeout=5.0)  # a standing pull keeps it busy
+    # Catch it mid-run; if we miss the window the wave will re-run it, so retry a few times.
+    saw_409 = False
+    for _ in range(40):
+        r = httpx.post(f"{url}/api/ponds/orders/reset", timeout=5.0)
+        if r.status_code == 409:
+            saw_409 = True
+            break
+        time.sleep(0.05)
+    httpx.post(f"{url}/api/ponds/orders/remove", timeout=5.0)  # drop the wave
+    assert saw_409, "reset was allowed mid-run (should 409)"
+
+
+def test_remove_pond_retires_line(runtime):
+    """`pond remove` (a name@major line): scrub its runtime, delete its live selection + its own Spout +
+    its name@major alert channel, keep its deployment record + run history, and leave downstream pinning it
+    blocked-on-missing-source. A catchment-wide alert survives. See plans/remove-pond.md."""
+    import sqlite3
+
+    url, root = runtime
+    _deploy(url, _TRICKLE_PONDS)
+    httpx.post(f"{url}/api/ponds/revenue/pulse", timeout=5.0)
+    assert _wait(lambda: (_pond_status(url, "revenue") or {}).get("end_f") is not None)
+    time.sleep(1.0)  # settle to idle (a pulse is one-shot → no standing demand)
+
+    # Attach a Spout + a scoped alert + a catchment-wide alert to catalog.
+    sp = httpx.post(f"{url}/api/ponds/catalog/spouts", json={
+        "destination": f"file://{root}/out", "table": "product", "mode": "auto"}, timeout=5.0).json()
+    spout_name = f"catalog#{sp['name']}"       # the Spout's pond name (as it appears in status)
+    spout_key = f"{spout_name}@1"              # its pond key (as returned in spouts_removed)
+    httpx.post(f"{url}/api/alerts", json={"name": "cat-line", "destination": "https://x/a", "scope": "catalog@1"}, timeout=5.0)
+    httpx.post(f"{url}/api/alerts", json={"name": "wide", "destination": "https://x/w", "scope": None}, timeout=5.0)
+
+    def catalog_runs():
+        db = sqlite3.connect(root / "duck.db")
+        try:
+            return db.execute(
+                "SELECT count(*) FROM pond_run pr JOIN pond_version pv ON pv.id = pr.pond_version_id "
+                "JOIN pond_name pn ON pn.id = pv.pond_name_id WHERE pn.name = 'catalog'").fetchone()[0]
+        finally:
+            db.close()
+
+    runs_before = catalog_runs()
+    assert runs_before > 0 and (root / "ponds" / "catalog" / "m1").exists()
+
+    r = httpx.request("DELETE", f"{url}/api/ponds/catalog", params={"major": 1}, timeout=15.0)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["removed"] == "catalog@1"
+    assert body["now_blocked"] == ["priced"] and spout_key in body["spouts_removed"]
+
+    # Gone from the live system + its runtime scrubbed; the deployed artifact + run history survive.
+    assert _pond_status(url, "catalog") is None
+    assert not (root / "ponds" / "catalog" / "m1").exists()
+    assert any(d.is_dir() and d.name[0].isdigit() for d in (root / "ponds" / "catalog").iterdir()), "artifact removed"
+    assert catalog_runs() == runs_before, "run history was not kept"
+    # Its Spout went with it; the scoped alert went, the catchment-wide one survived.
+    assert all(p["name"] != spout_name for p in httpx.get(f"{url}/api/status", timeout=5.0).json()["ponds"])
+    alert_names = {c["name"] for c in httpx.get(f"{url}/api/alerts", timeout=5.0).json()["channels"]}
+    assert "cat-line" not in alert_names and "wide" in alert_names
+    # Downstream that pinned catalog@1 blocks on the missing Source.
+    assert _wait(lambda: (_pond_status(url, "priced") or {}).get("is_blocked") is True, timeout=10.0)
+
+
+def test_remove_pond_rejects_with_demand(runtime):
+    """Remove requires the line idle + demand-free — a standing Wave is demand, so remove 409s until it's
+    cleared (sleep)."""
+    url, _ = runtime
+    _deploy(url, _TRICKLE_PONDS)
+    httpx.post(f"{url}/api/ponds/catalog/wave", timeout=5.0)  # a standing pull = demand
+    time.sleep(0.5)
+    r = httpx.request("DELETE", f"{url}/api/ponds/catalog", params={"major": 1}, timeout=5.0)
+    assert r.status_code == 409, r.text
+    httpx.post(f"{url}/api/ponds/catalog/sleep", timeout=5.0)  # clears demand + the standing trigger
+    time.sleep(0.5)
+    r = httpx.request("DELETE", f"{url}/api/ponds/catalog", params={"major": 1}, timeout=15.0)
+    assert r.status_code == 200, r.text
+
+
 def test_refresh_flag_rebuilds_and_bumps_floor(runtime):
     """`control refresh` is lazy: it flags the Pond (refresh_pending) but runs nothing. The next run is a
     cold wipe-and-rebuild that raises the published changelog floor, so downstream coverage-misses."""

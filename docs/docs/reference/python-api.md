@@ -107,6 +107,34 @@ df = pd.DataFrame(fetch_from_api())                    # arbitrary Python
 pond.write_table("snapshot", pond.con.from_df(df))
 ```
 
+### Objects — non-tabular outputs
+
+Not every output is a table. A trained model, a serialised vectoriser, a rendered report — these are **Objects**: named, non-tabular artifacts a Pond publishes alongside its tables, read cross-Pond by the same `source.name` addressing.
+
+```python
+import pickle
+
+@ripple
+def train(pond):
+    model = fit(pond.read_table("features.daily"))
+    pond.write_object("model", pickle.dumps(model))       # a single blob
+    pond.write_object("checkpoint", "/tmp/run/ckpt")      # or a path — a file OR a directory
+```
+
+- **`pond.write_object(name, src)`** — publish under `name`. `src` is raw `bytes`, a file path, or a directory path (published as one unit — e.g. a HuggingFace model directory). Overwrite semantics, like `write_table`; the write is staged during the run and committed atomically when the run publishes, so a later Ripple failure leaves the last-good Object intact.
+- **`pond.read_object("source.name")` → `bytes`** — a single-file Object's bytes (own `"name"` or a Source's `"source.name"`). Raises for a directory Object.
+- **`pond.object_path("source.name")` → `Path`** — a local path to the Object, valid for a single file *and* a directory. A remote (object-store) Object is materialised locally once; use this for large or directory artifacts you load by path:
+
+```python
+@ripple
+def score(pond):
+    import pickle
+    model = pickle.loads(pond.read_object("trainer.model"))          # a blob, straight to bytes
+    tokenizer = AutoTokenizer.from_pretrained(pond.object_path("trainer.hf"))  # a directory, by path
+```
+
+Objects are overwrite-only and ripple-only (no history/versioning yet). They appear under the **Objects** tab of the [Data Viewer](../guides/web-ui.md), download via `duckstring get-object <pond> <name>`, and can be removed with `duckstring delete-object <pond> <name>` (or the tab's Delete button) — a deleted Object returns only if a Ripple writes it again.
+
 ### `pond.sources_changed()` → `bool` and `pond.skip()`
 
 By default Duckstring skips a Pond Run whose Sources are all unchanged since it last ran — it *passes*, advancing freshness with no execution, so downstream skips too (see [Freshness](../concepts/freshness.md#no-change-and-passes)). Most Ponds need nothing here; the skip is automatic and the Ripple never runs.
@@ -153,6 +181,7 @@ The handle `p`:
 | `p.path` | The destination directory (`puddles/ponds/{source}/data/`) — write any non-table artifact there directly. |
 | `p.write_table([name,] relation)` | Export a relation as a table's Parquet snapshot (atomic). Accepts anything `write_table` on a Pond accepts. |
 | `p.write_path(path)` | Copy a parquet/csv file or glob in. |
+| `p.write_object(name, src)` | Seed a non-tabular [Object](#objects--non-tabular-outputs) for the Source under test (`bytes`, a file, or a directory), so a Pond reading `"{source}.{name}"` resolves it. `p.read_object` / `p.object_path` read it back. |
 | `p.catchment(name=None)` | A `Catchment` client bound to the Source: `.get([table])` fetches a table, `.query(sql)` runs SQL against the Source's exported tables, `.tables()` lists them. |
 
 Returning a relation is shorthand for `p.write_table(relation)`; returning a path string for `p.write_path(path)`. Puddle code never runs on a Catchment — only `pond hydrate` imports it.

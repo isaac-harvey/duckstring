@@ -30,6 +30,8 @@ from ..engine import (
     RippleState,
     Trigger,
     Window,
+    block_on_missing_asset,
+    clear_missing_asset,
     clear_pond,
     complete_ripple,
     derive_blocked,
@@ -70,6 +72,26 @@ def _now() -> datetime:
 
 def _iso(dt: datetime) -> str:
     return dt.isoformat()
+
+
+def _split_scope(scope: str | None) -> tuple[str | None, int | None]:
+    """An alert-channel scope string → ``(scope_name, scope_major)``. ``"name@major"`` → one line;
+    ``"name"`` → ``(name, None)`` (a bare name — ``add_channel`` resolves it to the highest deployed major);
+    ``None``/``""`` → catchment-wide."""
+    if not scope:
+        return None, None
+    base, sep, mj = scope.rpartition("@")
+    if sep and base and mj.isdigit():
+        return base, int(mj)
+    return scope, None
+
+
+def _format_scope(scope_name: str | None, scope_major: int | None) -> str | None:
+    """The inverse of :func:`_split_scope` — ``(name, major)`` → ``"name@major"``; ``(name, None)`` →
+    ``"name"``; ``(None, _)`` → ``None`` (catchment-wide)."""
+    if scope_name is None:
+        return None
+    return f"{scope_name}@{scope_major}" if scope_major is not None else scope_name
 
 
 # ─── Repair scope graph helpers (D3 — see plans/refresh.md) ────────────────────
@@ -440,6 +462,208 @@ class Driver:
             self.state = refresh_pond(self.state, pond, clear=clear)
             self._persist_state()
             self.state_version += 1
+
+    def delete_table(self, pond: str, table: str) -> None:
+        """Delete one table — its published data **and** its registry collection — from a Pond, **now**.
+        No run and no freshness change: the table is simply gone, and reappears only if the Pond's code
+        recreates it on a genuine future run (where the builder's absent⇒comprehensive trigger rebuilds it
+        whole). Requires the Pond to be idle. See plans/deletes.md."""
+        from pathlib import Path
+
+        from ..dataplane import unpublish_table
+        from ..trickle_io import base_table_name, drop_table
+        from .registry import pond_connect, pond_data_dir
+
+        with self.lock:
+            ps = self.state.pond_states.get(pond)
+            if ps is not None and ps.start_f > ps.end_f:
+                raise ValueError("the Pond is running — delete a table when it is idle")
+            # A Trickle companion (changelog/band/droplog/base) resolves to its base — the collection is one
+            # deletable unit; deleting a changelog alone would corrupt the reconstructable main.
+            table = base_table_name(table)
+            meta = self.meta[pond]
+            name, major = meta["name"], meta["major"]
+            # An idle Duck still holds registry.duckdb open, so free it before dropping (it respawns on the
+            # next run). Then drop the table's registry collection + its published data — no run, no rebuild.
+            self.launcher.terminate(pond, wait=True)
+            self._idle_since.pop(pond, None)
+            con = pond_connect(Path(self.root), name, major)
+            try:
+                drop_table(con, table)
+            finally:
+                con.close()
+            unpublish_table(pond_data_dir(Path(self.root), name, major, self.data_root), table)
+            self.state_version += 1
+
+    def reset_pond(self, pond: str, clear_history: bool = False) -> None:
+        """Reset one Pond to a fresh-deploy state — scrub its registry, published data, and ledger, and
+        rewind its freshness/fault to ``NEVER`` — while **keeping** its deployed artifact, operational
+        config, and **demand**. Lazy: it forces nothing; preserved demand + standing triggers re-drive the
+        rebuild when next eligible (the data dir is empty, so no downstream reads a gap — nobody reads a
+        ``NEVER`` Source). Requires the Pond idle. See plans/reset.md."""
+        import shutil
+        from pathlib import Path
+
+        from .registry import pond_data_dir, pond_major_dir
+
+        with self.lock:
+            ps = self.state.pond_states.get(pond)
+            if ps is not None and ps.start_f > ps.end_f:
+                raise ValueError("the Pond is running — reset it when idle")
+            meta = self.meta[pond]
+            name, major = meta["name"], meta["major"]
+            # 1. Free + scrub the on-disk runtime: registry.duckdb, pond.db ledger, and the published data.
+            self.launcher.terminate(pond, wait=True)
+            self._idle_since.pop(pond, None)
+            shutil.rmtree(pond_major_dir(Path(self.root), name, major), ignore_errors=True)
+            if self.data_root is not None:  # published data lives outside the state root (bucket/Volume)
+                pond_data_dir(Path(self.root), name, major, self.data_root).rmtree()
+            # 2. Rewind freshness/fault in duck.db (keep demand + operational config).
+            self.db.execute(
+                "UPDATE pond_state SET start_f=?, end_f=?, changed_f=?, d_ms=0, is_failed=0, is_blocked=0, "
+                "failed_f=?, failures=0, is_killed=0, refresh_pending=0 WHERE pond_id=?",
+                (_iso(NEVER), _iso(NEVER), _iso(NEVER), _iso(NEVER), meta["pond_id"]),
+            )
+            if clear_history:
+                self.db.execute("DELETE FROM ripple_run WHERE pond_version_id=?", (meta["version_id"],))
+                self.db.execute("DELETE FROM pond_run WHERE pond_version_id=?", (meta["version_id"],))
+            self.db.commit()
+            # 3. Rewind the in-memory engine state (keep demand: has_pull/pull_m/targets/standing_wake).
+            if ps is not None:
+                ps.start_f = ps.end_f = ps.changed_f = NEVER
+                ps.d = timedelta()
+                ps.is_failed = ps.is_blocked = ps.is_killed = False
+                ps.failed_f = NEVER
+                ps.failures = 0
+                ps.missing_asset = None
+                ps.refresh_pending = ps.repairing = False
+                ps.runs_started = ps.runs_completed = 0
+                for rid, rip in self.state.ripples.items():
+                    if rip.pond_id == pond:
+                        rs = self.state.ripple_states[rid]
+                        rs.start_f = rs.end_f = NEVER
+                        rs.is_running = False
+                        rs.started_at = None
+                        rs.runs_completed = 0
+                derive_blocked(self.state, pond)  # re-derive this Pond + propagate to its Sinks
+            self.state_version += 1
+            self._process(_now())
+
+    def reset_catchment(self, clear_history: bool = False) -> dict:
+        """Reset the **whole Catchment** to a fresh-deploy state — the sanctioned replacement for
+        ``rm -rf .duckstring``. Stop-the-world: terminate every Duck, scrub every line's registry, ledger,
+        and published data, rewind every Pond's freshness/fault to ``NEVER`` — keeping the deployed
+        artifacts, operational config, secrets, and keys. Rebuilds lazily (standing triggers + demand from
+        the Inlets down). See plans/reset.md. Returns ``{"ponds": n}``."""
+        import shutil
+        from pathlib import Path
+
+        from .registry import pond_data_dir
+
+        with self.lock:
+            # 1. Quiesce: stop every Duck (wait, so registry.duckdb handles are free) and drop pending work.
+            for key in list(self.state.ponds):
+                self.launcher.terminate(key, wait=True)
+            self.jobs.clear()
+            self._pending_transfers.clear()
+            self._pending_egress.clear()
+            self._idle_since.clear()
+            lines = [(m["name"], m["major"]) for m in self.meta.values()
+                     if not m.get("is_draw") and not m.get("is_spout")]
+            # 2. Scrub each line's runtime: registry.duckdb + pond.db + local data/ (keep the {version}/ artifacts).
+            ponds_root = Path(self.root) / "ponds"
+            if ponds_root.exists():
+                for name_dir in ponds_root.iterdir():
+                    if name_dir.is_dir():
+                        for m in name_dir.glob("m*"):
+                            if m.is_dir() and m.name[1:].isdigit():
+                                shutil.rmtree(m, ignore_errors=True)
+            if self.data_root is not None:  # published data outside the state root
+                for name, major in lines:
+                    try:
+                        pond_data_dir(Path(self.root), name, major, self.data_root).rmtree()
+                    except Exception:
+                        pass
+            # 3. Rewind all runtime rows in duck.db (keep demand + topology + operational config + secrets).
+            self.db.execute(
+                "UPDATE pond_state SET start_f=?, end_f=?, changed_f=?, d_ms=0, is_failed=0, is_blocked=0, "
+                "failed_f=?, failures=0, is_killed=0, refresh_pending=0",
+                (_iso(NEVER), _iso(NEVER), _iso(NEVER), _iso(NEVER)),
+            )
+            self.db.execute("DELETE FROM alert_delivery")  # the notification outbox is runtime, not config
+            if clear_history:
+                self.db.execute("DELETE FROM ripple_run")
+                self.db.execute("DELETE FROM pond_run")
+            self.db.commit()
+            # 4. Rebuild the engine from the scrubbed DB — a fresh-deploy engine (spouts/triggers re-armed).
+            self.reload()
+            self.state_version += 1
+            self._process(_now())
+            return {"ponds": len(lines)}
+
+    def remove_pond(self, name: str, major: int) -> dict:
+        """Remove (retire) one deployed major line ``name@major`` — delete its live ``pond`` selection, its
+        ``pond(id)``-keyed config, its on-disk runtime, and its **own** Spouts + alert channels — while
+        **keeping** its deployment record and run history (a redeploy un-retires it). Downstream sinks that
+        pin it re-derive ``has_missing_source`` and hard-block. Requires the line idle + demand-free (per the
+        thesis it never checks or refuses on dependents). See plans/remove-pond.md."""
+        import shutil
+        from pathlib import Path
+
+        from .registry import pond_data_dir, pond_major_dir
+
+        key = pond_key(name, major)
+        with self.lock:
+            meta = self.meta.get(key)
+            if meta is None or meta.get("is_draw") or meta.get("is_spout"):
+                raise ValueError(f"no removable Pond '{key}'")
+            ps = self.state.pond_states.get(key)
+            if ps is not None:  # guard: idle + demand-free (the whole op is atomic under the lock)
+                if ps.start_f > ps.end_f:
+                    raise ValueError("the Pond is running — sleep it first, then remove")
+                if ps.has_pull or ps.targets or ps.standing_wake or key in self.state.triggers:
+                    raise ValueError("the Pond has demand — clear it first (duckstring control sleep)")
+            pond_id = meta["pond_id"]
+            (pn_id,) = self.db.execute("SELECT pond_name_id FROM pond WHERE id = ?", (pond_id,)).fetchone()
+            # Blast radius: sinks that pin this line (they'll block on the missing Source) + its own Spouts.
+            now_blocked = sorted({r[0] for r in self.db.execute(
+                "SELECT pn.name FROM pond_to_pond ptp JOIN pond p ON p.id = ptp.pond_id "
+                "JOIN pond_name pn ON pn.id = p.pond_name_id "
+                "WHERE ptp.source_pond_name_id = ? AND ptp.source_major = ? AND p.is_spout = 0",
+                (pn_id, major))})  # Spouts of this line are removed with it, not left blocked
+            spouts = sorted(k for k, m in self.meta.items() if m.get("is_spout") and m.get("source_key") == key)
+
+            # 1. Quiesce + scrub the on-disk runtime (registry + pond.db ledger + local data). Keep the
+            #    {version}/ artifacts + the deployment/history rows.
+            self.launcher.terminate(key, wait=True)
+            self._idle_since.pop(key, None)
+            shutil.rmtree(pond_major_dir(Path(self.root), name, major), ignore_errors=True)
+            if self.data_root is not None:  # published data outside the state root
+                pond_data_dir(Path(self.root), name, major, self.data_root).rmtree()
+            # 2. Remove its attachments: its Spouts (full purge) + its name@major alert channels
+            #    (alert_delivery cascades via the FK).
+            for skey in spouts:
+                self._destroy_spout(skey)
+            self.db.execute("DELETE FROM alert_channel WHERE scope_name = ? AND scope_major = ?", (name, major))
+            # 3. Delete the pond(id)-keyed config + the pond selection row. Keep pond_version / ripple /
+            #    ripple_run / pond_run / pond_version_schema / pond_name (the retained record).
+            for tbl in ("pond_state", "pond_target", "pond_open", "pond_trigger", "pond_retry",
+                        "pond_window", "pond_spout", "pond_to_pond"):
+                self.db.execute(f"DELETE FROM {tbl} WHERE pond_id = ?", (pond_id,))
+            self.db.execute("DELETE FROM pond WHERE id = ?", (pond_id,))
+            self.db.commit()
+            # 4. Rebuild the engine — the line is gone; sinks re-derive has_missing_source.
+            self.reload()
+            self.state_version += 1
+            self._process(_now())
+            return {"removed": key, "spouts_removed": spouts, "now_blocked": now_blocked}
+
+    def is_pond_running(self, pond: str) -> bool:
+        """Whether a Pond has a Run in flight (start_f advanced past end_f) — the idle gate for an Object
+        delete (which must not race a run's commit_objects). Best-effort: unknown Pond ⇒ not running."""
+        with self.lock:
+            ps = self.state.pond_states.get(pond)
+            return ps is not None and ps.start_f > ps.end_f
 
     def repair(self, ponds: list[tuple[str, int | None]], downstream: bool = False) -> dict:
         """Repair — force-rebuild a **connected** set of Ponds now, in topological order (steps out of
@@ -886,7 +1110,8 @@ class Driver:
             src_name = self.meta.get(src_key, {}).get("name") if src_key else None
             spout_label = sm.get("name", spout_key)
             self._alert_failure(
-                spout_key, "spout", scope_pond=src_name, f=f,
+                spout_key, "spout", scope_pond=src_name,
+                scope_major=self.meta.get(src_key, {}).get("major"), f=f,
                 title=f"Spout '{spout_label}' delivery failed",
                 message=f"Egress delivery for spout '{spout_label}' failed: {error or 'unknown error'}",
             )
@@ -894,34 +1119,45 @@ class Driver:
 
     # ─── Alerts (failure & freshness notifications — see plans/alerts.md) ────────
 
-    def add_channel(self, name: str, destination: str, scope_name: str | None,
+    def add_channel(self, name: str, destination: str, scope: str | None,
                     events: str = "all", stale_ms: int | None = None) -> None:
-        """Create a notification channel (operational config, like a Spout). Validates the destination URI
-        + the event list; a not-yet-deployed scope name is allowed (a channel may precede its Pond)."""
+        """Create a notification channel (operational config, like a Spout). ``scope`` is ``"name@major"``
+        (one line) or ``None`` (catchment-wide) — a Pond-scoped channel is always a specific major. A bare
+        ``"name"`` resolves to the Pond's **highest deployed major** (like every other CLI/API surface); an
+        explicit ``"name@major"`` may precede deployment. Validates the destination URI + the event list."""
         from ..alerts import normalise_events, parse_notifier_destination
 
         parse_notifier_destination(destination)  # scheme + ${...} syntax (does not resolve credentials)
         events = ",".join(normalise_events(events)) if events else "all"
+        scope_name, scope_major = _split_scope(scope)
+        if scope_name is not None and scope_major is None:  # bare name → its highest deployed major
+            row = self.db.execute(
+                "SELECT MAX(p.major) FROM pond p JOIN pond_name pn ON pn.id = p.pond_name_id WHERE pn.name = ?",
+                (scope_name,),
+            ).fetchone()
+            if row is None or row[0] is None:
+                raise ValueError(f"Pond '{scope_name}' is not deployed — give a major, e.g. '{scope_name}@1'")
+            scope_major = row[0]
         with self.lock:
             existing = self.db.execute("SELECT 1 FROM alert_channel WHERE name = ?", (name,)).fetchone()
             if existing:
                 raise ValueError(f"An alert channel named '{name}' already exists")
             self.db.execute(
-                "INSERT INTO alert_channel (name, destination, scope_name, events, stale_ms) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (name, destination, scope_name, events, stale_ms),
+                "INSERT INTO alert_channel (name, destination, scope_name, scope_major, events, stale_ms) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (name, destination, scope_name, scope_major, events, stale_ms),
             )
             self.db.commit()
 
     def list_channels(self) -> list[dict]:
         with self.lock:
             rows = self.db.execute(
-                "SELECT name, destination, scope_name, events, stale_ms, enabled, created_at "
+                "SELECT name, destination, scope_name, scope_major, events, stale_ms, enabled, created_at "
                 "FROM alert_channel ORDER BY name"
             ).fetchall()
             return [
-                {"name": r[0], "destination": r[1], "scope": r[2], "events": r[3],
-                 "stale_ms": r[4], "enabled": bool(r[5]), "created_at": r[6]}
+                {"name": r[0], "destination": r[1], "scope": _format_scope(r[2], r[3]), "events": r[4],
+                 "stale_ms": r[5], "enabled": bool(r[6]), "created_at": r[7]}
                 for r in rows
             ]
 
@@ -988,9 +1224,9 @@ class Driver:
         name = self.db.execute("SELECT value FROM catchment_meta WHERE key = 'name'").fetchone()
         return name[0] if name and name[0] else None
 
-    def _emit_alert(self, kind: str, *, scope_pond: str | None, severity: str,
-                    title: str, message: str, f: str | None = None, detail: dict | None = None,
-                    match_kinds: tuple[str, ...] | None = None) -> None:
+    def _emit_alert(self, kind: str, *, scope_pond: str | None, scope_major: int | None = None,
+                    severity: str, title: str, message: str, f: str | None = None,
+                    detail: dict | None = None, match_kinds: tuple[str, ...] | None = None) -> None:
         """Enqueue one ``alert_delivery`` per matching enabled channel (dedup-fenced), then wake the alert
         worker. Matching = the channel's scope (catchment-wide, or this Pond's name) AND its ``events``
         including any of ``match_kinds`` (default: just ``kind``). A ``recovery`` passes the originating kind
@@ -1001,14 +1237,15 @@ class Driver:
 
             wanted = match_kinds or (kind,)
             channels = self.db.execute(
-                "SELECT id, events, scope_name FROM alert_channel WHERE enabled = 1"
+                "SELECT id, events, scope_name, scope_major FROM alert_channel WHERE enabled = 1"
             ).fetchall()
             if not channels:
                 return
             enqueued = False
-            for cid, events, scope_name in channels:
-                if scope_name is not None and scope_name != scope_pond:
-                    continue  # a pond-scoped channel ignores other Ponds / catchment-wide events
+            for cid, events, scope_name, ch_major in channels:
+                # A Pond-scoped channel matches exactly its (name, major); catchment-wide (name NULL) matches all.
+                if scope_name is not None and (scope_name != scope_pond or ch_major != scope_major):
+                    continue
                 subscribed = normalise_events(events)
                 if not any(k in subscribed for k in wanted):
                     continue
@@ -1030,18 +1267,19 @@ class Driver:
         except Exception as exc:  # noqa: BLE001 — alerting must never break the engine
             print(f"[catchment] alert emit failed ({kind}): {exc}", flush=True)
 
-    def _alert_failure(self, key: str, kind: str, *, scope_pond: str | None, f: str | None,
-                       title: str, message: str) -> None:
+    def _alert_failure(self, key: str, kind: str, *, scope_pond: str | None, scope_major: int | None,
+                       f: str | None, title: str, message: str) -> None:
         """Fire a failure/contract/spout alert and remember the key so its recovery is emitted when it
-        clears (in _process). ``scope_pond`` is the Pond name a channel scopes against."""
+        clears (in _process). ``scope_pond``/``scope_major`` are the Pond name@major a channel scopes
+        against."""
         blocked = sorted(
             self.meta[k]["name"] for k, ps in self.state.pond_states.items()
             if ps.is_blocked and k in self.meta and not self.meta[k].get("is_spout")
         )
         detail = {"blocked_downstream": blocked} if blocked else {}
-        self._emit_alert(kind, scope_pond=scope_pond, severity="error", title=title, message=message,
-                         f=f, detail=detail)
-        self._alerted_failures[key] = (kind, scope_pond, f)
+        self._emit_alert(kind, scope_pond=scope_pond, scope_major=scope_major, severity="error",
+                         title=title, message=message, f=f, detail=detail)
+        self._alerted_failures[key] = (kind, scope_pond, scope_major, f)
 
     def _emit_recoveries(self) -> None:
         """Emit a `recovery` for any Pond/Spout that was alerted as failed and has since cleared. Called
@@ -1050,10 +1288,10 @@ class Driver:
             ps = self.state.pond_states.get(key)
             if ps is not None and (ps.is_failed or ps.is_killed):
                 continue  # still down (or killed — a kill is intentional, not a recovery)
-            kind, scope_pond, _f = self._alerted_failures.pop(key)
+            kind, scope_pond, scope_major, _f = self._alerted_failures.pop(key)
             label = self.meta.get(key, {}).get("name", key)
             self._emit_alert(
-                "recovery", scope_pond=scope_pond, severity="info",
+                "recovery", scope_pond=scope_pond, scope_major=scope_major, severity="info",
                 title=f"Recovered: {label}", message=f"'{label}' recovered from a {kind} failure.",
                 f=_iso(ps.end_f) if ps is not None and ps.end_f != NEVER else None,
                 match_kinds=("recovery", kind),  # also reaches channels that only asked for the failure kind
@@ -1063,11 +1301,12 @@ class Driver:
         """The tick-driven freshness-SLA sweep (alongside _check_liveness). For each enabled channel with a
         ``stale_ms`` bound, alert a scoped Pond whose staleness exceeds it, and recover it when it advances."""
         channels = self.db.execute(
-            "SELECT id, scope_name, events, stale_ms FROM alert_channel WHERE enabled = 1 AND stale_ms IS NOT NULL"
+            "SELECT id, scope_name, scope_major, events, stale_ms FROM alert_channel "
+            "WHERE enabled = 1 AND stale_ms IS NOT NULL"
         ).fetchall()
         if not channels:
             return
-        for cid, scope_name, events, stale_ms in channels:
+        for cid, scope_name, ch_major, events, stale_ms in channels:
             from ..alerts import normalise_events
             if "freshness" not in normalise_events(events):
                 continue
@@ -1076,8 +1315,8 @@ class Driver:
                 m = self.meta.get(key)
                 if m is None or m.get("is_spout") or m.get("is_draw"):
                     continue
-                name = m["name"]
-                if scope_name is not None and scope_name != name:
+                name, major = m["name"], m["major"]
+                if scope_name is not None and (scope_name != name or ch_major != major):
                     continue
                 if ps.end_f == NEVER:  # never run → nothing to be stale about yet
                     continue
@@ -1087,7 +1326,7 @@ class Driver:
                     self._stale_breached.add(token)
                     age = int((now - ps.end_f).total_seconds())
                     self._emit_alert(
-                        "freshness", scope_pond=name, severity="warning",
+                        "freshness", scope_pond=name, scope_major=major, severity="warning",
                         title=f"'{name}' is stale", f=_iso(ps.end_f),
                         message=f"'{name}' has not been fresh for {age}s (SLA {int(stale_ms / 1000)}s).",
                         detail={"stale_seconds": age},
@@ -1095,7 +1334,7 @@ class Driver:
                 elif not stale and token in self._stale_breached:
                     self._stale_breached.discard(token)
                     self._emit_alert(
-                        "recovery", scope_pond=name, severity="info", f=_iso(ps.end_f),
+                        "recovery", scope_pond=name, scope_major=major, severity="info", f=_iso(ps.end_f),
                         title=f"'{name}' is fresh again",
                         message=f"'{name}' advanced back within its freshness SLA.",
                         match_kinds=("recovery", "freshness"),
@@ -1151,10 +1390,32 @@ class Driver:
                     )
                     self._process(now)  # settle the cascade first, so the blast radius is accurate
                     name = self.meta.get(pond, {}).get("name", pond)
-                    self._alert_failure(pond, "failure", scope_pond=name, f=f,
+                    self._alert_failure(pond, "failure", scope_pond=name,
+                                        scope_major=self.meta.get(pond, {}).get("major"), f=f,
                                         title=f"Pond '{name}' failed",
                                         message=f"Ripple '{rname}' failed: {err or 'unknown error'}")
+            elif kind == "missing_source":
+                # A Ripple read a Source asset that isn't published (deleted, or not produced yet). Park the
+                # Pond blocked-with-a-reason — NOT failed: no retry-budget burn, no failure alert. It
+                # recovers when the Source republishes something fresher. See plans/reset.md.
+                rname = payload["ripple"]
+                eid = f"{pond}.{rname}"
+                if eid in self.state.ripple_states:
+                    if f:
+                        self.state.ripple_states[eid].start_f = datetime.fromisoformat(f)
+                    reason = f"{payload.get('source')}.{payload.get('table')}"
+                    self.state = block_on_missing_asset(self.state, pond, reason, now)
+                    msg = f"waiting for '{reason}' to be published"
+                    self._fail_pond_run(pond, f, now, msg, None)  # history: the Run couldn't complete
+                    self._record_ripple_run(
+                        pond, rname, f, "failed",
+                        started_at=payload.get("started_at"),
+                        finished_at=payload.get("finished_at") or _iso(now),
+                        retry=payload.get("retry", 0), error=msg,
+                    )
+                    self._process(now)
             elif kind == "run_completed":
+                self.state = clear_missing_asset(self.state, pond)  # a clean read → the wait (if any) is over
                 self._finish_pond_run(pond, f, now, changed=payload.get("changed", True))
                 # Freeze the published output schema as the version's contract (the substrate the
                 # additive gate and min_version enforcement build on).
@@ -1780,7 +2041,8 @@ class Driver:
         self._process(now)  # settle the cascade first, so the blast radius (blocked downstream) is accurate
         name = self.meta.get(pond, {}).get("name", pond)
         verb = "broke its version contract" if alert_kind == "contract" else "failed"
-        self._alert_failure(pond, alert_kind, scope_pond=name, f=f,
+        self._alert_failure(pond, alert_kind, scope_pond=name,
+                            scope_major=self.meta.get(pond, {}).get("major"), f=f,
                             title=f"Pond '{name}' {verb}",
                             message=f"Pond '{name}' {verb}: {error or 'unknown error'}")
 
@@ -1876,6 +2138,22 @@ class Driver:
         except Exception:
             return set()
 
+    def _has_objects(self, key: str) -> bool:
+        """Whether this major line has published any non-tabular Object — gates the viewer's Objects tab."""
+        from pathlib import Path
+
+        from ..objects import list_objects
+        from .registry import pond_data_dir
+
+        meta = self.meta.get(key, {})
+        if meta.get("is_draw"):
+            return False
+        try:
+            data_dir = pond_data_dir(Path(self.root), meta["name"], meta["major"], self.data_root)
+            return bool(list_objects(data_dir))
+        except Exception:
+            return False
+
     def status(self) -> dict:
         with self.lock:
             from ..engine import NEVER, min_target
@@ -1893,6 +2171,7 @@ class Driver:
                 ps = self.state.pond_states[key]
                 # Whether this major line has published any tables — gates the Pond's data viewer.
                 has_tables = bool(self._exported_tables(key))
+                has_objects = self._has_objects(key)
                 # Ripples belonging to this Pond, with their live per-Ripple state and intra-Pond edges.
                 ripples = []
                 ripple_edges = []
@@ -1968,6 +2247,7 @@ class Driver:
                     ),
                     "version": self.meta[key]["version"],
                     "has_tables": has_tables,
+                    "has_objects": has_objects,
                     "status": st,
                     "gen": ps.runs_started,
                     "runs_completed": ps.runs_completed,
@@ -1980,6 +2260,7 @@ class Driver:
                     "trigger": trigger,
                     "is_failed": ps.is_failed,
                     "is_blocked": ps.is_blocked,
+                    "blocked_reason": (f"waiting for '{ps.missing_asset}'" if ps.missing_asset else None),
                     "is_killed": ps.is_killed,
                     "refresh_pending": ps.refresh_pending,
                     "repairing": ps.repairing,

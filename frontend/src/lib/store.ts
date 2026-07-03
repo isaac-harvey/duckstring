@@ -142,8 +142,10 @@ function transformStatus(payload: StatusPayload): StatusSlice {
       major: p.major,
       kind: p.kind,
       hasTables: p.has_tables ?? false,
+      hasObjects: p.has_objects ?? false,
       isFailed: p.is_failed,
       isBlocked: p.is_blocked,
+      blockedReason: p.blocked_reason ?? null,
       isKilled: p.is_killed,
       refreshPending: p.refresh_pending ?? false,
       repairing: p.repairing ?? false,
@@ -251,6 +253,7 @@ export interface LiveState extends StatusSlice {
   force(pond: PondId): Promise<void>;
   kill(pond: PondId): Promise<void>;
   refreshPond(pond: PondId, clear?: boolean): Promise<void>;
+  resetPond(pond: PondId): Promise<void>;
 
   // Repair (D3): a canvas selection mode that force-rebuilds a connected set of Ponds now.
   repairMode: boolean;
@@ -349,8 +352,15 @@ export const useLiveStore = create<LiveState>((set, get) => ({
     } catch {
       /* leave the last lineage in place */
     }
+    const next = transformStatus(payload);
+    // Drop a selection whose Pond has vanished (e.g. it was just removed) so the Sidebar doesn't hold a
+    // ghost and the canvas re-frames to what's left (see the fit-all fallback in DagCanvas).
+    const sel = get().selectedPondId;
+    const cleared = sel && !next.ponds[sel]
+      ? { selectedPondId: null, selectedRippleId: null, selectedTriggerId: null }
+      : {};
     set({
-      ...transformStatus(payload), lineage, statusVersion: payload.version,
+      ...next, ...cleared, lineage, statusVersion: payload.version,
       now: Date.now(), connected: true, error: null, needsKey: false,
     });
 
@@ -467,6 +477,7 @@ export const useLiveStore = create<LiveState>((set, get) => ({
   force: (pond) => act(get, set, () => postTrigger(pond, 'force')),
   kill: (pond) => act(get, set, () => postTrigger(pond, 'kill')),
   refreshPond: (pond, clear = false) => act(get, set, () => refreshPond(pond, clear)),
+  resetPond: (pond) => act(get, set, () => postTrigger(pond, 'reset')),
 
   repairMode: false,
   repairScope: [],

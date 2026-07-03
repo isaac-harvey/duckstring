@@ -268,7 +268,8 @@ def derive_blocked(s: EngineState, pid: PondId) -> None:
     downstream; a Pond still reads its blocked state solely from itself and its Sources."""
     ps = s.pond_states[pid]
     pond = s.ponds[pid]
-    blocked = ps.is_failed or ps.is_killed or ps.remote_down or pond.has_missing_source or any(
+    blocked = ps.is_failed or ps.is_killed or ps.remote_down or ps.missing_asset is not None \
+        or pond.has_missing_source or any(
         s.pond_states[sp].is_failed or s.pond_states[sp].is_blocked or s.pond_states[sp].is_killed
         or s.pond_states[sp].repairing  # a Source mid-repair: don't run downstream on its stale output
         for sp in pond.sources
@@ -281,6 +282,38 @@ def derive_blocked(s: EngineState, pid: PondId) -> None:
 
 
 # ─── Lifecycle ────────────────────────────────────────────────────────────────
+
+
+def block_on_missing_asset(state: EngineState, pid: PondId, reason: str, now: datetime) -> EngineState:
+    """A Ripple read a Source asset that isn't published (:class:`~duckstring.core.MissingSourceAsset`).
+    Park the Pond **blocked-with-a-reason** — *not* failed: no retry-budget burn, no failure alert. Abandon
+    the incomplete Run (roll the phantom ``start_f → end_f`` so liveness won't fail it), record the reason,
+    and re-arm a **non-propagating** local pull so the Pond re-attempts when its Source next publishes
+    something fresher (it does not solicit the Source — auto-solicit is deferred). Propagates ``blocked``
+    downstream. Recovers via :func:`clear_missing_asset` on the next successful Run. See plans/reset.md."""
+    s = state.clone()
+    ps = s.pond_states[pid]
+    ps.start_f = ps.end_f  # abandon the incomplete run (the read failed; nothing published)
+    for rid in ripples_of(s, pid):
+        rs = s.ripple_states[rid]
+        rs.is_running = False
+        rs.started_at = None
+        rs.start_f = rs.end_f
+        rs.targets = [t for t in rs.targets if t > rs.end_f]
+    ps.missing_asset = reason
+    ps.has_pull = True       # retry when the Source is fresher …
+    ps.pull_local = True     # … without soliciting it (deferred auto-solicit)
+    derive_blocked(s, pid)
+    return s
+
+
+def clear_missing_asset(state: EngineState, pid: PondId) -> EngineState:
+    """Clear a Pond's missing-asset wait (its Source republished and it read clean) and re-derive blocked."""
+    s = state.clone()
+    if s.pond_states[pid].missing_asset is not None:
+        s.pond_states[pid].missing_asset = None
+        derive_blocked(s, pid)
+    return s
 
 
 def can_start_pond(s: EngineState, pid: PondId, now: datetime) -> bool:
@@ -684,9 +717,33 @@ def sentinel(now: datetime, state: EngineState) -> tuple[EngineState, list[Rippl
     return s, started
 
 
+def restore_demand(s: EngineState, now: datetime) -> None:
+    """Re-derive **pull** demand from the sinks — a corrective invariant that makes the one-shot pull
+    propagation *eventually consistent*. A Pond still holding a propagating pull it can't yet satisfy
+    implies its behind Sources (the cold-start test ``S.start_f <= D.start_f``) should hold pulls too; if a
+    reset / a crash between propagate-and-persist / a blocked-Source refusal dropped that upstream, this
+    re-solicits it. ``pond_receive_pull`` is idempotent (the ``has_pull`` guard) and **refuses blocked
+    Ponds**, so a path automatically parks under a blocked Source and heals on the first tick after it
+    unblocks. Excludes killed Ponds (parked terminal) and ``pull_local`` Wakes (non-propagating).
+
+    *Push* is deliberately not restored here: a standing Tide re-emits its targets every bound (its own
+    restoration), and the narrow "a one-shot Pulse hit a blocked Source" strand is healed by Mechanism 2's
+    solicitation (a pull), not by blanket per-tick target re-propagation — which churns the Tide throttle
+    (targets encode the cadence). See plans/reset.md."""
+    for pid in list(s.pond_states):
+        ps = s.pond_states[pid]
+        if ps.is_killed or ps.pull_local or ps.is_blocked or not ps.has_pull:
+            continue
+        for sp in s.ponds[pid].sources:
+            if s.pond_states[sp].start_f <= ps.start_f:
+                s.pond_states[sp].has_received_pull = True
+                pond_receive_pull(s, sp, now, ps.pull_m)
+
+
 def tick(now: datetime, state: EngineState) -> EngineState:
-    """Clock-driven processes only: Tide target emission and Wave-on-idle re-Tap. Window availability
-    is read live in :func:`can_start_pond`. The caller runs :func:`sentinel` afterwards."""
+    """Clock-driven processes only: Tide target emission and Wave-on-idle re-Tap, plus the demand-restoration
+    invariant (:func:`restore_demand`). Window availability is read live in :func:`can_start_pond`. The
+    caller runs :func:`sentinel` afterwards."""
     s = state.clone()
     # Standing Wake (Spouts): whenever idle and armed, re-arm a **non-propagating** pull (a Wake, not a
     # Wave — `pull_local` stops `start_pond_run` soliciting the Source). It then runs whenever the Source
@@ -714,6 +771,7 @@ def tick(now: datetime, state: EngineState) -> EngineState:
             ref = max_target(ps.targets) or ps.start_f
             if now + ps.d - ref >= bound:
                 pond_add_target(s, pid, now)
+    restore_demand(s, now)  # re-derive any demand lost upstream (reset / crash / blocked-refusal)
     return s
 
 

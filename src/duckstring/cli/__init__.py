@@ -9,9 +9,10 @@ from . import pond as pond_cmd
 from . import puddle as puddle_cmd
 from . import secret as secret_cmd
 from . import spout as spout_cmd
-from .control import clear, failure_budget, force, kill, refresh, repair, sleep, wake
-from .data import get, query
+from .control import clear, failure_budget, force, kill, refresh, repair, reset, sleep, wake
+from .data import delete_object, delete_table, get, get_object, objects, query
 from .deploy import deploy
+from .deploy import remove as remove_pond
 from .status import status
 from .trigger import pulse, remove, tap, tide, wave
 from .window import app as window_app
@@ -54,6 +55,7 @@ control_app = typer.Typer(
 control_app.command("force")(force)
 control_app.command("refresh")(refresh)
 control_app.command("repair")(repair)
+control_app.command("reset")(reset)
 control_app.command("wake")(wake)
 control_app.command("sleep")(sleep)
 control_app.command("kill")(kill)
@@ -74,9 +76,14 @@ app.add_typer(secret_cmd.app, name="secret")
 app.add_typer(alert_cmd.app, name="alert")
 
 pond_cmd.app.command("deploy")(deploy)
+pond_cmd.app.command("remove")(remove_pond)
 app.command("status")(status)
 app.command("get")(get)
 app.command("query")(query)
+app.command("objects")(objects)
+app.command("get-object")(get_object)
+app.command("delete-table")(delete_table)
+app.command("delete-object")(delete_object)
 
 
 def main() -> None:

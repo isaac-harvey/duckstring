@@ -64,11 +64,16 @@ class SubprocessLauncher:
             ]
         )
 
-    def terminate(self, pond_key: str) -> None:
+    def terminate(self, pond_key: str, wait: bool = False) -> None:
         self._pending.pop(pond_key, None)
         proc = self._procs.pop(pond_key, None)
         if proc is not None and proc.poll() is None:
             proc.terminate()
+            if wait:  # block until the process exits (releases its registry.duckdb handle) — a caller that
+                try:  # is about to open the registry directly needs the file free (e.g. delete_table).
+                    proc.wait(timeout=10)
+                except Exception:
+                    proc.kill()
 
     def shutdown_all(self) -> None:
         self._pending.clear()
@@ -91,7 +96,7 @@ class NoopLauncher:
     def ensure(self, pond_key: str, version: str, source_path: str) -> None:
         pass
 
-    def terminate(self, pond_key: str) -> None:
+    def terminate(self, pond_key: str, wait: bool = False) -> None:
         pass
 
     def shutdown_all(self) -> None:

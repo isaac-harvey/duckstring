@@ -200,6 +200,9 @@ class PondState:
     # Fault tolerance (see docs/guide/theory.md "Fault Tolerance").
     is_failed: bool = False  # a Pond Run gave up and has not been superseded by a fresher success
     is_blocked: bool = False  # this Pond is failed, or a required Source is failed/blocked/killed
+    missing_asset: str | None = None  # a Ripple read an unpublished Source asset ("source.table") — the
+                                      # Pond is blocked *waiting* for it, not failed (no budget, no alert).
+                                      # Transient (re-derived on the next read attempt), see plans/reset.md.
     failed_f: datetime = NEVER  # freshness of the freshest Pond Run that has failed (NEVER if none)
     failures: int = 0  # failed Pond Runs since the last success (counted against retry_on_change)
     # Control (Wake/Force/Kill — see docs).

@@ -60,6 +60,29 @@ def refresh(
     typer.echo(f"Refresh cleared on '{pond}'." if clear else f"'{pond}' will refresh on its next run.")
 
 
+def reset(
+    pond: str = typer.Argument(..., help="Name of the Pond to reset."),
+    catchment: Optional[str] = _CATCHMENT,
+    major: Optional[int] = _MAJOR,
+    version: Optional[str] = _VERSION,
+    clear_history: bool = typer.Option(False, "--clear-history", help="Also delete the Pond's run history."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation prompt."),
+) -> None:
+    """Reset a Pond to a fresh-deploy state — scrub its registry, published data, and ledger and rewind its
+    freshness — keeping its deployed code, operational config, and demand. Lazy: nothing runs now; the Pond
+    rebuilds from scratch when next demanded. Requires the Pond to be idle."""
+    from . import _http
+    from .config import resolve_catchment
+    _, cfg = resolve_catchment(catchment)
+    if not yes:
+        typer.confirm(f"Reset '{pond}' (scrub its data + state; keeps code, config, demand)?", abort=True)
+    _http.post(
+        f"{cfg['url']}/api/ponds/{pond}/reset", auth=cfg,
+        params={**_http.pond_params(major, version), "clear_history": clear_history}, json={},
+    )
+    typer.echo(f"Reset '{pond}'. It rebuilds from scratch when next demanded.")
+
+
 def repair(
     ponds: list[str] = typer.Argument(..., help="Ponds to rebuild (a connected set)."),
     catchment: Optional[str] = _CATCHMENT,

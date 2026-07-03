@@ -22,6 +22,8 @@ from duckstring.engine import (
     RippleState,
     Trigger,
     Window,
+    block_on_missing_asset,
+    clear_missing_asset,
     clear_pond,
     complete_ripple,
     derive_blocked,
@@ -489,6 +491,89 @@ def test_tide_below_bottleneck_throttles():
     for gap in g:
         assert abs(gap - 3.0) < 0.3, f"throttled cadence {g} != 3.0s"
     assert max_targets > 1  # several Pulses in flight at once (pipelining)
+
+
+@pytest.mark.timeout(5)
+def test_restore_demand_re_solicits_a_stranded_source():
+    """The demand-restoration invariant (plans/reset.md): a downstream still holding a standing pull whose
+    Source no longer mirrors it (e.g. the Source was reset to NEVER, or a cascade was lost) gets its Source
+    re-solicited on the next tick. Without it the Source sits idle forever and the downstream never runs."""
+    src = Pond("src", "src")
+    dwn = Pond("dwn", "dwn", sources=["src"])
+    s = build([src, dwn], [Ripple("r", "dwn", "r")])
+    s.pond_states["dwn"].start_f = s.pond_states["dwn"].end_f = T0
+    s.pond_states["dwn"].has_pull = True             # preserved demand (the intent to keep running)
+    s.pond_states["src"].start_f = s.pond_states["src"].end_f = NEVER  # reset: cleared to a fresh slate
+    assert s.pond_states["src"].has_pull is False
+
+    s = tick(T0 + STEP, s)
+    assert s.pond_states["src"].has_pull is True      # re-solicited (cold-start cascade)
+
+
+@pytest.mark.timeout(5)
+def test_restore_demand_parks_under_blocked_source_and_heals_on_unblock():
+    """Re-solicitation refuses a blocked Source (as all demand does), so a path parks under a blocked
+    Source and heals on the first tick after it unblocks — the fix for the standing gap where a blocked
+    Pond drops incoming demand instead of parking it."""
+    src = Pond("src", "src")
+    dwn = Pond("dwn", "dwn", sources=["src"])
+    s = build([src, dwn], [Ripple("r", "dwn", "r")])
+    s.pond_states["dwn"].start_f = s.pond_states["dwn"].end_f = T0
+    s.pond_states["dwn"].has_pull = True
+    s.pond_states["src"].start_f = s.pond_states["src"].end_f = NEVER
+    s.pond_states["src"].is_blocked = True
+
+    s = tick(T0 + STEP, s)
+    assert s.pond_states["src"].has_pull is False      # blocked → parks, not re-solicited
+
+    s.pond_states["src"].is_blocked = False
+    s = tick(T0 + 2 * STEP, s)
+    assert s.pond_states["src"].has_pull is True        # healed on the next tick
+
+
+@pytest.mark.timeout(5)
+def test_missing_source_asset_blocks_with_reason_not_failed():
+    """A read of an unpublished Source asset (plans/reset.md Mechanism 2) parks the Pond blocked-with-a-
+    reason — not failed: no budget burn, no ``failed_f`` — abandons the incomplete Run, and propagates
+    ``blocked`` downstream. ``clear_missing_asset`` (a later clean read) releases it and the downstream."""
+    src = Pond("src", "src")
+    mid = Pond("mid", "mid", sources=["src"])
+    dwn = Pond("dwn", "dwn", sources=["mid"])
+    s = build([src, mid, dwn], [Ripple("r", "mid", "r"), Ripple("r2", "dwn", "r2")])
+    # `mid` started a Run (reached start_f=T0) then read src.x and missed.
+    s.pond_states["mid"].start_f = T0
+    s.pond_states["mid"].end_f = NEVER
+    s.ripple_states["r"].start_f = T0
+    s.ripple_states["r"].is_running = True
+
+    s = block_on_missing_asset(s, "mid", "src.x", T0 + STEP)
+    m = s.pond_states["mid"]
+    assert m.missing_asset == "src.x"
+    assert m.is_blocked is True and m.is_failed is False   # blocked, not failed
+    assert m.failures == 0 and m.failed_f == NEVER          # no budget burn
+    assert m.start_f == m.end_f                             # incomplete Run abandoned (liveness won't fail it)
+    assert not s.ripple_states["r"].is_running
+    assert s.pond_states["dwn"].is_blocked is True          # propagated downstream
+
+    s = clear_missing_asset(s, "mid")                       # a later clean read
+    assert s.pond_states["mid"].missing_asset is None
+    assert s.pond_states["mid"].is_blocked is False
+    assert s.pond_states["dwn"].is_blocked is False         # downstream released too
+
+
+@pytest.mark.timeout(5)
+def test_restore_demand_quiescent_graph_no_spurious_demand():
+    """A fully-idle graph with no outstanding demand stays quiescent — the invariant only re-derives held
+    demand, it never invents it."""
+    src = Pond("src", "src")
+    dwn = Pond("dwn", "dwn", sources=["src"])
+    s = build([src, dwn], [Ripple("r", "dwn", "r")])
+    for pid in ("src", "dwn"):
+        s.pond_states[pid].start_f = s.pond_states[pid].end_f = T0
+    s = tick(T0 + STEP, s)
+    s, _ = sentinel(T0 + STEP, s)
+    assert not any(ps.has_pull for ps in s.pond_states.values())
+    assert s.pending_begin_runs == []
 
 
 @pytest.mark.timeout(5)

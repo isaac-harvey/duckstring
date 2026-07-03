@@ -511,6 +511,88 @@ def test_builder_fact_and_dim_both_change(tmp_path):
     snk.close()
 
 
+def test_builder_rebuilds_whole_when_output_dropped(tmp_path):
+    """A delete drops a merge Trickle's registry collection (see plans/deletes.md). The next run must
+    rebuild the WHOLE table via the comprehensive path — not persist just the run's small delta — even
+    though the Sources only changed a little. Guards the absence⇒comprehensive trigger in builder._compute."""
+    f_con, f_dir = _producer(tmp_path, "fact")
+    d_con, d_dir = _producer(tmp_path, "dim")
+    T.merge_table(f_con, "f", f_con.sql("SELECT * FROM (VALUES (1,'A',10),(2,'A',5),(3,'B',7)) v(id,k,qty)"),
+                  ts(1), ("id",))
+    T.merge_table(d_con, "d", d_con.sql("SELECT * FROM (VALUES ('A',100),('B',200)) v(k,price)"), ts(1), ("k",))
+    publish(f_con, f_dir, f=ts(1))
+    publish(d_con, d_dir, f=ts(1))
+
+    snk = duckdb.connect(str(tmp_path / "snk.duckdb"))
+    snk_dir = tmp_path / "ponds" / "o" / "m1" / "data"
+
+    def run(f, pf):
+        p = Pond("o", "1.0.0", snk, root=tmp_path, source_majors={"fact": 1, "dim": 1}, f=f, previous_f=pf)
+        (p.trickle("fact.f").join(p.trickle("dim.d"), on="k")
+           .select("s0.id, s0.k, s0.qty, s1.price").merge("o", pk="id"))
+        publish(snk, snk_dir, f=f)
+
+    run(ts(1), NEVER)  # bootstrap: full table
+    full = [(1, "A", 10, 100), (2, "A", 5, 100), (3, "B", 7, 200)]
+    assert rows(snk, snk_dir, "o", "id, k, qty, price") == full
+
+    T.drop_table(snk, "o")  # the delete: drop the sink's whole registry collection
+    assert "o" not in T.read_meta(snk)
+
+    # A *small* source change (id2 qty 5→8) with a recent previous_f — the incremental path would compose
+    # only that one delta and, applied to the empty log, would leave the table with just id2. The trigger
+    # forces a comprehensive rebuild, so the whole join comes back.
+    T.merge_table(f_con, "f", f_con.sql("SELECT * FROM (VALUES (1,'A',10),(2,'A',8),(3,'B',7)) v(id,k,qty)"),
+                  ts(2), ("id",))
+    publish(f_con, f_dir, f=ts(2))
+    run(ts(2), ts(1))
+
+    assert rows(snk, snk_dir, "o", "id, k, qty, price") == [
+        (1, "A", 10, 100), (2, "A", 8, 100), (3, "B", 7, 200),
+    ]
+    snk.close()
+
+
+def test_unpublish_table_removes_published_collection(tmp_path):
+    """unpublish_table drops every published form + the sidecar entry (the data half of a delete)."""
+    from duckstring.dataplane import unpublish_table
+    from duckstring.trickle_io import load_sidecar
+
+    con, data_dir = _producer(tmp_path, "src")
+    T.merge_table(con, "dim", con.sql("SELECT * FROM (VALUES ('A',1),('B',2)) v(k,x)"), ts(1), ("k",))
+    T.append_table(con, "log", con.sql("SELECT 1 AS id"), ts(1), ("id",))
+    publish(con, data_dir, f=ts(1))
+    # A merge main surfaces its main + its raw-navigable __changelog; the append is a parts table.
+    assert set(ParquetDataPlane().list_tables(data_dir)) == {"dim", "dim__changelog", "log"}
+
+    unpublish_table(data_dir, "dim")  # takes the main + every companion with it
+    assert ParquetDataPlane().list_tables(data_dir) == ["log"]
+    assert "dim" not in load_sidecar(data_dir)
+    assert not (data_dir / "dim__changelog").exists()
+    unpublish_table(data_dir, "dim")  # idempotent
+
+
+def test_base_table_name_resolves_companions():
+    assert T.base_table_name("priced_line") == "priced_line"
+    assert T.base_table_name("priced_line__changelog") == "priced_line"
+    assert T.base_table_name("priced_line__band") == "priced_line"
+    assert T.base_table_name("order_line__droplog") == "order_line"
+    assert T.base_table_name("priced_line__base") == "priced_line"
+    assert T.base_table_name("__changelog") == "__changelog"  # no base → unchanged
+
+
+def test_drop_table_clears_registry_collection(tmp_path):
+    con, _ = _producer(tmp_path, "src")
+    T.merge_table(con, "dim", con.sql("SELECT * FROM (VALUES ('A',1)) v(k,x)"), ts(1), ("k",))
+    assert "dim" in T.read_meta(con)
+    assert con.execute("SELECT count(*) FROM duckdb_tables() WHERE table_name = 'dim__changelog'").fetchone()[0] == 1
+
+    T.drop_table(con, "dim")
+    assert "dim" not in T.read_meta(con)
+    assert con.execute("SELECT count(*) FROM duckdb_tables() WHERE table_name LIKE 'dim%'").fetchone()[0] == 0
+    T.drop_table(con, "dim")  # idempotent
+
+
 def test_builder_count(tmp_path):
     """``.count()``: a bare stored Trickle counts via metadata + changelog net weight (no scan); a composed
     query is evaluated in full and counted. Both track inserts and deletes, and the merge-main count matches

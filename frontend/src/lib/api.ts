@@ -71,6 +71,7 @@ export interface RawPond {
   spout: { destination: string; table: string | null; mode: string; armed: boolean } | null;
   version: string;
   has_tables: boolean; // this major line has published at least one table — the data viewer is offered
+  has_objects: boolean; // this major line has published at least one non-tabular Object — the Objects tab is offered
   status: 'running' | 'queued' | 'idle' | 'failed' | 'killed' | 'blocked' | 'repairing';
   gen: number;
   runs_completed: number;
@@ -82,6 +83,7 @@ export interface RawPond {
   trigger: { kind: 'wave' | 'tide'; bound_ms: number | null } | null;
   is_failed: boolean;
   is_blocked: boolean;
+  blocked_reason: string | null; // e.g. waiting for a Source asset a Ripple couldn't read (Mechanism 2)
   is_killed: boolean;
   refresh_pending: boolean; // next run is a cold wipe-and-rebuild (control refresh)
   repairing: boolean; // in an active repair plan — blocked from normal demand
@@ -238,6 +240,31 @@ export async function repairPonds(
   });
   if (res.status === 401) throw new UnauthorizedError();
   if (!res.ok) throw new Error((await res.json().catch(() => null))?.detail ?? `repair failed (${res.status})`);
+  return res.json();
+}
+
+// Reset the whole Catchment to a fresh-deploy state (scrub data + state; keep deploys/config/secrets).
+export async function resetCatchment(clearHistory = false): Promise<{ ponds: number }> {
+  const res = await fetch(`${apiBase()}/catchment/reset`, {
+    method: 'POST',
+    headers: authHeaders({ 'content-type': 'application/json' }),
+    body: JSON.stringify({ clear_history: clearHistory }),
+  });
+  if (res.status === 401) throw new UnauthorizedError();
+  if (!res.ok) throw new Error((await res.json().catch(() => null))?.detail ?? `reset failed (${res.status})`);
+  return res.json();
+}
+
+// Remove (retire) a Pond major line — deletes its data, config, Spouts + alerts; keeps history. Full only.
+export async function removePond(pond: string): Promise<{ removed: string; spouts_removed: string[]; now_blocked: string[] }> {
+  const { name, major } = splitPond(pond);
+  const qs = major === undefined ? '' : `?major=${major}`;
+  const res = await fetch(`${apiBase()}/ponds/${encodeURIComponent(name)}${qs}`, {
+    method: 'DELETE',
+    headers: authHeaders(),
+  });
+  if (res.status === 401) throw new UnauthorizedError();
+  if (!res.ok) throw new Error((await res.json().catch(() => null))?.detail ?? `remove failed (${res.status})`);
   return res.json();
 }
 
@@ -471,6 +498,66 @@ export async function fetchTables(pond: string): Promise<TableInfo[]> {
   const { name, major } = splitPond(pond);
   const qs = major === undefined ? '' : `?major=${major}`;
   return getJSON<{ tables: TableInfo[] }>(`/ponds/${encodeURIComponent(name)}/tables${qs}`).then((d) => d.tables);
+}
+
+// A published non-tabular Object (an ML model, a serialised blob) — see plans/objects.md.
+export interface ObjectInfo {
+  name: string;
+  size: number | null; // total byte size (payload sum for a directory Object)
+  f: string | null; // the run freshness that produced it (ISO)
+  is_dir: boolean; // a directory Object (published/downloaded as a unit) vs a single file
+  ext: string; // the single-file Object's extension (e.g. ".pkl"); "" for a dir Object or an extension-less blob
+}
+
+// The non-tabular Objects this Pond's major line has published — the viewer's Objects list.
+export async function fetchObjects(pond: string): Promise<ObjectInfo[]> {
+  const { name, major } = splitPond(pond);
+  const qs = major === undefined ? '' : `?major=${major}`;
+  return getJSON<{ objects: ObjectInfo[] }>(`/ponds/${encodeURIComponent(name)}/objects${qs}`).then((d) => d.objects);
+}
+
+// Download one Object (a single file, or a directory Object as a zip). Fetched with auth then handed to the
+// browser as a blob (a plain link wouldn't carry the auth header the Catchment may require).
+export async function downloadObject(pond: string, obj: ObjectInfo): Promise<void> {
+  const { name, major } = splitPond(pond);
+  const qs = major === undefined ? '' : `?major=${major}`;
+  const url = `${apiBase()}/ponds/${encodeURIComponent(name)}/objects/${encodeURIComponent(obj.name)}${qs}`;
+  const res = await fetch(url, { headers: authHeaders() });
+  if (res.status === 401) throw new UnauthorizedError();
+  if (!res.ok) throw new Error(`download failed: ${res.status}`);
+  const blob = await res.blob();
+  const href = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = href;
+  a.download = obj.is_dir ? `${obj.name}.zip` : `${obj.name}${obj.ext}`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(href);
+}
+
+// Delete a table (its data + registry state); the Catchment forces a rebuild run. Full access only.
+export async function deleteTable(pond: string, table: string): Promise<void> {
+  const { name, major } = splitPond(pond);
+  const qs = major === undefined ? '' : `?major=${major}`;
+  const res = await fetch(
+    `${apiBase()}/ponds/${encodeURIComponent(name)}/tables/${encodeURIComponent(table)}${qs}`,
+    { method: 'DELETE', headers: authHeaders() },
+  );
+  if (res.status === 401) throw new UnauthorizedError();
+  if (!res.ok) throw new Error((await res.json().catch(() => null))?.detail ?? `delete failed: ${res.status}`);
+}
+
+// Delete a published Object. Requires the Pond to be idle (409 otherwise). Full access only.
+export async function deleteObject(pond: string, name: string): Promise<void> {
+  const { name: pn, major } = splitPond(pond);
+  const qs = major === undefined ? '' : `?major=${major}`;
+  const res = await fetch(
+    `${apiBase()}/ponds/${encodeURIComponent(pn)}/objects/${encodeURIComponent(name)}${qs}`,
+    { method: 'DELETE', headers: authHeaders() },
+  );
+  if (res.status === 401) throw new UnauthorizedError();
+  if (!res.ok) throw new Error((await res.json().catch(() => null))?.detail ?? `delete failed: ${res.status}`);
 }
 
 // The distinct run freshnesses (newest-first) of a Trickle table — the window selector's options.

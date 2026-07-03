@@ -184,6 +184,19 @@ class Storage:
         staging chunk to its token-named home). Local: ``os.replace``. Object: an fsspec ``mv``."""
         raise NotImplementedError
 
+    def put_tree(self, local: Path, *parts: str) -> None:
+        """Publish a local file-or-directory ``local`` to the addressed location, **replacing** whatever
+        is there (used to commit an :mod:`~duckstring.objects` Object's payload into ``objects/{name}/``).
+        The addressed location mirrors ``local``'s contents. Local: an atomic dir swap; object store: drop
+        the old prefix then ``put`` recursively."""
+        raise NotImplementedError
+
+    def fetch(self, dest: Path, *parts: str) -> Path:
+        """Materialise the addressed file-or-subtree to a **local** path and return it. A local backend
+        returns the real path in place (no copy — the result is read-only by contract); an object store
+        downloads to ``dest`` (a file path for a single object, a directory for a subtree) and returns it."""
+        raise NotImplementedError
+
     def duckdb_setup(self, con) -> None:
         """Configure ``con`` so DuckDB can read/write this storage (load ``httpfs`` + a credential
         secret for an object store). A no-op for local paths."""
@@ -281,6 +294,20 @@ class LocalStorage(Storage):
         target = dest._abs(dest_name)
         target.parent.mkdir(parents=True, exist_ok=True)
         self._abs(src_name).replace(target)
+
+    def put_tree(self, local: Path, *parts: str) -> None:
+        import shutil
+
+        dest = self._abs(*parts)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        tmp = dest.with_name(dest.name + ".tmp")
+        shutil.rmtree(tmp, ignore_errors=True)
+        shutil.copytree(local, tmp)  # `local` is always a directory (an Object's staged payload)
+        shutil.rmtree(dest, ignore_errors=True)
+        tmp.replace(dest)
+
+    def fetch(self, dest: Path, *parts: str) -> Path:
+        return self._abs(*parts)  # already local — hand back the real path (read-only by contract)
 
 
 class ObjectStorage(Storage):
@@ -457,6 +484,24 @@ class ObjectStorage(Storage):
     def move_into(self, dest: "Storage", src_name: str, dest_name: str) -> None:
         assert isinstance(dest, ObjectStorage)
         self.fs.mv(self._key(src_name), dest._key(dest_name))
+
+    def put_tree(self, local: Path, *parts: str) -> None:
+        key = self._key(*parts)
+        try:
+            self.fs.rm(key, recursive=True)
+        except FileNotFoundError:
+            pass
+        # `local` is a directory of the Object's payload → its contents land under `key`.
+        self.fs.put(str(local), key, recursive=True)
+
+    def fetch(self, dest: Path, *parts: str) -> Path:
+        key = self._key(*parts)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if self.fs.isdir(key):
+            self.fs.get(key, str(dest), recursive=True)
+        else:
+            self.fs.get_file(key, str(dest))
+        return dest
 
     # ─── DuckDB credentials ──────────────────────────────────────────────────────
 

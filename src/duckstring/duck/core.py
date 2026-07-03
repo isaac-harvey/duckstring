@@ -40,6 +40,8 @@ class Event:
     changed: bool = True  # did this Pond Run change its output? False = a pass (pond.skip() / empty delta).
                           # Set on the Run-completing ripple event + run_completed; holds changed_f at the
                           # Catchment so downstream skips. See plans/no-change-skip.md.
+    source: str | None = None  # missing_source event: the Source + table the Ripple couldn't read (it is
+    table: str | None = None   # not published) — the Catchment parks the Pond blocked-with-a-reason.
 
     def payload(self) -> dict:
         d = {"kind": self.kind, "f": self.f.isoformat(), "status": self.status, "retry": self.retry,
@@ -56,6 +58,10 @@ class Event:
             d["finished_at"] = self.finished_at.isoformat()
         if self.schema is not None:
             d["schema"] = self.schema
+        if self.source is not None:
+            d["source"] = self.source
+        if self.table is not None:
+            d["table"] = self.table
         return d
 
 
@@ -174,6 +180,24 @@ class DuckCore:
                 retry=attempt, error=error, traceback=traceback, started_at=started_at, finished_at=finished_at,
             ))
             self.attempts.pop(name, None)  # the Run is done; reset for any future run
+        return self._advance(now)
+
+    def ripple_missing_source(
+        self, name: str, source: str, table: str, now: datetime, started_at=None, finished_at=None,
+    ) -> list[str]:
+        """A Ripple read a Source asset that isn't published (:class:`~duckstring.core.MissingSourceAsset`).
+        Give up the Run at this Ripple **without** spending immediate retries (the Source won't republish
+        mid-Run) and buffer a ``missing_source`` event — the Catchment parks the Pond blocked-with-a-reason,
+        not failed. See plans/reset.md."""
+        self.state, rf = worker.fail_ripple(self.state, name, now, retry=False)
+        ledger.record_ripple_failed(self.con, name)
+        f = rf.f if rf is not None else self.state.states[name].start_f
+        ledger.record_pond_run_finish(self.con, f, now, status="failed")  # don't re-run on restart
+        self.events.append(Event(
+            kind="missing_source", ripple=name, f=f, status="failed", source=source, table=table,
+            started_at=started_at, finished_at=finished_at,
+        ))
+        self.attempts.pop(name, None)
         return self._advance(now)
 
     def _advance(self, now: datetime) -> list[str]:

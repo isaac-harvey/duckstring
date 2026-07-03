@@ -35,6 +35,7 @@ export const PondNode = memo(function PondNode({ data }: NodeProps) {
   // Only a Pond that owns Ripples can collapse — a Draw has nothing to hide, so it shows no caret.
   const hasRipples = useLiveStore((s) => Object.values(s.ripples).some((r) => r.pondId === pondId));
   const hasTables = useLiveStore((s) => s.pondInfo[pondId]?.hasTables ?? false);
+  const hasObjects = useLiveStore((s) => s.pondInfo[pondId]?.hasObjects ?? false);
   const openDataViewer = useLiveStore((s) => s.openDataViewer);
   const now = useLiveStore((s) => s.now);
 
@@ -82,7 +83,7 @@ export const PondNode = memo(function PondNode({ data }: NodeProps) {
         style={{ background: '#52525b', opacity: 0 }}
       />
 
-      {hasTables && (
+      {(hasTables || hasObjects) && (
         <span
           role="button"
           title="View data"

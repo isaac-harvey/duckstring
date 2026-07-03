@@ -342,6 +342,28 @@ def rotate_keys(
 
 
 @app.command()
+def reset(
+    catchment: Optional[str] = typer.Option(None, "--catchment", "-c", help="Catchment to reset (uses default if omitted)."),
+    clear_history: bool = typer.Option(False, "--clear-history", help="Also delete all run history."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation."),
+) -> None:
+    """Reset the whole Catchment to a fresh-deploy state — scrub every Pond's registry, published data, and
+    ledger and rewind all freshness. Keeps deployed code, operational config, secrets, and keys. The
+    sanctioned replacement for deleting `.duckstring`; stop-the-world (every Duck restarts)."""
+    from . import _http
+    from .config import resolve_catchment
+
+    cname, cfg = resolve_catchment(catchment)
+    if not yes:
+        typer.confirm(
+            f"Reset ALL Ponds on '{cname}' to a fresh-deploy state? Scrubs data + state; keeps deploys, "
+            f"config, and secrets.", default=False, abort=True,
+        )
+    resp = _http.post(f"{cfg['url']}/api/catchment/reset", auth=cfg, json={"clear_history": clear_history}).json()
+    typer.echo(f"Reset {resp.get('ponds', 0)} Pond(s). They rebuild from scratch when next demanded.")
+
+
+@app.command()
 def connect(
     name: str = typer.Option(..., "--name", "-n", help="Name to register this Catchment under."),
     path: str = typer.Option(..., "--path", help="URL of the remote Catchment server."),

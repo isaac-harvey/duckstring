@@ -1,6 +1,6 @@
 'use client';
 
-import { Fragment, useEffect, useMemo, useState } from 'react';
+import { Fragment, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ReactFlow,
   Background,
@@ -17,7 +17,7 @@ import {
 import '@xyflow/react/dist/style.css';
 
 import { useLiveStore, consumeEdgeColor, formatAge, THEME_PULL, THEME_PUSH, THEME_SUCCESS, THEME_DANGER } from '@/lib/store';
-import type { AccessLevel } from '@/lib/api';
+import { resetCatchment, type AccessLevel } from '@/lib/api';
 import { computeLayout, statsLineWidth, type ContentFloors } from '@/lib/layout';
 import { useIsMobile } from '@/lib/useIsMobile';
 import { PondNode } from './PondNode';
@@ -27,6 +27,7 @@ import { CatchmentGroupNode } from './CatchmentGroupNode';
 import { RemotePondNode } from './RemotePondNode';
 import { AlertsMenu } from './AlertsMenu';
 import { SecretsMenu } from './SecretsMenu';
+import { ConfirmDialog, type ConfirmOpts } from './ConfirmDialog';
 
 // ─── Custom edges (read-only; colour reflects the sink's demand) ─────────────
 
@@ -239,6 +240,8 @@ function ControlsPanel() {
   );
   const [secretsOpen, setSecretsOpen] = useState(false);
   const [alertsOpen, setAlertsOpen] = useState(false);
+  const [resetConfirm, setResetConfirm] = useState<ConfirmOpts | null>(null);
+  const catchmentName = useLiveStore((s) => s.catchment?.name ?? null);
 
   const collapsibleIds = collapsibleKey ? collapsibleKey.split(',') : [];
   const allCollapsed = collapsibleIds.length > 0 && collapsibleIds.every((id) => collapsedPonds[id]);
@@ -271,7 +274,27 @@ function ControlsPanel() {
             Alerts
           </button>
         )}
+        {isFull && (
+          <button
+            title="Scrub every Pond's data + state to a fresh-deploy state (keeps deploys, config, secrets)"
+            onClick={() => setResetConfirm({
+              title: 'Reset the entire Catchment?',
+              body:
+                'This scrubs EVERY Pond — its registry, published data, and ledger — and rewinds all ' +
+                'freshness to a fresh-deploy state. Every worker restarts; Ponds rebuild from scratch when ' +
+                'next demanded.\n\nKept: your deployed code, operational config (triggers, windows, spouts, ' +
+                'alerts), secrets, and keys. This cannot be undone.',
+              confirmLabel: 'Reset everything',
+              requireTyped: catchmentName || 'reset all',
+              action: async () => { await resetCatchment().catch(() => {}); },
+            })}
+            style={{ ...panelButton, justifyContent: 'center', color: THEME_DANGER, borderColor: `${THEME_DANGER}66` }}
+          >
+            Reset all
+          </button>
+        )}
       </div>
+      {isFull && resetConfirm && <ConfirmDialog opts={resetConfirm} onClose={() => setResetConfirm(null)} />}
       {isFull && secretsOpen && <SecretsMenu onClose={() => setSecretsOpen(false)} />}
       {isFull && alertsOpen && <AlertsMenu onClose={() => setAlertsOpen(false)} />}
     </div>
@@ -394,6 +417,19 @@ export function DagCanvas() {
     return () => clearTimeout(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isMobile]);
+
+  // Re-frame when the *set* of Ponds changes (one deployed or removed). The controlled viewport
+  // otherwise stays put, which can leave a newly-orphaned downstream Pond off-screen after its
+  // source is removed. Keyed on Pond ids only, so collapse/expand (a ripple-visibility change)
+  // doesn't trigger it; the initial mount is framed by the isMobile effect above.
+  const pondIdKey = useMemo(() => Object.keys(ponds).sort().join(','), [ponds]);
+  const framedOnce = useRef(false);
+  useEffect(() => {
+    if (!framedOnce.current) { framedOnce.current = true; return; }
+    const t = setTimeout(() => fitView({ padding: 0.15, duration: 350 }), 120);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pondIdKey]);
 
   // React Flow controlled mode requires these handlers; layout is managed externally, so no-op.
   const onNodesChange = () => {};

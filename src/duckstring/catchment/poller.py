@@ -50,6 +50,7 @@ async def _land_transfer(client: httpx.AsyncClient, url: str, auth: dict, root, 
     ships only the append-only parts newer than that (append history / ``__changelog`` / ``__droplog``),
     which the consumer drops into its own parts directory. A merge main / plain Ripple output is a single
     file, landed wholesale (replace). ``after = None`` (bootstrap / no Trickle source) → whole set."""
+    from ..objects import OBJECTS_DIR
     from ..trickle_io import (
         BASE_SUFFIX,
         SIDECAR,
@@ -65,9 +66,13 @@ async def _land_transfer(client: httpx.AsyncClient, url: str, auth: dict, root, 
     # The cold base is wholesale but rewritten rarely — tell the producer the oldest cold-base freshness we
     # already hold so it re-ships a base only when its fold watermark has advanced past it.
     held = load_sidecar(data_dir)
-    f_bases = [m.get("f_base") for m in held.values() if m.get("mode") == "merge"]
+    f_bases = [m.get("f_base") for m in held.values() if m.get("mode") == "merge" and isinstance(m, dict)]
     base_after = min(f_bases) if f_bases and all(f_bases) else None
-    params = {k: v for k, v in (("after", after), ("base_after", base_after)) if v}
+    # Objects are overwrite-only; tell the producer the oldest Object freshness we hold so it re-ships an
+    # Object only when its freshness advanced past that (see draw._ship_objects).
+    obj_fs = [e.get("f") for e in (held.get("objects") or {}).values() if e.get("f")]
+    objects_after = min(obj_fs) if obj_fs else None
+    params = {k: v for k, v in (("after", after), ("base_after", base_after), ("objects_after", objects_after)) if v}
     resp = await client.get(f"{url}/api/draw/{name}/{major}", params=params, headers=auth)
     resp.raise_for_status()
     data_dir.mkdir()
@@ -77,11 +82,17 @@ async def _land_transfer(client: httpx.AsyncClient, url: str, auth: dict, root, 
         # parts are immutable and idempotent by name). A "{table}__base/{chunk}" is a chunk of a merge
         # main's wholesale cold base — shipped in full only when it changed, so after landing we drop any
         # stale chunk the producer no longer has (its names change every compaction; a leftover resurrects).
+        # A re-shipped Object arrives as its whole subtree; clear the old copy first (its file set may have
+        # changed — a dir-Object's members, or a single-file Object's extension) so no stale file survives.
+        for reshipped in {p.split("/")[1] for p in zf.namelist()
+                          if p.split("/")[0] == OBJECTS_DIR and len(p.split("/")) > 2}:
+            data_dir.rmtree(OBJECTS_DIR, reshipped)
         landed_base: dict[str, set[str]] = {}
         for info in zf.infolist():
-            if not (info.filename.endswith(".parquet") or info.filename == SIDECAR):
-                continue
             parts = info.filename.split("/")
+            is_object = parts[0] == OBJECTS_DIR and len(parts) > 2
+            if not (info.filename.endswith(".parquet") or info.filename == SIDECAR or is_object):
+                continue
             data_dir.write_bytes(zf.read(info), *parts)  # atomic per-object write (rename local / PUT object)
             if len(parts) > 1 and parts[0].endswith(BASE_SUFFIX):
                 landed_base.setdefault(parts[0], set()).add(parts[-1])

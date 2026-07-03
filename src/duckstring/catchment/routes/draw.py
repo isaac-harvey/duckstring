@@ -58,7 +58,7 @@ async def draw_wait(
 
 @router.get("/draw/{name}/{major}", dependencies=[auth.read])
 def draw(name: str, major: int, request: Request, tables: Optional[str] = None, after: Optional[str] = None,
-         base_after: Optional[str] = None):
+         base_after: Optional[str] = None, objects_after: Optional[str] = None):
     """Stream a Pond line's exported Parquet as a zip. ``tables`` (comma-separated) optionally restricts
     the set — reserved for per-Ripple duct scope; default is every table.
 
@@ -106,9 +106,39 @@ def draw(name: str, major: int, request: Request, tables: Optional[str] = None, 
             for part in table_parts(data_dir, table):
                 if after_dt is None or part_f(part) > after_dt:
                     zf.writestr(f"{table}/{part}", part_store.read_bytes(part))
+        # Non-tabular Objects — overwrite-only, so ship each object subtree whose freshness advanced past
+        # the consumer's held watermark (`objects_after`, the min f it holds). Bootstrap ships all.
+        _ship_objects(zf, data_dir, sidecar_meta.get("objects") or {}, objects_after)
         # The Trickle mode/PK sidecar travels with the data so the consuming Catchment's read_delta can
         # resolve a Trickle source (mode/PK aren't in the downstream's duck.db). Harmless for plain Ponds.
         sidecar = data_dir.read_text(SIDECAR)
         if sidecar is not None:
             zf.writestr(SIDECAR, sidecar)
     return Response(content=buf.getvalue(), media_type="application/zip")
+
+
+def _ship_objects(zf, data_dir, obj_entries: dict, objects_after: Optional[str]) -> None:
+    """Zip each published Object's payload under ``objects/{name}/…`` — those newer than ``objects_after``.
+    Materialises via ``object_path`` (a no-copy local read, or a download for an object store)."""
+    import shutil
+    import tempfile
+    from pathlib import Path
+
+    from ...objects import OBJECTS_DIR, object_path
+
+    after_dt = datetime.fromisoformat(objects_after) if objects_after else None
+    scratch = Path(tempfile.mkdtemp(prefix="duckstring-obj-draw-"))
+    try:
+        for oname, entry in obj_entries.items():
+            of = entry.get("f")
+            if after_dt is not None and of is not None and datetime.fromisoformat(of) <= after_dt:
+                continue  # the consumer already holds this Object
+            local = object_path(data_dir, oname, scratch)
+            if entry.get("is_dir"):
+                for f in sorted(local.rglob("*")):
+                    if f.is_file():
+                        zf.writestr(f"{OBJECTS_DIR}/{oname}/{f.relative_to(local).as_posix()}", f.read_bytes())
+            else:
+                zf.writestr(f"{OBJECTS_DIR}/{oname}/{local.name}", local.read_bytes())
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)

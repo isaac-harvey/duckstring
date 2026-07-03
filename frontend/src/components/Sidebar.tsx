@@ -1,9 +1,10 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-import { fetchAlerts, fetchSecrets, testSpout, type RawAlertChannel } from '@/lib/api';
-import { useLiveStore, atLeast, formatAge, formatDuration, parseTs, THEME_PULL, THEME_PUSH, THEME_SUCCESS, THEME_DANGER, THEME_BLOCKED, THEME_WAKE } from '@/lib/store';
-import type { FreqUnit, Pond, PondInfo, PondRun } from '@/lib/types';
+import { fetchAlerts, fetchSecrets, testSpout, fetchTables, fetchObjects, removePond, type RawAlertChannel } from '@/lib/api';
+import { ConfirmDialog, type ConfirmOpts } from './ConfirmDialog';
+import { useLiveStore, atLeast, formatAge, formatDuration, parseTs, THEME_PULL, THEME_PUSH, THEME_SUCCESS, THEME_DANGER, THEME_BLOCKED, THEME_WAKE, THEME_BRAND } from '@/lib/store';
+import type { FreqUnit, Pond, PondId, PondInfo, PondRun } from '@/lib/types';
 import { AlertChannelForm, ChannelRow } from './AlertsMenu';
 import { TraceChart } from './TraceChart';
 import { WindowEditor } from './WindowEditor';
@@ -48,6 +49,15 @@ function Btn({
 
 // A 4-column row of equal-width buttons — so the Trigger and Control rows line up.
 const quadRow: React.CSSProperties = { display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 6 };
+
+// A Trickle companion (X__changelog / X__band / X__droplog / X__base) belongs to base table X — collapse
+// them so a Reset lists the user-facing tables, not their internals (mirrors trickle_io.base_table_name).
+function baseTableName(name: string): string {
+  for (const s of ['__changelog', '__band', '__droplog', '__base']) {
+    if (name.endsWith(s) && name.length > s.length) return name.slice(0, -s.length);
+  }
+  return name;
+}
 
 function Label({ children }: { children: React.ReactNode }) {
   return (
@@ -100,6 +110,9 @@ function StatusBox({ info, ponds, canControl }: { info: PondInfo; ponds: Record<
     );
   }
   if (info.isBlocked) {
+    if (info.blockedReason) {
+      return <StatusCard color={THEME_BLOCKED} title="Blocked · Waiting for a Source asset">{info.blockedReason}</StatusCard>;
+    }
     if (info.missingSources.length > 0) {
       return <StatusCard color={THEME_BLOCKED} title="Blocked · Missing Sources">{bullets(info.missingSources, (s) => s)}</StatusCard>;
     }
@@ -329,7 +342,7 @@ function SpoutEditor({ sourceId, canControl }: { sourceId: string; canControl: b
         </div>
       ) : (
         <div style={{ marginTop: 6 }}>
-          <Btn small onClick={() => setOpen(true)} color={THEME_PULL}>+ Add Spout</Btn>
+          <Btn block onClick={() => setOpen(true)} color={THEME_BRAND}>+ Add Spout</Btn>
         </div>
       ))}
     </Section>
@@ -344,7 +357,7 @@ function AlertEditor({ pond, canControl }: { pond: Pond; canControl: boolean }) 
   const [open, setOpen] = useState(false);
 
   const load = () =>
-    fetchAlerts().then((cs) => setChannels(cs.filter((c) => c.scope === pond.name))).catch(() => setChannels([]));
+    fetchAlerts().then((cs) => setChannels(cs.filter((c) => c.scope === pond.id))).catch(() => setChannels([]));
   // Load once on mount — the parent keys this component by pond id, so a pond switch remounts it fresh.
   useEffect(() => { if (canControl) void load(); }, [canControl]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -356,14 +369,14 @@ function AlertEditor({ pond, canControl }: { pond: Pond; canControl: boolean }) 
       {channels.map((c) => <ChannelRow key={c.name} channel={c} onChanged={load} />)}
       {open ? (
         <div style={{ marginTop: 8 }}>
-          <AlertChannelForm fixedScope={pond.name} onAdded={() => { setOpen(false); void load(); }} />
+          <AlertChannelForm fixedScope={pond.id} onAdded={() => { setOpen(false); void load(); }} />
           <div style={{ marginTop: 6 }}>
             <Btn small onClick={() => setOpen(false)} color={THEME_BLOCKED}>Cancel</Btn>
           </div>
         </div>
       ) : (
         <div style={{ marginTop: 6 }}>
-          <Btn small onClick={() => setOpen(true)} color={THEME_PULL}>+ Add Alert</Btn>
+          <Btn block onClick={() => setOpen(true)} color={THEME_BRAND}>+ Add Alert</Btn>
         </div>
       )}
     </Section>
@@ -443,8 +456,11 @@ export function Sidebar({ mobile = false }: { mobile?: boolean }) {
   const clearFailure = useLiveStore((s) => s.clearFailure);
   const setBudget = useLiveStore((s) => s.setBudget);
   const refreshPond = useLiveStore((s) => s.refreshPond);
+  const resetPond = useLiveStore((s) => s.resetPond);
   const enterRepair = useLiveStore((s) => s.enterRepair);
   const repairMode = useLiveStore((s) => s.repairMode);
+  const [confirm, setConfirm] = useState<ConfirmOpts | null>(null);  // themed confirm dialog (Reset / Remove)
+  const [removeErr, setRemoveErr] = useState<string | null>(null);   // surfaced 409 (running / has demand)
 
   // Access level gates the action surface (the backend enforces it too — this just avoids dead buttons).
   // read: status/history/data only · demand: + the Triggers menu · full: + Control/Windows/Failures.
@@ -492,6 +508,25 @@ export function Sidebar({ mobile = false }: { mobile?: boolean }) {
     : selectedRipple
       ? `${ponds[selectedRipple.pondId]?.name ?? ''} / ${selectedRipple.name}`
       : selectedPond?.name ?? null;
+
+  // Open the Reset confirm: fetch the Pond's tables + Objects so the dialog can list exactly what clears.
+  const openResetConfirm = async (id: PondId, name: string) => {
+    const [tables, objects] = await Promise.all([
+      fetchTables(id).catch(() => []),
+      fetchObjects(id).catch(() => []),
+    ]);
+    const bases = [...new Set(tables.map((t) => baseTableName(t.name)))];
+    const list = (xs: string[]) => (xs.length ? xs.join(', ') : '(none)');
+    setConfirm({
+      title: `Reset "${name}"?`,
+      body:
+        'This scrubs its registry, published data, and ledger and rewinds its freshness — keeping its code, ' +
+        'operational config, and demand. It rebuilds from scratch when next demanded.\n\n' +
+        `Tables cleared: ${list(bases)}\nObjects cleared: ${list(objects.map((o) => o.name))}`,
+      confirmLabel: 'Reset',
+      action: async () => { await resetPond(id); },
+    });
+  };
 
   const content = (
     <>
@@ -631,14 +666,17 @@ export function Sidebar({ mobile = false }: { mobile?: boolean }) {
               <Btn block onClick={() => sleep(selectedPond.id)} color={THEME_BLOCKED}>Sleep</Btn>
               <Btn block onClick={() => kill(selectedPond.id)} color={THEME_DANGER}>Kill</Btn>
             </div>
-            {/* Refresh: flag the next run to rebuild from scratch (lazy). Toggles when pending. */}
-            <div style={{ marginTop: 6 }}>
+            {/* Refresh (flag a cold rebuild on the next run, lazy) + Reset (scrub data + state now). */}
+            <div style={{ marginTop: 6, display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: 6 }}>
               <Btn
                 block
-                color={THEME_PULL}
+                color={THEME_SUCCESS}
                 onClick={() => refreshPond(selectedPond.id, !!selectedInfo?.refreshPending)}
               >
-                {selectedInfo?.refreshPending ? 'Cancel Refresh' : 'Refresh on next run'}
+                {selectedInfo?.refreshPending ? 'Cancel' : 'Refresh'}
+              </Btn>
+              <Btn block color={THEME_DANGER} onClick={() => openResetConfirm(selectedPond.id, selectedPond.name)}>
+                Reset
               </Btn>
             </div>
           </Section>
@@ -658,7 +696,7 @@ export function Sidebar({ mobile = false }: { mobile?: boolean }) {
                 <input type="number" min="0" step="1" value={value} onChange={(e) => setValue(e.target.value)} style={{ ...numInput, width: 48 }} />
                 <Btn
                   small
-                  color={THEME_PUSH}
+                  color={THEME_WAKE}
                   onClick={() => setBudget(selectedPond.id, Math.max(0, parseInt(immRetries) || 0), Math.max(0, parseInt(srcRetries) || 0))}
                 >
                   Set
@@ -672,7 +710,9 @@ export function Sidebar({ mobile = false }: { mobile?: boolean }) {
             )}
             {/* Repair: enter canvas-selection mode to force-rebuild a connected set of Ponds now. */}
             <div style={{ marginTop: 8 }}>
-              <Btn onClick={() => enterRepair()} color={THEME_DANGER} disabled={repairMode}>Repair…</Btn>
+              <Btn block onClick={() => enterRepair()} color={THEME_SUCCESS} disabled={repairMode}>
+                Repair — rebuild a connected set…
+              </Btn>
             </div>
           </Section>
           )}
@@ -686,6 +726,42 @@ export function Sidebar({ mobile = false }: { mobile?: boolean }) {
           <Section>
             <TraceChart {...pondTrace(selectedPondRuns)} />
           </Section>
+
+          {/* Remove (retire) this Pond line — data + config + Spouts + alerts go; history is kept.
+              Type-to-confirm (name@version), like the catchment Reset. Full only; not for Spouts/Draws. */}
+          {canControl && !selectedPond.isSpout && !selectedPond.isDraw && (
+          <Section>
+            <Label>Danger</Label>
+            <Btn
+              block
+              color={THEME_DANGER}
+              onClick={() => {
+                const ver = selectedInfo?.version;
+                const target = ver ? `${selectedPond.name}@${ver}` : selectedPond.id;
+                setRemoveErr(null);
+                setConfirm({
+                  title: `Remove “${target}”?`,
+                  body:
+                    'This deletes the Pond line — its data, live state, and on-disk runtime, plus its own ' +
+                    'Spouts and alert channels. Its deployment record and run history are kept (a redeploy ' +
+                    'restores it). Downstream Ponds that read it will block until you fix them.',
+                  confirmLabel: 'Remove Pond',
+                  requireTyped: target,
+                  action: async () => {
+                    try {
+                      await removePond(selectedPond.id);
+                    } catch (e) {
+                      setRemoveErr(e instanceof Error ? e.message : String(e));
+                    }
+                  },
+                });
+              }}
+            >
+              Remove Pond…
+            </Btn>
+            {removeErr && <div style={{ marginTop: 6, fontSize: 11.5, color: THEME_DANGER }}>{removeErr}</div>}
+          </Section>
+          )}
 
           </>
           )}
@@ -721,6 +797,8 @@ export function Sidebar({ mobile = false }: { mobile?: boolean }) {
           </Section>
         </>
       )}
+
+      {confirm && <ConfirmDialog opts={confirm} onClose={() => setConfirm(null)} />}
     </>
   );
 

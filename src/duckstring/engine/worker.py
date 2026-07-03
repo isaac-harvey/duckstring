@@ -158,17 +158,20 @@ def complete_ripple(state: WorkerState, name: str, now: datetime) -> tuple[Worke
     return s, None
 
 
-def fail_ripple(state: WorkerState, name: str, now: datetime) -> tuple[WorkerState, RunFailed | None]:
+def fail_ripple(
+    state: WorkerState, name: str, now: datetime, retry: bool = True
+) -> tuple[WorkerState, RunFailed | None]:
     """A Ripple's run errored. If the Pond Run it was reaching (``F = Ripple.start_f``) still has
     immediate-retry budget, spend one and re-arm the Ripple to run again (``sentinel`` relaunches it);
     otherwise the Run gives up and a :class:`RunFailed` is returned for the Catchment. Either way the
-    Ripple is no longer running."""
+    Ripple is no longer running. ``retry=False`` skips the budget and gives up immediately — for a
+    :class:`~duckstring.core.MissingSourceAsset`, which a re-run won't fix within the same Run."""
     s = state.clone()
     rs = s.states[name]
     f = rs.start_f
     rs.is_running = False
     rs.started_at = None
-    if s.immediate_left.get(f, 0) > 0:
+    if retry and s.immediate_left.get(f, 0) > 0:
         s.immediate_left[f] -= 1
         if f > rs.end_f and f not in rs.targets:
             rs.targets.append(f)  # retry the same Ripple, same Run

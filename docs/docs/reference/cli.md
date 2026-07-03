@@ -29,6 +29,7 @@ Most commands that talk to a Catchment share these:
 | `catchment connect -n {name} --path {url} [--key KEY] [--header 'N: v']… [-y]` | Register a remote Catchment by URL; `--key` stores its API key (sent as a Bearer header — use a `demand` key for a downstream that only solicits and draws), `--header` stores arbitrary headers for platform auth (e.g. `'Authorization: Key …'` for Posit Connect) — both attached to every request. |
 | `catchment list` | List registered Catchments; `●` marks the default. |
 | `catchment download [-c NAME] [--path DIR] [-y]` | Download the Catchment's entire root (database, artifacts, data, ledgers) into a local directory — default `./.duckstring`, so it drops straight into a platform deploy bundle. Shows the state size and asks before transferring (`-y` skips); streams with a progress bar. |
+| `catchment reset [-c NAME] [--clear-history] [-y]` | Reset the **whole Catchment** to a fresh-deploy state — scrub every Pond's registry, published data, and ledger and rewind all freshness — **keeping** the deployed code, operational config, secrets, and keys. The sanctioned replacement for deleting `.duckstring`; stop-the-world (every worker restarts). Ponds rebuild lazily from the Inlets down. |
 | `catchment set-default {name}` | Set the default Catchment. |
 | `catchment disconnect {name} [--purge]` | Unregister; for local Catchments, offers to delete the data directory (`--purge` deletes without asking). |
 | `catchment open {pond} [-m M] [--tap-on-get]` | Mark a Pond open to demand from any source; `--tap-on-get` makes a [query](../guides/querying-data.md) read fire a Tap (snapshot served first). |
@@ -58,6 +59,7 @@ Conduits that draw a Pond from an upstream Catchment into the consuming one (`-c
 | `pond hydrate [-s SOURCE] [--from-catchment] [-c NAME]` | Materialise the project's [Puddles](../guides/local-testing.md) into `puddles/`. Sources without a definition are skipped with a warning; `--from-catchment` fills them from the Catchment's exported tables; `-s` restricts to specific Sources. |
 | `pond run [--ripple NAME] [--fresh]` | Execute the Pond locally against its hydrated Puddles, output to `puddles/out/`. `--ripple` runs a single Ripple against the last run's state; `--fresh` ignores a self-puddle seed. |
 | `pond deploy [-c NAME] [--git REF] [-y] [--all]` | Deploy the current Pond project (reads `pond.toml`). `--all` deploys every subdirectory containing a `pond.toml`; `--git` deploys from a git ref (branch/tag/commit) of the project's `origin` remote instead of uploading the working tree; `-y` skips confirmations. |
+| `pond remove {name} [-m M] [-c NAME] [-y]` | Remove (retire) a deployed Pond major line — deletes its data, live state, and on-disk runtime plus its own Spouts and alert channels, **keeping** its deployment record + run history (a redeploy restores it). `--major` picks the line (default: highest deployed). Downstream Ponds that read it block on the missing Source until fixed. Requires the line idle with no demand (`control sleep` it first). |
 
 ## `duckstring puddle` — inspect local test data
 
@@ -133,7 +135,7 @@ Two destinations work today: a **webhook** (`https://…`/`http://…`, a Slack-
 
 | Command | Description |
 |---|---|
-| `alert add --to {uri} [--pond N] [--on failure,…\|all] [--stale 1h] [--name N]` | Add a channel. `--to` is an `https://`/`http://`/`mailto:` URI; `--pond` scopes it to one Pond (default: catchment-wide); `--on` is the event kinds (default `all`); `--stale` sets a freshness SLA (e.g. `1h`, `30m`) — required for `freshness` to fire; `--name` defaults to the scheme/scope. |
+| `alert add --to {uri} [--pond N [--major M]] [--on failure,…\|all] [--stale 1h] [--name N]` | Add a channel. `--to` is an `https://`/`http://`/`mailto:` URI; `--pond` scopes it to one Pond line (`--major` picks the major, default: the Pond's highest deployed major; omit `--pond` for catchment-wide); `--on` is the event kinds (default `all`); `--stale` sets a freshness SLA (e.g. `1h`, `30m`) — required for `freshness` to fire; `--name` defaults to the scheme/scope. |
 | `alert ls` | List channels with their scope, events, SLA, and destination. |
 | `alert rm {name}` | Remove a channel. |
 | `alert test {name}` | Send a test notification through the channel (validates connectivity + credentials). |
@@ -151,6 +153,7 @@ See [Control](../guides/control.md) and [Fault Tolerance](../guides/fault-tolera
 | `control force {pond}` | Recompute now at current freshness; doesn't propagate downstream. Clears failed/killed. |
 | `control refresh {pond} [--clear]` | Flag the Pond so its *next* run is a cold wipe-and-rebuild (full recompute, clears the changelog so downstream reloads). Lazy — nothing runs now. `--clear` un-flags. See [Trickle](../guides/trickle.md). |
 | `control repair {ponds}... [--downstream]` | Force-rebuild a **connected** set of Ponds now, in dependency order (each reads its freshly-rebuilt parents). For an immediate fix when no new upstream run is coming. `--downstream` extends the set to all descendants; a disconnected set (a skipped Pond in a sequence) is rejected. |
+| `control reset {pond} [--clear-history] [-y]` | Reset a Pond to a fresh-deploy state — scrub its registry, published data, and ledger and rewind its freshness — **keeping** its code, operational config, and demand. Lazy: nothing runs now; it rebuilds from scratch when next demanded. Requires the Pond idle. |
 | `control sleep {pond} [--upstream]` | Clear all demand (started runs complete). `--upstream` also sleeps every ancestor. |
 | `control kill {pond}` | Terminate the Pond's worker and cancel its run; parks the Pond `killed` until wake/force/clear. |
 | `control clear {pond}` | Reset a failed/killed Pond to idle and unblock downstream, without running. |
@@ -180,3 +183,17 @@ duckstring query {pond} [ripple] [--sql SQL | --sql @file.sql]
 ```
 
 Run SQL against the Pond's exported tables. With just a `ripple` argument: `SELECT * FROM {pond}.{ripple} LIMIT 10`. Without a format flag, results print to the terminal; with one, they're written to `./ponds/{pond}/[{ripple}/]{filename}` or `--path`.
+
+```bash
+duckstring objects {pond}                     # list a Pond's non-tabular Objects
+duckstring get-object {pond} {name} [-o PATH]  # download one (a file, or a directory Object unzipped)
+```
+
+List / download a Pond's [Objects](python-api.md#objects--non-tabular-outputs) — models, blobs, and other non-tabular outputs. A single-file Object writes to `./{name}` (or `--out`); a directory Object unzips into it.
+
+```bash
+duckstring delete-table {pond} {table} [-y]    # delete a table (data + state) — no run, stays gone
+duckstring delete-object {pond} {name} [-y]     # delete an Object (returns only if a Ripple rewrites it)
+```
+
+Delete one published output from a Pond (full access; the Pond must be idle). A table delete removes its data **and** registry state **now** — no run, no freshness change; it reappears only when the Pond next genuinely runs, rebuilt whole if the code still produces it (an append Trickle warns first — its history is dropped). An Object delete removes it directly.

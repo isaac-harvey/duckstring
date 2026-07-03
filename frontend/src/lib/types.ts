@@ -53,9 +53,11 @@ export interface PondInfo {
   major: number;
   kind: string;
   hasTables: boolean; // this major line has published tables — the data viewer is offered
+  hasObjects: boolean; // this major line has published non-tabular Objects — the viewer's Objects tab is offered
   // Fault tolerance + control (Ponds only).
   isFailed: boolean;
   isBlocked: boolean;
+  blockedReason: string | null;
   isKilled: boolean;
   refreshPending: boolean; // next run is a cold wipe-and-rebuild (control refresh)
   repairing: boolean; // in an active repair plan

@@ -172,6 +172,48 @@ def refresh(
     return {"ok": True}
 
 
+@router.post("/ponds/{name}/reset", dependencies=[auth.full])
+def reset(
+    name: str, request: Request, clear_history: bool = False,
+    major: int | None = None, version: str | None = None,
+):
+    """Reset a Pond to a fresh-deploy state — scrub its registry, data, and ledger and rewind its
+    freshness, keeping its code, operational config, and demand. Lazy (no forced run); requires the Pond
+    idle (409). See plans/reset.md."""
+    try:
+        _driver(request).reset_pond(_resolve(request, name, major, version), clear_history=clear_history)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"ok": True}
+
+
+@router.delete("/ponds/{name}", dependencies=[auth.full])
+def remove_pond(name: str, request: Request, major: int | None = None, version: str | None = None):
+    """Remove (retire) one deployed major line — delete its live selection, config, on-disk runtime, and
+    its own Spouts + alert channels, keeping its deployment record + run history. Downstream sinks that pin
+    it block on the missing Source. Requires the line idle + demand-free (409). See plans/remove-pond.md."""
+    key = _resolve(request, name, major, version)
+    n, _, mj = key.rpartition("@")
+    try:
+        return _driver(request).remove_pond(n, int(mj))
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.delete("/ponds/{name}/tables/{table}", dependencies=[auth.full])
+def delete_table(
+    name: str, table: str, request: Request, major: int | None = None, version: str | None = None,
+):
+    """Delete one table from a Pond — its published data **and** its registry collection — now. No run:
+    it reappears only if the Pond's code recreates it on a future run. Requires the Pond idle (409).
+    See plans/deletes.md."""
+    try:
+        _driver(request).delete_table(_resolve(request, name, major, version), table)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"ok": True}
+
+
 class _RepairPond(BaseModel):
     name: str
     major: Optional[int] = None
