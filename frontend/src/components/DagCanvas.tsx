@@ -1,6 +1,6 @@
 'use client';
 
-import { Fragment, useEffect, useMemo, useState } from 'react';
+import { Fragment, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ReactFlow,
   Background,
@@ -417,6 +417,19 @@ export function DagCanvas() {
     return () => clearTimeout(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isMobile]);
+
+  // Re-frame when the *set* of Ponds changes (one deployed or removed). The controlled viewport
+  // otherwise stays put, which can leave a newly-orphaned downstream Pond off-screen after its
+  // source is removed. Keyed on Pond ids only, so collapse/expand (a ripple-visibility change)
+  // doesn't trigger it; the initial mount is framed by the isMobile effect above.
+  const pondIdKey = useMemo(() => Object.keys(ponds).sort().join(','), [ponds]);
+  const framedOnce = useRef(false);
+  useEffect(() => {
+    if (!framedOnce.current) { framedOnce.current = true; return; }
+    const t = setTimeout(() => fitView({ padding: 0.15, duration: 350 }), 120);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pondIdKey]);
 
   // React Flow controlled mode requires these handlers; layout is managed externally, so no-op.
   const onNodesChange = () => {};

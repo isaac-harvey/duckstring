@@ -251,6 +251,50 @@ def test_deploy_selects_new_version(catchment_client):
     assert {r[0] for r in db.execute("SELECT version FROM pond_version")} == {"1.0.0", "1.1.0"}
 
 
+def test_redeploy_same_version_keeps_run_history(catchment_client):
+    """Redeploying an already-known version (e.g. re-activating a retired line) must preserve its run
+    history — a pond_version is an immutable artifact. Regression: the old path nuked pond_run/ripple_run."""
+    _deploy(catchment_client, name="inlet", version="1.0.0", kind="inlet",
+            toml_text=INLET_TOML, pond_py_text=POND_PY_TWO_RIPPLES)
+    db = _db(catchment_client)
+    (pv_id,) = db.execute(
+        "SELECT pv.id FROM pond_version pv JOIN pond_name pn ON pn.id = pv.pond_name_id WHERE pn.name = 'inlet'"
+    ).fetchone()
+    (load_id,) = db.execute("SELECT id FROM ripple WHERE pond_version_id = ? AND name = 'load'", (pv_id,)).fetchone()
+    with db:
+        db.execute("INSERT INTO pond_run (pond_version_id, f, started_at, status) VALUES (?, ?, ?, 'success')",
+                   (pv_id, "2026-01-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00"))
+        db.execute("INSERT INTO ripple_run (ripple_id, pond_version_id, f, retry, status) VALUES (?, ?, ?, 0, 'success')",
+                   (load_id, pv_id, "2026-01-01T00:00:00+00:00"))
+
+    # Redeploy the identical artifact — history survives and the pond_version id is unchanged.
+    _deploy(catchment_client, name="inlet", version="1.0.0", kind="inlet",
+            toml_text=INLET_TOML, pond_py_text=POND_PY_TWO_RIPPLES)
+    assert db.execute("SELECT count(*) FROM pond_run WHERE pond_version_id = ?", (pv_id,)).fetchone()[0] == 1
+    assert db.execute("SELECT count(*) FROM ripple_run WHERE pond_version_id = ?", (pv_id,)).fetchone()[0] == 1
+
+
+def test_redeploy_changed_topology_keeps_pond_runs(catchment_client):
+    """A genuine topology change under the same version must rewrite the ripple rows (ripple_run goes with
+    them, FK), but the Pond's own run history (pond_run, keyed on the version) is still kept."""
+    _deploy(catchment_client, name="inlet", version="1.0.0", kind="inlet",
+            toml_text=INLET_TOML, pond_py_text=POND_PY_TWO_RIPPLES)
+    db = _db(catchment_client)
+    (pv_id,) = db.execute(
+        "SELECT pv.id FROM pond_version pv JOIN pond_name pn ON pn.id = pv.pond_name_id WHERE pn.name = 'inlet'"
+    ).fetchone()
+    with db:
+        db.execute("INSERT INTO pond_run (pond_version_id, f, started_at, status) VALUES (?, ?, ?, 'success')",
+                   (pv_id, "2026-01-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00"))
+
+    # Redeploy the same version with a different intra-Pond graph (drop the edge).
+    one_ripple = "from duckstring import ripple\n\n@ripple\ndef load(pond): ...\n"
+    _deploy(catchment_client, name="inlet", version="1.0.0", kind="inlet",
+            toml_text=INLET_TOML, pond_py_text=one_ripple)
+    assert {r[0] for r in db.execute("SELECT name FROM ripple WHERE pond_version_id = ?", (pv_id,))} == {"load"}
+    assert db.execute("SELECT count(*) FROM pond_run WHERE pond_version_id = ?", (pv_id,)).fetchone()[0] == 1
+
+
 def test_deploy_two_majors_both_selected(catchment_client):
     _deploy(catchment_client, name="inlet", version="1.0.0", kind="inlet", toml_text=INLET_TOML)
     v2_toml = INLET_TOML.replace("1.0.0", "2.0.0")

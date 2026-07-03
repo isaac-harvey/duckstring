@@ -110,6 +110,36 @@ def _discover_ripples(source_dir: Path) -> list[dict]:
         return []
 
 
+def _incoming_topology(ripples) -> dict[str, frozenset]:
+    """The intra-Pond graph as {ripple_name: frozenset(parent_names)} — for comparing a redeploy
+    against what's already stored (parents arrive as function refs, resolved to names here)."""
+    func_to_name = {r["func"]: r["name"] for r in ripples}
+    names = {r["name"] for r in ripples}
+    sig: dict[str, frozenset] = {}
+    for r in ripples:
+        parents = set()
+        for pf in r["parents"]:
+            pn = func_to_name.get(pf, getattr(pf, "__name__", None))
+            if pn and pn in names:
+                parents.add(pn)
+        sig[r["name"]] = frozenset(parents)
+    return sig
+
+
+def _existing_topology(db, pv_id) -> dict[str, frozenset]:
+    """The stored intra-Pond graph for a pond_version, in the same shape as _incoming_topology."""
+    id_to_name = dict(db.execute("SELECT id, name FROM ripple WHERE pond_version_id = ?", (pv_id,)).fetchall())
+    parents: dict[str, set] = {nm: set() for nm in id_to_name.values()}
+    for sink_id, source_id in db.execute(
+        "SELECT sink_id, source_id FROM ripple_to_ripple WHERE sink_id IN "
+        "(SELECT id FROM ripple WHERE pond_version_id = ?)",
+        (pv_id,),
+    ):
+        if sink_id in id_to_name and source_id in id_to_name:
+            parents[id_to_name[sink_id]].add(id_to_name[source_id])
+    return {nm: frozenset(ps) for nm, ps in parents.items()}
+
+
 def _register(db, name, version, kind, source_path, cfg, ripples) -> None:
     major = int(version.split(".")[0])
     deployed_at = datetime.now(timezone.utc).isoformat()
@@ -123,19 +153,22 @@ def _register(db, name, version, kind, source_path, cfg, ripples) -> None:
         ).fetchone()
         if existing:
             pv_id = existing[0]
-            # Rewriting an existing version's topology: its run history (keyed on this pond_version)
-            # references the ripple rows we're about to drop, so clear it first or the ripple DELETE
-            # below violates ripple_run's FK. ripple_run before pond_run (ripple_run references both).
-            db.execute("DELETE FROM ripple_run WHERE pond_version_id = ?", (pv_id,))
-            db.execute("DELETE FROM pond_run WHERE pond_version_id = ?", (pv_id,))
-            ripple_ids = [r[0] for r in db.execute("SELECT id FROM ripple WHERE pond_version_id = ?", (pv_id,))]
-            if ripple_ids:
-                marks = ",".join("?" * len(ripple_ids))
-                db.execute(
-                    f"DELETE FROM ripple_to_ripple WHERE sink_id IN ({marks}) OR source_id IN ({marks})",
-                    ripple_ids * 2,
-                )
-                db.execute("DELETE FROM ripple WHERE pond_version_id = ?", (pv_id,))
+            # Redeploying an already-known version (e.g. re-activating a removed/retired line, or a plain
+            # re-push). A pond_version is meant to be an immutable artifact, so preserve its run history
+            # by default — only touch the ripple rows when the intra-Pond topology genuinely changed.
+            if _existing_topology(db, pv_id) != _incoming_topology(ripples):
+                # Topology changed under the same version: the old ripple rows must be rewritten, and
+                # ripple_run references them (FK), so its rows can't survive. pond_run keys only on the
+                # version, so the Pond's run history is kept — we lose only the per-ripple attempt detail.
+                db.execute("DELETE FROM ripple_run WHERE pond_version_id = ?", (pv_id,))
+                ripple_ids = [r[0] for r in db.execute("SELECT id FROM ripple WHERE pond_version_id = ?", (pv_id,))]
+                if ripple_ids:
+                    marks = ",".join("?" * len(ripple_ids))
+                    db.execute(
+                        f"DELETE FROM ripple_to_ripple WHERE sink_id IN ({marks}) OR source_id IN ({marks})",
+                        ripple_ids * 2,
+                    )
+                    db.execute("DELETE FROM ripple WHERE pond_version_id = ?", (pv_id,))
             db.execute(
                 "UPDATE pond_version SET source_path = ?, major = ?, immediate_retries = ?, "
                 "source_retries = ?, deployed_at = ? WHERE id = ?",

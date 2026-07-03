@@ -66,17 +66,25 @@ def _deploy_one(
         _r = _httpx.get(f"{url}/api/ponds/{name}/versions/{version}", headers=auth_headers(cfg), timeout=5.0)
         if _r.status_code == 200:
             version_exists: bool | None = True
+            version_active = bool(_r.json().get("is_active"))
         elif _r.status_code == 404:
             version_exists = False
+            version_active = False
         else:
             version_exists = None
+            version_active = False
     except Exception:
         version_exists = None
+        version_active = False
 
     mode = f"git:{git}" if git else "local"
     console.print(f"Deploying [bold]{name}[/bold] v[bold]{version}[/bold] ([dim]{mode}[/dim]) → [bold]{catchment_name}[/bold]")
-    if version_exists is True:
-        console.print("[yellow]A Pond with the same name and version currently exists and will be overwritten.[/yellow]")
+    if version_exists is True and version_active:
+        console.print("[yellow]This version is currently deployed and will be overwritten.[/yellow]")
+    elif version_exists is True:
+        # The version's deployment record + run history survive a removal, but nothing is live against
+        # it — redeploying re-activates the retired line rather than overwriting a running one.
+        console.print("[yellow]This version was previously removed (history kept); redeploying will restore it.[/yellow]")
     elif version_exists is False:
         console.print("[dim]New version — no conflicts.[/dim]")
     else:

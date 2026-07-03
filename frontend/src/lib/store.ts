@@ -352,8 +352,15 @@ export const useLiveStore = create<LiveState>((set, get) => ({
     } catch {
       /* leave the last lineage in place */
     }
+    const next = transformStatus(payload);
+    // Drop a selection whose Pond has vanished (e.g. it was just removed) so the Sidebar doesn't hold a
+    // ghost and the canvas re-frames to what's left (see the fit-all fallback in DagCanvas).
+    const sel = get().selectedPondId;
+    const cleared = sel && !next.ponds[sel]
+      ? { selectedPondId: null, selectedRippleId: null, selectedTriggerId: null }
+      : {};
     set({
-      ...transformStatus(payload), lineage, statusVersion: payload.version,
+      ...next, ...cleared, lineage, statusVersion: payload.version,
       now: Date.now(), connected: true, error: null, needsKey: false,
     });
 
