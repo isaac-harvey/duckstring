@@ -1,10 +1,19 @@
 # Removing a Pond (a `name@major` line)
 
-Status: **implemented.** `Driver.remove_pond(name, major)` + `DELETE /api/ponds/{name}` +
-`duckstring pond remove` + a Sidebar **Remove Pond** button (type-`name@version` confirm). Prerequisite
-(alerts → `name@major` scope) landed first. Tests: `test_remove_pond_retires_line` (real-Duck: scrub +
-history kept + artifact survives + Spout/scoped-alert cascade + catchment-wide-alert survives + downstream
-blocks) and `test_remove_pond_rejects_with_demand`.
+Status: **implemented.** `Driver.remove_pond(name, major, wipe=False)` + `DELETE /api/ponds/{name}[?wipe=true]`
++ `duckstring pond remove [--wipe]` + a Sidebar **Remove Pond** button (type-`name@version` confirm, with a
+**"Also wipe history"** checkbox). Prerequisite (alerts → `name@major` scope) landed first. Tests:
+`test_remove_pond_retires_line` (real-Duck: scrub + history kept + artifact survives + Spout/scoped-alert
+cascade + catchment-wide-alert survives + downstream blocks), `test_remove_pond_wipe_purges_history`
+(real-Duck: history + versions + pond_name + on-disk tree all purged), and `test_remove_pond_rejects_with_demand`.
+
+The default is a **retire** (below). `--wipe` escalates it to a **purge**: after the retire steps it also
+deletes the deployment record (every `pond_version` of the major + its `ripple`/`ripple_to_ripple`/
+`pond_version_schema` rows), the run history (`pond_run`/`ripple_run`), and the `{version}/` artifact dirs —
+and drops the `pond_name` once its last major is gone and no live sink still sources it (the `pond_to_pond`
+source FK guards that). The line is then as if never deployed: its `/api/runs` history vanishes and a redeploy
+does **not** un-retire it (it's a fresh deploy). This is the `--purge` the "What removal deliberately does not
+do" section below flagged as a later feature — now built, spelled `--wipe`.
 
 Retire one deployed major line — the executable object `name@major` — from a
 Catchment. The main use case is dropping an old major that nothing runs any more. The sibling of
@@ -38,11 +47,12 @@ intact — retire is naturally reversible.
 
 **Keeping history forces the FK chain.** `ripple_run` references *both* `ripple` and `pond_version`, and
 `pond_run` references `pond_version`; FK enforcement is on (`PRAGMA foreign_keys = ON`). So a no-purge
-removal **cannot** delete the version-scoped rows (`pond_version`, `ripple`, `ripple_to_ripple`,
-`pond_version_schema`) — and shouldn't; they *are* the record. Removal only deletes the live selection +
-its `pond(id)`-keyed config. (A separate future `--purge` — explicitly out of scope now — would delete the
-version rows + history + the `{version}/` artifacts, gated by the `pond_to_pond.source_pond_name_id` FK,
-which already forbids deleting a `pond_name` that a live sink still declares.)
+(default) removal **cannot** delete the version-scoped rows (`pond_version`, `ripple`, `ripple_to_ripple`,
+`pond_version_schema`) — and shouldn't; they *are* the record. The default removal only deletes the live
+selection + its `pond(id)`-keyed config. **`--wipe`** goes further, deleting those version rows + history +
+the `{version}/` artifacts (children-first FK order), then dropping the `pond_name` once its last major is
+gone and the `pond_to_pond.source_pond_name_id` FK no longer forbids it (a live sink still declaring the name
+keeps it, matching the `has_missing_source` block). A `--wipe`'d line is not un-retired by a redeploy.
 
 ## Dependents & cascade — none, by thesis
 
@@ -100,21 +110,22 @@ the caller can report the blast radius).
 
 ## Surfaces
 
-- **API**: `DELETE /api/ponds/{name}?major=M` (full-gated). 409 if running or has demand. Returns
-  `{removed, spouts_removed, now_blocked}`.
-- **CLI**: `duckstring pond remove {name} [--major M] [-y]` (default major = highest deployed). Prints the
-  blast radius (Spouts removed, sinks now blocked) and confirms; `-y` skips. On a not-idle Pond, the error
-  says to `control sleep` first.
+- **API**: `DELETE /api/ponds/{name}?major=M[&wipe=true]` (full-gated). 409 if running or has demand.
+  Returns `{removed, spouts_removed, now_blocked, wiped}`.
+- **CLI**: `duckstring pond remove {name} [--major M] [--wipe] [-y]` (default major = highest deployed).
+  Prints the blast radius (Spouts removed, sinks now blocked) and confirms (the prompt names whether history
+  is kept or purged); `-y` skips. On a not-idle Pond, the error says to `control sleep` first.
 - **UI**: a **Remove** button at the bottom of the Pond Sidebar (full-only), opening the themed
   `ConfirmDialog` with `requireTyped` = the Pond's **`name@version`** (what the node shows, e.g.
   `catalog@1.4.2`) — the type-to-confirm gate, since it's destructive and against the read-only-topology
-  grain. The body states the Pond, that its data + live state go but its run history is kept, and lists the
-  Spouts that go with it + any sinks that will block. The backend resolves the typed version to its major
-  line. Disabled (with a hint to sleep first) when the Pond is running or has demand.
+  grain — plus an **"Also wipe history"** opt-in checkbox (`ConfirmDialog.toggle`, threaded to
+  `removePond(id, wipe)`). The body states the Pond, that its data + live state go but its run history is
+  kept (unless wiped), and lists the Spouts that go with it + any sinks that will block. The backend resolves
+  the typed version to its major line. Disabled (with a hint to sleep first) when the Pond is running or has
+  demand.
 
 ## What removal deliberately does not do
 
-- **No `--purge`** (delete history + version rows + artifacts) — a later, separate feature.
 - **No dependent refusal, no cascade** — sinks block via `has_missing_source`; the operator handles them.
 - **No `pond_name` deletion** — it's forced-kept by the history FK chain and shared across majors.
 

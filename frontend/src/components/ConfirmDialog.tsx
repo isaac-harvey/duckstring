@@ -4,14 +4,16 @@ import { useEffect, useState } from 'react';
 import { THEME_BLOCKED } from '@/lib/store';
 
 // A destructive-confirmation request. `action` is the work to run on confirm (the dialog awaits it, then
-// closes). `requireTyped`, when set, gates the confirm button behind the user typing that exact string —
-// for the heaviest, irreversible actions (a whole-Catchment reset).
+// closes; it receives the `toggle`'s checkbox state). `requireTyped`, when set, gates the confirm button
+// behind the user typing that exact string — for the heaviest, irreversible actions (a whole-Catchment
+// reset). `toggle`, when set, renders an opt-in checkbox (e.g. a Remove's "wipe history" escalation).
 export type ConfirmOpts = {
   title: string;
   body: string;
   confirmLabel: string;
   requireTyped?: string;
-  action: () => Promise<void> | void;
+  toggle?: { label: string; hint?: string; default?: boolean };
+  action: (toggled: boolean) => Promise<void> | void;
 };
 
 // A centred, themed modal confirmation (replaces window.confirm). Fixed to the viewport (centres on screen
@@ -19,6 +21,7 @@ export type ConfirmOpts = {
 export function ConfirmDialog({ opts, onClose }: { opts: ConfirmOpts; onClose: () => void }) {
   const [busy, setBusy] = useState(false);
   const [typed, setTyped] = useState('');
+  const [toggled, setToggled] = useState(!!opts.toggle?.default);
   const gated = !!opts.requireTyped;
   const canConfirm = !busy && (!gated || typed === opts.requireTyped);
 
@@ -34,7 +37,7 @@ export function ConfirmDialog({ opts, onClose }: { opts: ConfirmOpts; onClose: (
     if (!canConfirm) return;
     setBusy(true);
     try {
-      await opts.action();
+      await opts.action(toggled);
     } finally {
       onClose();
     }
@@ -59,9 +62,23 @@ export function ConfirmDialog({ opts, onClose }: { opts: ConfirmOpts; onClose: (
         }}
       >
         <div style={{ fontSize: 13.5, fontWeight: 700, color: '#e4e4e7', marginBottom: 8 }}>{opts.title}</div>
-        <div style={{ fontSize: 12.5, color: '#a1a1aa', lineHeight: 1.55, marginBottom: gated ? 12 : 16, whiteSpace: 'pre-wrap' }}>
+        <div style={{ fontSize: 12.5, color: '#a1a1aa', lineHeight: 1.55, marginBottom: opts.toggle || gated ? 12 : 16, whiteSpace: 'pre-wrap' }}>
           {opts.body}
         </div>
+        {opts.toggle && (
+          <label style={{ display: 'flex', alignItems: 'flex-start', gap: 8, marginBottom: 16, cursor: 'pointer' }}>
+            <input
+              type="checkbox"
+              checked={toggled}
+              onChange={(e) => setToggled(e.target.checked)}
+              style={{ marginTop: 2, accentColor: THEME_BLOCKED, cursor: 'pointer' }}
+            />
+            <span style={{ fontSize: 12, color: '#e4e4e7', lineHeight: 1.5 }}>
+              {opts.toggle.label}
+              {opts.toggle.hint && <span style={{ display: 'block', color: '#71717a', fontSize: 11 }}>{opts.toggle.hint}</span>}
+            </span>
+          </label>
+        )}
         {gated && (
           <div style={{ marginBottom: 16 }}>
             <div style={{ fontSize: 11.5, color: '#71717a', marginBottom: 6 }}>

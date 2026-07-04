@@ -396,6 +396,46 @@ def test_remove_pond_retires_line(runtime):
     assert _wait(lambda: (_pond_status(url, "priced") or {}).get("is_blocked") is True, timeout=10.0)
 
 
+def test_remove_pond_wipe_purges_history(runtime):
+    """`pond remove --wipe` (name@major): the retire, PLUS purge the deployment record + run history +
+    {version}/ artifacts and drop the now-orphaned pond_name — as if never deployed. Targets revenue (a
+    terminal outlet, so nothing sources it → its pond_name is deletable). See plans/remove-pond.md."""
+    import sqlite3
+
+    url, root = runtime
+    _deploy(url, _TRICKLE_PONDS)
+    httpx.post(f"{url}/api/ponds/revenue/pulse", timeout=5.0)
+    assert _wait(lambda: (_pond_status(url, "revenue") or {}).get("end_f") is not None)
+    time.sleep(1.0)  # settle to idle
+
+    def counts():
+        db = sqlite3.connect(root / "duck.db")
+        try:
+            runs = db.execute(
+                "SELECT count(*) FROM pond_run pr JOIN pond_version pv ON pv.id = pr.pond_version_id "
+                "JOIN pond_name pn ON pn.id = pv.pond_name_id WHERE pn.name = 'revenue'").fetchone()[0]
+            versions = db.execute(
+                "SELECT count(*) FROM pond_version pv JOIN pond_name pn ON pn.id = pv.pond_name_id "
+                "WHERE pn.name = 'revenue'").fetchone()[0]
+            names = db.execute("SELECT count(*) FROM pond_name WHERE name = 'revenue'").fetchone()[0]
+            return runs, versions, names
+        finally:
+            db.close()
+
+    runs_before, versions_before, _ = counts()
+    assert runs_before > 0 and versions_before > 0 and (root / "ponds" / "revenue").exists()
+
+    r = httpx.request("DELETE", f"{url}/api/ponds/revenue", params={"major": 1, "wipe": "true"}, timeout=15.0)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["removed"] == "revenue@1" and body["wiped"] is True
+
+    # Gone from the live system AND its record purged: history, versions, pond_name, and the on-disk tree.
+    assert _pond_status(url, "revenue") is None
+    assert counts() == (0, 0, 0), "history / versions / pond_name were not purged"
+    assert not (root / "ponds" / "revenue").exists(), "artifact tree was not removed"
+
+
 def test_remove_pond_rejects_with_demand(runtime):
     """Remove requires the line idle + demand-free — a standing Wave is demand, so remove 409s until it's
     cleared (sleep)."""

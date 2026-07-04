@@ -162,21 +162,27 @@ def remove(
     name: str = typer.Argument(..., help="Pond name to remove."),
     catchment: Optional[str] = typer.Option(None, "--catchment", "-c", help="Catchment to use (uses default if omitted)."),
     major: Optional[int] = typer.Option(None, "--major", "-m", help="Major line to remove (default: highest deployed)."),
+    wipe: bool = typer.Option(False, "--wipe", help="Also purge the deployment record, run history, and "
+                              "artifacts — as if never deployed (not reversible by a redeploy)."),
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation prompt."),
 ) -> None:
     """Remove (retire) a deployed Pond major line — delete its data, live state, and on-disk runtime plus
     its own Spouts and alert channels, keeping its deployment record and run history (a redeploy un-retires
     it). Downstream Ponds that read it will block until fixed. Requires the line idle with no demand
-    (`control sleep` it first)."""
+    (`control sleep` it first). Pass `--wipe` to also purge the deployment record + run history + artifacts,
+    leaving no trace of the line."""
     from . import _http
     from .config import resolve_catchment
 
     _, cfg = resolve_catchment(catchment)
     label = f"{name}@{major}" if major is not None else name
     if not yes:
-        typer.confirm(f"Remove Pond '{label}' (deletes its data + config; keeps run history)?", abort=True)
-    resp = _http.delete(f"{cfg['url']}/api/ponds/{name}", auth=cfg, params=_http.pond_params(major, None)).json()
-    typer.echo(f"Removed '{resp['removed']}'.")
+        detail = ("deletes its data + config AND purges its deployment record + run history — as if never "
+                  "deployed") if wipe else "deletes its data + config; keeps run history"
+        typer.confirm(f"Remove Pond '{label}' ({detail})?", abort=True)
+    params = {**_http.pond_params(major, None), **({"wipe": "true"} if wipe else {})}
+    resp = _http.delete(f"{cfg['url']}/api/ponds/{name}", auth=cfg, params=params).json()
+    typer.echo(f"Removed '{resp['removed']}'{' (wiped)' if resp.get('wiped') else ''}.")
     if resp.get("spouts_removed"):
         typer.echo(f"  Spouts removed with it: {', '.join(resp['spouts_removed'])}")
     if resp.get("now_blocked"):

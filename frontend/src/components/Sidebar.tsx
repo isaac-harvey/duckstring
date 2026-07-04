@@ -747,9 +747,13 @@ export function Sidebar({ mobile = false }: { mobile?: boolean }) {
                     'restores it). Downstream Ponds that read it will block until you fix them.',
                   confirmLabel: 'Remove Pond',
                   requireTyped: target,
-                  action: async () => {
+                  toggle: {
+                    label: 'Also wipe history — as if never deployed.',
+                    hint: 'Purges the deployment record, run history, and artifacts too. Not reversible by a redeploy.',
+                  },
+                  action: async (wipe) => {
                     try {
-                      await removePond(selectedPond.id);
+                      await removePond(selectedPond.id, wipe);
                     } catch (e) {
                       setRemoveErr(e instanceof Error ? e.message : String(e));
                     }

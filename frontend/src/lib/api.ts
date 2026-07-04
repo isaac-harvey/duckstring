@@ -256,9 +256,13 @@ export async function resetCatchment(clearHistory = false): Promise<{ ponds: num
 }
 
 // Remove (retire) a Pond major line — deletes its data, config, Spouts + alerts; keeps history. Full only.
-export async function removePond(pond: string): Promise<{ removed: string; spouts_removed: string[]; now_blocked: string[] }> {
+// With `wipe`, also purges the deployment record + run history + artifacts (as if never deployed).
+export async function removePond(pond: string, wipe = false): Promise<{ removed: string; spouts_removed: string[]; now_blocked: string[]; wiped: boolean }> {
   const { name, major } = splitPond(pond);
-  const qs = major === undefined ? '' : `?major=${major}`;
+  const params = new URLSearchParams();
+  if (major !== undefined) params.set('major', String(major));
+  if (wipe) params.set('wipe', 'true');
+  const qs = params.toString() ? `?${params}` : '';
   const res = await fetch(`${apiBase()}/ponds/${encodeURIComponent(name)}${qs}`, {
     method: 'DELETE',
     headers: authHeaders(),

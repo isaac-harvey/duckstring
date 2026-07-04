@@ -601,12 +601,19 @@ class Driver:
             self._process(_now())
             return {"ponds": len(lines)}
 
-    def remove_pond(self, name: str, major: int) -> dict:
+    def remove_pond(self, name: str, major: int, wipe: bool = False) -> dict:
         """Remove (retire) one deployed major line ``name@major`` — delete its live ``pond`` selection, its
         ``pond(id)``-keyed config, its on-disk runtime, and its **own** Spouts + alert channels — while
         **keeping** its deployment record and run history (a redeploy un-retires it). Downstream sinks that
         pin it re-derive ``has_missing_source`` and hard-block. Requires the line idle + demand-free (per the
-        thesis it never checks or refuses on dependents). See plans/remove-pond.md."""
+        thesis it never checks or refuses on dependents).
+
+        With ``wipe=True`` this is a **purge**, not a retire: after the retire steps it also deletes the
+        line's deployment record (every ``pond_version`` of the major + its ``ripple``/``ripple_to_ripple``/
+        ``pond_version_schema`` rows), its run history (``pond_run``/``ripple_run``), and the ``{version}/``
+        artifact dirs on disk — and drops the ``pond_name`` if the last major is gone and nothing sources it,
+        so the line is as if it had never been deployed (its ``/api/runs`` history vanishes too, and it is
+        **not** reversible by a redeploy). See plans/remove-pond.md."""
         import shutil
         from pathlib import Path
 
@@ -651,12 +658,40 @@ class Driver:
                         "pond_window", "pond_spout", "pond_to_pond"):
                 self.db.execute(f"DELETE FROM {tbl} WHERE pond_id = ?", (pond_id,))
             self.db.execute("DELETE FROM pond WHERE id = ?", (pond_id,))
+            # 3b. --wipe: purge the deployment record + run history + {version}/ artifacts for this major,
+            #     so the line is as if never deployed (not reversible by a redeploy). FK order: children first.
+            if wipe:
+                versions = self.db.execute(
+                    "SELECT id, source_path FROM pond_version WHERE pond_name_id = ? AND major = ?",
+                    (pn_id, major)).fetchall()
+                vids = [v[0] for v in versions]
+                if vids:
+                    ph = ",".join("?" * len(vids))
+                    self.db.execute(f"DELETE FROM ripple_run WHERE pond_version_id IN ({ph})", vids)
+                    self.db.execute(f"DELETE FROM pond_run WHERE pond_version_id IN ({ph})", vids)
+                    self.db.execute(f"DELETE FROM pond_version_schema WHERE pond_version_id IN ({ph})", vids)
+                    self.db.execute(
+                        f"DELETE FROM ripple_to_ripple WHERE sink_id IN "
+                        f"(SELECT id FROM ripple WHERE pond_version_id IN ({ph}))", vids)
+                    self.db.execute(f"DELETE FROM ripple WHERE pond_version_id IN ({ph})", vids)
+                    self.db.execute(f"DELETE FROM pond_version WHERE id IN ({ph})", vids)
+                # Drop the pond_name once its last major is gone and no live sink still sources it.
+                self.db.execute(
+                    "DELETE FROM pond_name WHERE id = ? "
+                    "AND NOT EXISTS (SELECT 1 FROM pond_version WHERE pond_name_id = ?) "
+                    "AND NOT EXISTS (SELECT 1 FROM pond_to_pond WHERE source_pond_name_id = ?)",
+                    (pn_id, pn_id, pn_id))
+                for _vid, source_path in versions:  # the {version}/ artifact dirs
+                    shutil.rmtree(Path(self.root) / source_path, ignore_errors=True)
+                pond_root = Path(self.root) / "ponds" / name  # tidy an now-empty ponds/{name}/
+                if pond_root.is_dir() and not any(pond_root.iterdir()):
+                    pond_root.rmdir()
             self.db.commit()
             # 4. Rebuild the engine — the line is gone; sinks re-derive has_missing_source.
             self.reload()
             self.state_version += 1
             self._process(_now())
-            return {"removed": key, "spouts_removed": spouts, "now_blocked": now_blocked}
+            return {"removed": key, "spouts_removed": spouts, "now_blocked": now_blocked, "wiped": wipe}
 
     def is_pond_running(self, pond: str) -> bool:
         """Whether a Pond has a Run in flight (start_f advanced past end_f) — the idle gate for an Object

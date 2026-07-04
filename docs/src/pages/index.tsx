@@ -20,20 +20,37 @@ import styles from './index.module.css';
 // Never call it an "orchestration framework"; never name competitors; don't lead with the Catchment.
 
 // ─────────────────────────────────────────────────────────────────────────────
-// A media placeholder — drop a video/GIF/embed in where marked.
-function DemoSlot({badge}: {badge: string}): ReactNode {
+interface DemoSlotProps {
+  src: string;        // Path to your video (e.g., '/img/demo-analytics') without extension
+  aspectRatio?: string; // Optional: Allows custom aspect ratios like '16/9', '4/3', '1/1'
+  poster?: string;     // Optional: Path to a static fallback screenshot
+}
+
+function DemoSlot({ 
+  src, 
+  aspectRatio = '16/9', 
+  poster 
+}: DemoSlotProps): ReactNode {
   return (
     <figure className={styles.demo}>
-      <div className={styles.demoFrame}>
-        {/*
-          ▶ DROP MEDIA HERE ◀
-          Replace the placeholder spans below with ONE of:
-            • a GIF/MP4:  <img src={useBaseUrl('/img/demo-xyz.gif')} alt="" className={styles.demoMedia} />
-            • a video:    <video className={styles.demoMedia} autoPlay loop muted playsInline src={useBaseUrl('/img/demo-xyz.mp4')} />
-            • an embed:   <iframe className={styles.demoMedia} src="https://www.youtube.com/embed/..." allowFullScreen />
-          Keep the 16:9 .demoFrame wrapper so layout doesn't shift.
-        */}
-        <span className={styles.demoBadge}>{badge}</span>
+      <div 
+        className={styles.demoFrame} 
+        style={{ aspectRatio }} // Inline style handles dynamic aspect ratios natively
+      >
+        <video 
+          className={styles.demoMedia} 
+          autoPlay 
+          loop 
+          muted 
+          playsInline 
+          poster={poster}
+        >
+          {/* Delivers WebM first for optimized browsers, falls back to MP4 */}
+          <source src={useBaseUrl(`${src}.webm`)} type="video/webm" />
+          <source src={useBaseUrl(`${src}.mp4`)} type="video/mp4" />
+          Your browser does not support the video tag.
+        </video>
+
         <span className={styles.demoPlay} aria-hidden>
           ▶
         </span>
@@ -169,7 +186,7 @@ function ThrottleDemo(): ReactNode {
         for.
       </p>
 
-      <DemoSlot badge="Demo - TODO" />
+      <DemoSlot src="/img/ripple" aspectRatio="28/10"/>
 
       <p className={styles.proseMuted}>
         No sophisticated prediction of run times is required — flipping to control by consumers rather
@@ -193,7 +210,7 @@ function UpgradeDemo(): ReactNode {
         major retires when nothing depends on it. No lockstep, no choreographed release, no freeze.
       </p>
 
-      <DemoSlot badge="Demo - TODO" />
+      <DemoSlot src="/img/upgrade" aspectRatio="28/10"/>
 
       <p className={styles.proseMuted}>
         Upgrading a complex sequence of transformations can paralyze development, especially if
@@ -219,7 +236,7 @@ function IncrementalReveal(): ReactNode {
         only on changes.
       </p>
 
-      <DemoSlot badge="Demo - TODO" />
+      <DemoSlot src="/img/trickle" aspectRatio="28/10"/>
 
       <p className={styles.proseMuted}>
         Done well, incremental processing lets you stay single-node, in-memory and blazing fast —
