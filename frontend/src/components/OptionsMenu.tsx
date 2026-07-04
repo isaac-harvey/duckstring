@@ -95,19 +95,25 @@ export function TopBar() {
   const close = () => { setOpen(false); setPanel(null); };
 
   return (
-    <div style={{ position: 'relative', display: 'inline-flex', flexDirection: 'column', fontFamily: 'ui-monospace, SFMono-Regular, monospace' }}>
+    // On mobile the bar spans the full page width, pinned to the top (a page header); on desktop it is a
+    // floating top-left card.
+    <div style={{
+      position: 'relative', display: isMobile ? 'flex' : 'inline-flex', width: isMobile ? '100%' : undefined,
+      flexDirection: 'column', fontFamily: 'ui-monospace, SFMono-Regular, monospace',
+    }}>
       {/* The bar: a big logo alongside a two-row identity (name + status, then the access chips), with
           the Options button on the right. The two rows give the logo room without a tall single line. */}
       <div
         style={{
-          display: 'flex', alignItems: 'center', gap: 10, background: '#15151a', border: '1px solid #27272a',
-          borderRadius: open ? '8px 8px 0 0' : 8, padding: '6px 9px', fontSize: 12, color: '#a1a1aa',
+          display: 'flex', alignItems: 'center', gap: 10, background: '#15151a',
+          border: isMobile ? 'none' : '1px solid #27272a', borderBottom: '1px solid #27272a',
+          borderRadius: isMobile ? 0 : open ? '8px 8px 0 0' : 8, padding: '6px 12px', fontSize: 12, color: '#a1a1aa',
         }}
       >
         <span
           aria-label="Duckstring"
           style={{
-            width: isMobile ? 30 : 36, height: isMobile ? 30 : 36, flexShrink: 0,
+            width: isMobile ? 38 : 36, height: isMobile ? 38 : 36, flexShrink: 0,
             backgroundImage: 'url(/logo-mark.svg)', backgroundSize: 'contain',
             backgroundRepeat: 'no-repeat', backgroundPosition: 'center',
           }}

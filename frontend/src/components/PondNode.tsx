@@ -2,7 +2,7 @@
 
 import { memo } from 'react';
 import { Handle, Position, type NodeProps } from '@xyflow/react';
-import { useLiveStore, formatAge, stateColor, nodeFill } from '@/lib/store';
+import { useLiveStore, formatAge, stateColor, nodeFill, THEME_BRAND } from '@/lib/store';
 import { DemandIndicators } from './DemandIndicators';
 
 // A small grid/table glyph — the affordance to open this Pond's data viewer (shown when it has tables).
@@ -26,6 +26,7 @@ export const PondNode = memo(function PondNode({ data }: NodeProps) {
   const info = useLiveStore((s) => s.pondInfo[pondId]);
   const selectedPondId = useLiveStore((s) => s.selectedPondId);
   const selectPond = useLiveStore((s) => s.selectPond);
+  const selectorActive = useLiveStore((s) => s.selectorMode);
   const selecting = useLiveStore((s) => s.selectorMode && s.selectorPhase === 'select');
   const inScope = useLiveStore((s) => s.selectorScope.includes(pondId));
   const toggleSelect = useLiveStore((s) => s.toggleSelect);
@@ -47,23 +48,25 @@ export const PondNode = memo(function PondNode({ data }: NodeProps) {
   const displayName = pond.isSpout ? pond.name.split('#').slice(1).join('#') || pond.name : pond.name;
   // Draws and Spouts both cross the Catchment boundary → dashed (ingress vs egress).
   const boundary = pond.isDraw || pond.isSpout;
-  // In selector mode, clicking a Pond toggles it in/out of the scope (a bright ring marks it).
-  const ringColor = selecting && inScope ? '#a3e635' : borderColor;
+  // In selector mode, a selected Pond keeps a bright cyan ring through BOTH phases — so during
+  // "choose actions" the operator can still see exactly which Ponds the actions will hit. Clicking
+  // toggles the scope only in the select phase; in the ops phase a canvas click is inert.
+  const highlighted = selectorActive && inScope;
 
   return (
     <div
       onClick={(e) => {
         e.stopPropagation();
         if (selecting) toggleSelect(pondId);
-        else selectPond(pondId);
+        else if (!selectorActive) selectPond(pondId);
       }}
       style={{
         width: '100%',
         height: '100%',
         // Draws (ingress) and Spouts (egress) cross the Catchment boundary → dashed, vs a solid Pond.
         border: `2px ${boundary ? 'dashed' : 'solid'} ${borderColor}`,
-        boxShadow: selecting && inScope
-          ? `0 0 0 3px ${ringColor}`
+        boxShadow: highlighted
+          ? `0 0 0 3px ${THEME_BRAND}`
           : refreshPending
             ? `0 0 0 2px #ee9333aa`  // pending refresh — an amber hint
             : isSelected ? `0 0 0 3px ${borderColor}40` : undefined,

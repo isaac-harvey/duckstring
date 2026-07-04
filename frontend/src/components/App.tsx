@@ -11,6 +11,7 @@ import { RunHistory } from './RunHistory';
 import { RunDetail } from './RunDetail';
 import { DataViewerModal } from './DataViewerModal';
 import { ConfirmDialog } from './ConfirmDialog';
+import { TopBar } from './OptionsMenu';
 
 const POLL_MS = 1000;
 
@@ -114,14 +115,14 @@ const BRAND = '#06c4e6';
 // Operation metadata: label + a short blurb (shown on the button's second line so an unfamiliar operator
 // knows what each does), `warn` (destructive → red accent) and `irreversible` (needs the typed confirm).
 const OP_META: Record<BatchOp, { label: string; blurb: string; warn?: boolean; irreversible?: boolean }> = {
-  kill: { label: 'Kill', blurb: 'stop the Duck', warn: true },
-  sleep: { label: 'Sleep', blurb: 'cancel demand' },
-  reset: { label: 'Reset', blurb: 'erase data & state', warn: true, irreversible: true },
-  wipe: { label: 'Wipe', blurb: 'clear run history', warn: true, irreversible: true },
-  remove: { label: 'Remove', blurb: 'retire the Pond', warn: true, irreversible: true },
-  clear: { label: 'Clear', blurb: 'clear failures' },
-  repair: { label: 'Repair', blurb: 'rebuild now' },
-  refresh: { label: 'Refresh', blurb: 'rebuild next run' },
+  kill: { label: 'Kill', blurb: 'Stop The Duck', warn: true },
+  sleep: { label: 'Sleep', blurb: 'Cancel Demand' },
+  reset: { label: 'Reset', blurb: 'Erase Data & State', warn: true, irreversible: true },
+  wipe: { label: 'Wipe', blurb: 'Clear Run History', warn: true, irreversible: true },
+  remove: { label: 'Remove', blurb: 'Retire The Pond', warn: true, irreversible: true },
+  clear: { label: 'Clear', blurb: 'Clear Failures' },
+  repair: { label: 'Repair', blurb: 'Rebuild Now' },
+  refresh: { label: 'Refresh', blurb: 'Rebuild Next Run' },
 };
 
 const bannerBtn = (bg: string, disabled = false): React.CSSProperties => ({
@@ -151,6 +152,7 @@ function SelectorBanner() {
   const submitBatch = useLiveStore((s) => s.submitBatch);
   const cancel = useLiveStore((s) => s.exitSelector);
   const [confirming, setConfirming] = useState(false);
+  const isMobile = useIsMobile();
 
   if (!mode) return null;
 
@@ -201,7 +203,7 @@ function SelectorBanner() {
           <span style={{ color: '#a1a1aa' }}>
             Apply to <b style={{ color: '#e4e4e7' }}>{scope.length}</b> Pond{scope.length === 1 ? '' : 's'} ·
           </span>
-          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, width: isMobile ? '100%' : undefined, flexDirection: isMobile ? 'column' : 'row' }}>
             {BATCH_OPS.map((op) => {
               const on = ops.includes(op);
               const disabled = opDisabled(op);
@@ -216,8 +218,12 @@ function SelectorBanner() {
                   disabled={disabled}
                   title={lockedOn ? 'Auto-selected — implied by another action' : disabled ? 'Not available with the current selection' : undefined}
                   style={{
-                    display: 'flex', flexDirection: 'column', alignItems: 'flex-start', gap: 1,
-                    padding: '3px 9px', borderRadius: 5, fontFamily: 'inherit', textAlign: 'left',
+                    // Mobile: one wide row per action, single line "Label: Blurb". Desktop: compact
+                    // two-line chips that wrap.
+                    display: 'flex', flexDirection: isMobile ? 'row' : 'column',
+                    alignItems: isMobile ? 'baseline' : 'flex-start', gap: isMobile ? 6 : 1,
+                    width: isMobile ? '100%' : undefined, boxSizing: 'border-box',
+                    padding: isMobile ? '7px 11px' : '3px 9px', borderRadius: 5, fontFamily: 'inherit', textAlign: 'left',
                     cursor: disabled ? (lockedOn ? 'default' : 'not-allowed') : 'pointer',
                     border: `1px solid ${muted ? '#27272a' : accent}`,
                     color: on ? accent : muted ? '#52525b' : '#a1a1aa',
@@ -225,8 +231,8 @@ function SelectorBanner() {
                     opacity: muted ? 0.5 : 1,
                   }}
                 >
-                  <span style={{ fontSize: 11, fontWeight: 600 }}>{m.label}{lockedOn ? ' 🔒' : ''}</span>
-                  <span style={{ fontSize: 9, color: on ? accent : muted ? '#3f3f46' : '#71717a', opacity: 0.9 }}>{m.blurb}</span>
+                  <span style={{ fontSize: isMobile ? 13 : 11, fontWeight: 600 }}>{m.label}{lockedOn ? ' 🔒' : ''}{isMobile ? ':' : ''}</span>
+                  <span style={{ fontSize: isMobile ? 12 : 9, color: on ? accent : muted ? '#3f3f46' : '#71717a', opacity: 0.9 }}>{m.blurb}</span>
                 </button>
               );
             })}
@@ -288,6 +294,8 @@ export function App() {
     <div className="ds-app" style={{ display: 'flex', flexDirection: 'column', width: '100%', overflow: 'hidden', fontFamily: 'ui-monospace, SFMono-Regular, monospace' }}>
       {needsKey && <KeyPrompt />}
       <DataViewerModal />
+      {/* Mobile: the TopBar is a full-width page header pinned above everything (desktop floats it on the canvas). */}
+      {isMobile && <TopBar />}
       <SelectorBanner />
       {/* On mobile the sidebar drops below the canvas as a collapsible bottom sheet. */}
       <div style={{ display: 'flex', flexDirection: isMobile ? 'column' : 'row', flex: 1, minHeight: 0 }}>

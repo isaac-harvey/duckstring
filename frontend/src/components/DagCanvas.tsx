@@ -226,9 +226,13 @@ export function DagCanvas() {
         style={{ background: '#0f0f14' }}
       >
         <Background color="#2a2a35" gap={24} size={1} />
-        <Panel position="top-left">
-          <TopBar />
-        </Panel>
+        {/* On mobile the TopBar is a full-width page header rendered above the canvas (in App); on
+            desktop it floats as a top-left panel over the canvas. */}
+        {!isMobile && (
+          <Panel position="top-left">
+            <TopBar />
+          </Panel>
+        )}
         <Controls style={{ background: '#1a1a1f', border: '1px solid #3f3f46', borderRadius: 6 }} />
       </ReactFlow>
     </div>
