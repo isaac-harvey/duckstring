@@ -105,28 +105,29 @@ export function TopBar() {
           the Options button on the right. The two rows give the logo room without a tall single line. */}
       <div
         style={{
-          display: 'flex', alignItems: 'center', gap: 10, background: '#15151a',
+          display: 'flex', alignItems: 'center', gap: 7, background: '#15151a',
           border: isMobile ? 'none' : '1px solid #27272a', borderBottom: '1px solid #27272a',
-          borderRadius: isMobile ? 0 : open ? '8px 8px 0 0' : 8, padding: '6px 12px', fontSize: 12, color: '#a1a1aa',
+          borderRadius: isMobile ? 0 : open ? '8px 8px 0 0' : 8, padding: '4px 12px 4px 6px', fontSize: 12, color: '#a1a1aa',
         }}
       >
         <span
           aria-label="Duckstring"
           style={{
-            width: isMobile ? 38 : 36, height: isMobile ? 38 : 36, flexShrink: 0,
+            width: isMobile ? 48 : 44, height: isMobile ? 48 : 44, flexShrink: 0,
             backgroundImage: 'url(/logo-mark.svg)', backgroundSize: 'contain',
             backgroundRepeat: 'no-repeat', backgroundPosition: 'center',
           }}
         />
         <div style={{ display: 'flex', flexDirection: 'column', gap: 3, minWidth: 0 }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 7 }}>
-            <span title={catchment?.id ?? undefined} style={{ fontSize: 13, fontWeight: 700, color: '#f4f4f5', whiteSpace: 'nowrap' }}>
-              {label}
-            </span>
+            {/* The status dot sits before the name so its position is fixed regardless of name length. */}
             <span
               title={connected ? 'connected' : error ? 'unreachable' : 'connecting'}
               style={{ width: 8, height: 8, flexShrink: 0, borderRadius: '50%', background: connected ? THEME_SUCCESS : THEME_DANGER }}
             />
+            <span title={catchment?.id ?? undefined} style={{ fontSize: 13, fontWeight: 700, color: '#f4f4f5', whiteSpace: 'nowrap' }}>
+              {label}
+            </span>
             {statusText && <span style={{ color: '#71717a', fontSize: 11 }}>{statusText}</span>}
           </div>
           <AccessChips />
