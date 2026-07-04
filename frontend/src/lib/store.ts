@@ -18,7 +18,9 @@ import {
   fetchWindows,
   postTrigger,
   refreshPond,
-  repairPonds,
+  batchPonds,
+  BATCH_OPS,
+  type BatchOp,
   clearFailure,
   setBudget,
   addWindow,
@@ -255,15 +257,24 @@ export interface LiveState extends StatusSlice {
   refreshPond(pond: PondId, clear?: boolean): Promise<void>;
   resetPond(pond: PondId): Promise<void>;
 
-  // Repair (D3): a canvas selection mode that force-rebuilds a connected set of Ponds now.
-  repairMode: boolean;
-  repairScope: PondId[];
-  repairError: string | null;
-  enterRepair(): void;
-  exitRepair(): void;
-  toggleRepair(id: PondId): void;
-  addRepairDownstream(): void;
-  submitRepair(): Promise<void>;
+  // Selector: a canvas selection mode that applies a set of operations to a set of Ponds (Pond Actions).
+  // Phase 'select' picks the Ponds on the canvas; phase 'ops' picks the operations to apply.
+  selectorMode: boolean;
+  selectorPhase: 'select' | 'ops';
+  selectorScope: PondId[];
+  selectorOps: BatchOp[];
+  selectorError: string | null;
+  enterSelector(): void;
+  exitSelector(): void;
+  toggleSelect(id: PondId): void;
+  selectAll(): void;
+  selectTree(): void;
+  selectBetween(): void;
+  addDownstream(): void;
+  clearSelectorScope(): void;
+  setSelectorPhase(phase: 'select' | 'ops'): void;
+  toggleOp(op: BatchOp): void;
+  submitBatch(confirm: string | null): Promise<void>;
 
   clearFailure(pond: PondId): Promise<void>;
   setBudget(pond: PondId, immediateRetries: number, sourceRetries: number): Promise<void>;
@@ -296,6 +307,28 @@ function focusPond(s: LiveState): PondId | null {
 // Identity of a Pond Run (newest history can re-fetch the same run to keep the detail pane live).
 export function runKey(r: PondRun): string {
   return `${r.id}::${r.version}::${r.f}`;
+}
+
+// The pond topology as adjacency lists, for the Selector's expansion helpers (children = ponds that
+// list me as a source; parents = my sources).
+function graphOf(ponds: Record<PondId, Pond>): { children: Record<string, string[]>; parents: Record<string, string[]> } {
+  const children: Record<string, string[]> = {};
+  const parents: Record<string, string[]> = {};
+  for (const p of Object.values(ponds)) {
+    parents[p.id] = [...p.sources];
+    for (const src of p.sources) (children[src] ??= []).push(p.id);
+  }
+  return { children, parents };
+}
+
+// The reachable-set closure from `seeds` over adjacency `adj`, including the seeds themselves.
+function closure(seeds: PondId[], adj: Record<string, string[]>): Set<string> {
+  const out = new Set<string>(seeds);
+  const stack = [...seeds];
+  while (stack.length) {
+    for (const nxt of adj[stack.pop()!] ?? []) if (!out.has(nxt)) { out.add(nxt); stack.push(nxt); }
+  }
+  return out;
 }
 
 export const useLiveStore = create<LiveState>((set, get) => ({
@@ -479,37 +512,70 @@ export const useLiveStore = create<LiveState>((set, get) => ({
   refreshPond: (pond, clear = false) => act(get, set, () => refreshPond(pond, clear)),
   resetPond: (pond) => act(get, set, () => postTrigger(pond, 'reset')),
 
-  repairMode: false,
-  repairScope: [],
-  repairError: null,
-  enterRepair: () => set({ repairMode: true, repairScope: [], repairError: null }),
-  exitRepair: () => set({ repairMode: false, repairScope: [], repairError: null }),
-  toggleRepair: (id) =>
+  selectorMode: false,
+  selectorPhase: 'select',
+  selectorScope: [],
+  selectorOps: [],
+  selectorError: null,
+  enterSelector: () => set({ selectorMode: true, selectorPhase: 'select', selectorScope: [], selectorOps: [], selectorError: null }),
+  exitSelector: () => set({ selectorMode: false, selectorPhase: 'select', selectorScope: [], selectorOps: [], selectorError: null }),
+  toggleSelect: (id) =>
     set((s) => ({
-      repairError: null,
-      repairScope: s.repairScope.includes(id)
-        ? s.repairScope.filter((x) => x !== id)
-        : [...s.repairScope, id],
+      selectorError: null,
+      selectorScope: s.selectorScope.includes(id)
+        ? s.selectorScope.filter((x) => x !== id)
+        : [...s.selectorScope, id],
     })),
-  addRepairDownstream: () =>
+  // All targetable Ponds (Spouts/Draws have no local output — excluded from bulk ops).
+  selectAll: () =>
+    set((s) => ({
+      selectorScope: Object.values(s.ponds).filter((p) => !p.isSpout && !p.isDraw).map((p) => p.id),
+      selectorError: null,
+    })),
+  addDownstream: () =>
     set((s) => {
-      // Downward closure over the topology (children = ponds that list me as a source).
-      const children: Record<string, string[]> = {};
-      for (const p of Object.values(s.ponds)) for (const src of p.sources) (children[src] ??= []).push(p.id);
-      const scope = new Set(s.repairScope);
-      const stack = [...s.repairScope];
-      while (stack.length) for (const c of children[stack.pop()!] ?? []) if (!scope.has(c)) { scope.add(c); stack.push(c); }
-      return { repairScope: [...scope], repairError: null };
+      const { children } = graphOf(s.ponds);
+      return { selectorScope: [...closure(s.selectorScope, children)], selectorError: null };
     }),
-  submitRepair: async () => {
-    const { repairScope } = get();
-    if (repairScope.length === 0) return;
+  // Weakly-connected component(s) of the selection: undirected reachability over source edges.
+  selectTree: () =>
+    set((s) => {
+      const { children, parents } = graphOf(s.ponds);
+      const undirected: Record<string, string[]> = {};
+      for (const id of Object.keys(s.ponds)) undirected[id] = [...(children[id] ?? []), ...(parents[id] ?? [])];
+      return { selectorScope: [...closure(s.selectorScope, undirected)], selectorError: null };
+    }),
+  // Ponds on a directed path between two selected Ponds: descendants(S) ∩ ancestors(S) (S included).
+  selectBetween: () =>
+    set((s) => {
+      const { children, parents } = graphOf(s.ponds);
+      const desc = closure(s.selectorScope, children);
+      const anc = closure(s.selectorScope, parents);
+      return { selectorScope: [...desc].filter((id) => anc.has(id)), selectorError: null };
+    }),
+  clearSelectorScope: () => set({ selectorScope: [], selectorError: null }),
+  setSelectorPhase: (phase) => set({ selectorPhase: phase, selectorError: null }),
+  toggleOp: (op) =>
+    set((s) => {
+      let ops = s.selectorOps.includes(op) ? s.selectorOps.filter((o) => o !== op) : [...s.selectorOps, op];
+      // Constraints: Repair is exclusive with Remove/Reset; Remove implies (and locks on) Reset.
+      if (ops.includes('repair')) ops = ops.filter((o) => o !== 'remove' && o !== 'reset');
+      if (ops.includes('remove')) {
+        ops = ops.filter((o) => o !== 'repair');
+        if (!ops.includes('reset')) ops.push('reset');
+      }
+      return { selectorOps: ops, selectorError: null };
+    }),
+  submitBatch: async (confirm) => {
+    const { selectorScope, selectorOps } = get();
+    if (selectorScope.length === 0 || selectorOps.length === 0) return;
+    const ordered = BATCH_OPS.filter((o) => selectorOps.includes(o));
     try {
-      await repairPonds(repairScope, false);
-      set({ repairMode: false, repairScope: [], repairError: null });
+      await batchPonds(selectorScope, ordered, confirm);
+      set({ selectorMode: false, selectorPhase: 'select', selectorScope: [], selectorOps: [], selectorError: null });
       await get().refresh();
     } catch (e) {
-      set({ repairError: e instanceof Error ? e.message : 'repair failed' });
+      set({ selectorError: e instanceof Error ? e.message : 'operation failed' });
     }
   },
 

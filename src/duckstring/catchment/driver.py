@@ -145,6 +145,14 @@ def _topo_order(scope: set[str], parents: dict[str, set[str]]) -> list[str]:
     return done
 
 
+# The bulk-operation vocabulary (see plans/selector_ui.md), in application-precedence order: quiesce
+# (kill/sleep), destroy state (reset), trim history (wipe), retire (remove), then recover (clear/repair/
+# refresh). Reset and Wipe are independent steps (Wipe-only — clear history without a data scrub — is a
+# valid case). Repair is a set-op (the connected-set rebuild); every other op is applied per Pond.
+BATCH_OPS = ("kill", "sleep", "reset", "wipe", "remove", "clear", "repair", "refresh")
+IRREVERSIBLE_OPS = frozenset({"reset", "wipe", "remove"})
+
+
 class Driver:
     def __init__(self, db, root, base_url: str | None, launcher, data_root: str | None = None):
         self.db = db
@@ -765,6 +773,84 @@ class Driver:
                 if sp in children:
                     children[sp].add(k)
         return children
+
+    def wipe_history(self, pond: str) -> None:
+        """Clear a Pond's run history (its ``pond_run``/``ripple_run`` rows) — a log trim only, with **no**
+        data scrub, freshness rewind, or state change. Distinct from ``reset_pond``, which also scrubs."""
+        with self.lock:
+            version_id = self.meta[pond]["version_id"]
+            self.db.execute("DELETE FROM ripple_run WHERE pond_version_id = ?", (version_id,))
+            self.db.execute("DELETE FROM pond_run WHERE pond_version_id = ?", (version_id,))
+            self.db.commit()
+            self.state_version += 1
+
+    def batch(
+        self, ponds: list[tuple[str, int | None]], operations: list[str], confirm: str | None = None,
+    ) -> dict:
+        """Apply a set of operations to a set of Ponds in precedence order (``BATCH_OPS``) — the engine
+        behind the UI Selector and ``duckstring do``. Validates the op-set (unknown op, or Repair combined
+        with Remove/Reset → ValueError → 422) and, when any irreversible op (reset/wipe/remove) is present,
+        requires ``confirm`` to equal this Catchment's name. Remove implies (and subsumes) Reset, and is
+        **terminal per Pond** — later ops skip an already-removed line. Repair runs once over the live
+        scope (its own connectivity check rejects a gappy manual selection). Per-Pond execution errors are
+        collected, not fatal. Holds the lock across the whole batch, so it is atomic w.r.t. the scheduler."""
+        selected = list(dict.fromkeys(operations))
+        unknown = [o for o in selected if o not in BATCH_OPS]
+        if unknown:
+            raise ValueError(f"unknown operation(s): {', '.join(unknown)}")
+        ops = [o for o in BATCH_OPS if o in selected]
+        if not ops:
+            raise ValueError("no operations selected")
+        if "repair" in ops and ("remove" in ops or "reset" in ops):
+            raise ValueError("repair cannot be combined with remove or reset")
+        if "remove" in ops:  # Remove already scrubs — the standalone Reset step is redundant.
+            ops = [o for o in ops if o != "reset"]
+
+        with self.lock:
+            if any(o in IRREVERSIBLE_OPS for o in ops):
+                expected = self.identity().get("name") or "confirm"
+                if confirm != expected:
+                    raise ValueError(
+                        f"irreversible operation(s) — type the catchment name ('{expected}') to confirm"
+                    )
+            keys = list(dict.fromkeys(self.resolve(n, m, None) for n, m in ponds))
+            removed: set[str] = set()
+            errors: list[dict] = []
+
+            def _run(op: str, key: str, fn) -> None:
+                try:
+                    fn()
+                except Exception as exc:  # best-effort per Pond — collect, don't abort the batch
+                    errors.append({"pond": key, "op": op, "error": str(exc)})
+
+            for op in ops:
+                if op == "repair":
+                    live = [k for k in keys if k not in removed]
+                    if live:
+                        _run("repair", None, lambda live=live: self.repair(
+                            [(k.rpartition("@")[0], int(k.rpartition("@")[2])) for k in live]))
+                    continue
+                for key in [k for k in keys if k not in removed]:
+                    if op == "kill":
+                        _run(op, key, lambda k=key: self.kill(k))
+                    elif op == "sleep":
+                        _run(op, key, lambda k=key: self.sleep(k))
+                    elif op == "reset":
+                        _run(op, key, lambda k=key: self.reset_pond(k))
+                    elif op == "wipe":
+                        _run(op, key, lambda k=key: self.wipe_history(k))
+                    elif op == "clear":
+                        _run(op, key, lambda k=key: self.clear(k))
+                    elif op == "refresh":
+                        _run(op, key, lambda k=key: self.refresh(k))
+                    elif op == "remove":
+                        n, _, mj = key.rpartition("@")
+
+                        def _rm(k=key, n=n, mj=mj):
+                            self.remove_pond(n, int(mj), wipe=False)
+                            removed.add(k)
+                        _run(op, key, _rm)
+            return {"operations": ops, "ponds": keys, "removed": sorted(removed), "errors": errors}
 
     def kill(self, pond: str) -> None:
         """Kill — terminate the Duck and park the Pond in a terminal killed state (cancels its Run)."""

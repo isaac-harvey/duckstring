@@ -3,12 +3,14 @@
 import { useEffect, useState } from 'react';
 import { ReactFlowProvider } from '@xyflow/react';
 import { useLiveStore } from '@/lib/store';
+import { BATCH_OPS, type BatchOp } from '@/lib/api';
 import { useIsMobile } from '@/lib/useIsMobile';
 import { DagCanvas } from './DagCanvas';
 import { Sidebar } from './Sidebar';
 import { RunHistory } from './RunHistory';
 import { RunDetail } from './RunDetail';
 import { DataViewerModal } from './DataViewerModal';
+import { ConfirmDialog } from './ConfirmDialog';
 
 const POLL_MS = 1000;
 
@@ -105,36 +107,154 @@ function MobileRunsPanel() {
   );
 }
 
-// The repair-mode toolbar — a top banner while the operator picks a connected set of Ponds on the
-// canvas to force-rebuild now. The server validates connectivity on submit (its detail shows here).
-function RepairBanner() {
-  const repairMode = useLiveStore((s) => s.repairMode);
-  const scope = useLiveStore((s) => s.repairScope);
-  const error = useLiveStore((s) => s.repairError);
-  const addDownstream = useLiveStore((s) => s.addRepairDownstream);
-  const submit = useLiveStore((s) => s.submitRepair);
-  const cancel = useLiveStore((s) => s.exitRepair);
-  if (!repairMode) return null;
+// Cyan is the default accent for the Selector (the Duckstring brand colour, used wherever there is no
+// semantic reason for another). Destructive/irreversible ops keep red — that reason exists.
+const BRAND = '#06c4e6';
 
-  const btn = (bg: string): React.CSSProperties => ({
-    background: bg, border: 'none', borderRadius: 5, padding: '6px 12px', color: '#0a0a0a',
-    fontSize: 12, fontWeight: 700, cursor: 'pointer', fontFamily: 'inherit',
-  });
+// Operation metadata: label + a short blurb (shown on the button's second line so an unfamiliar operator
+// knows what each does), `warn` (destructive → red accent) and `irreversible` (needs the typed confirm).
+const OP_META: Record<BatchOp, { label: string; blurb: string; warn?: boolean; irreversible?: boolean }> = {
+  kill: { label: 'Kill', blurb: 'stop the Duck', warn: true },
+  sleep: { label: 'Sleep', blurb: 'cancel demand' },
+  reset: { label: 'Reset', blurb: 'erase data & state', warn: true, irreversible: true },
+  wipe: { label: 'Wipe', blurb: 'clear run history', warn: true, irreversible: true },
+  remove: { label: 'Remove', blurb: 'retire the Pond', warn: true, irreversible: true },
+  clear: { label: 'Clear', blurb: 'clear failures' },
+  repair: { label: 'Repair', blurb: 'rebuild now' },
+  refresh: { label: 'Refresh', blurb: 'rebuild next run' },
+};
+
+const bannerBtn = (bg: string, disabled = false): React.CSSProperties => ({
+  background: bg, border: 'none', borderRadius: 5, padding: '6px 12px', color: '#0a0a0a',
+  fontSize: 12, fontWeight: 700, cursor: disabled ? 'default' : 'pointer', fontFamily: 'inherit',
+  opacity: disabled ? 0.5 : 1,
+});
+
+// The Selector toolbar — a two-phase top banner (Pond Actions). Phase 1: pick a set of Ponds on the
+// canvas (All / Tree / Between / Downstream / Clear). Phase 2: pick the operations to apply; irreversible
+// ones (reset/wipe/remove) gate behind typing the catchment name. The server applies them in precedence
+// order and returns per-Pond errors (surfaced here).
+function SelectorBanner() {
+  const mode = useLiveStore((s) => s.selectorMode);
+  const phase = useLiveStore((s) => s.selectorPhase);
+  const scope = useLiveStore((s) => s.selectorScope);
+  const ops = useLiveStore((s) => s.selectorOps);
+  const error = useLiveStore((s) => s.selectorError);
+  const catchmentName = useLiveStore((s) => s.catchment?.name ?? null);
+  const selectAll = useLiveStore((s) => s.selectAll);
+  const selectTree = useLiveStore((s) => s.selectTree);
+  const selectBetween = useLiveStore((s) => s.selectBetween);
+  const addDownstream = useLiveStore((s) => s.addDownstream);
+  const clearScope = useLiveStore((s) => s.clearSelectorScope);
+  const setPhase = useLiveStore((s) => s.setSelectorPhase);
+  const toggleOp = useLiveStore((s) => s.toggleOp);
+  const submitBatch = useLiveStore((s) => s.submitBatch);
+  const cancel = useLiveStore((s) => s.exitSelector);
+  const [confirming, setConfirming] = useState(false);
+
+  if (!mode) return null;
+
+  const ordered = BATCH_OPS.filter((o) => ops.includes(o));
+  const needsConfirm = ordered.some((o) => OP_META[o].irreversible);
+
+  const apply = () => {
+    if (ordered.length === 0) return;
+    if (needsConfirm) setConfirming(true);
+    else void submitBatch(null);
+  };
+
+  const opDisabled = (op: BatchOp): boolean => {
+    if (op === 'repair') return ops.includes('remove') || ops.includes('reset');
+    if (op === 'reset') return ops.includes('remove'); // locked on by Remove
+    return false;
+  };
+
   return (
     <div style={{
-      display: 'flex', alignItems: 'center', gap: 12, padding: '8px 14px',
-      background: '#1a1206', borderBottom: '1px solid #ee9333', color: '#fbbf24', fontSize: 12,
+      display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 10, padding: '8px 14px',
+      background: '#06141a', borderBottom: `1px solid ${BRAND}`, color: '#7dd3e8', fontSize: 12,
     }}>
-      <span style={{ fontWeight: 700 }}>Repair mode</span>
-      <span style={{ color: '#a1a1aa' }}>
-        Click Ponds to select a connected set to rebuild now · <b style={{ color: '#e4e4e7' }}>{scope.length}</b> selected
-      </span>
-      {error && <span style={{ color: '#ef4444' }}>{error}</span>}
-      <div style={{ marginLeft: 'auto', display: 'flex', gap: 8 }}>
-        <button style={btn('#52525b')} onClick={() => addDownstream()} disabled={scope.length === 0}>Include downstream</button>
-        <button style={btn('#a3e635')} onClick={() => void submit()} disabled={scope.length === 0}>Repair {scope.length}</button>
-        <button style={btn('#71717a')} onClick={() => cancel()}>Cancel</button>
-      </div>
+      <span style={{ fontWeight: 700 }}>Pond Actions</span>
+
+      {phase === 'select' ? (
+        <>
+          <span style={{ color: '#a1a1aa' }}>
+            Click Ponds, or use a helper · <b style={{ color: '#e4e4e7' }}>{scope.length}</b> selected
+          </span>
+          <div style={{ display: 'flex', gap: 6 }}>
+            <button style={bannerBtn('#52525b')} onClick={() => selectAll()}>All</button>
+            <button style={bannerBtn('#52525b', scope.length === 0)} disabled={scope.length === 0} onClick={() => selectTree()}>Tree</button>
+            <button style={bannerBtn('#52525b', scope.length === 0)} disabled={scope.length === 0} onClick={() => selectBetween()}>Between</button>
+            <button style={bannerBtn('#52525b', scope.length === 0)} disabled={scope.length === 0} onClick={() => addDownstream()}>Downstream</button>
+            <button style={bannerBtn('#52525b', scope.length === 0)} disabled={scope.length === 0} onClick={() => clearScope()}>Clear</button>
+          </div>
+          {error && <span style={{ color: '#ef4444' }}>{error}</span>}
+          <div style={{ marginLeft: 'auto', display: 'flex', gap: 8 }}>
+            <button style={bannerBtn(BRAND, scope.length === 0)} disabled={scope.length === 0} onClick={() => setPhase('ops')}>
+              Choose actions →
+            </button>
+            <button style={bannerBtn('#71717a')} onClick={() => cancel()}>Cancel</button>
+          </div>
+        </>
+      ) : (
+        <>
+          <span style={{ color: '#a1a1aa' }}>
+            Apply to <b style={{ color: '#e4e4e7' }}>{scope.length}</b> Pond{scope.length === 1 ? '' : 's'} ·
+          </span>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+            {BATCH_OPS.map((op) => {
+              const on = ops.includes(op);
+              const disabled = opDisabled(op);
+              const m = OP_META[op];
+              const accent = on ? (m.warn ? '#ef4444' : BRAND) : '#3f3f46';
+              const muted = disabled && !on; // precluded by another selection — clearly greyed out
+              const lockedOn = disabled && on; // auto-selected (Reset under Remove)
+              return (
+                <button
+                  key={op}
+                  onClick={() => !disabled && toggleOp(op)}
+                  disabled={disabled}
+                  title={lockedOn ? 'Auto-selected — implied by another action' : disabled ? 'Not available with the current selection' : undefined}
+                  style={{
+                    display: 'flex', flexDirection: 'column', alignItems: 'flex-start', gap: 1,
+                    padding: '3px 9px', borderRadius: 5, fontFamily: 'inherit', textAlign: 'left',
+                    cursor: disabled ? (lockedOn ? 'default' : 'not-allowed') : 'pointer',
+                    border: `1px solid ${muted ? '#27272a' : accent}`,
+                    color: on ? accent : muted ? '#52525b' : '#a1a1aa',
+                    background: on ? (m.warn ? '#ef444414' : '#06c4e614') : muted ? '#18181b55' : 'transparent',
+                    opacity: muted ? 0.5 : 1,
+                  }}
+                >
+                  <span style={{ fontSize: 11, fontWeight: 600 }}>{m.label}{lockedOn ? ' 🔒' : ''}</span>
+                  <span style={{ fontSize: 9, color: on ? accent : muted ? '#3f3f46' : '#71717a', opacity: 0.9 }}>{m.blurb}</span>
+                </button>
+              );
+            })}
+          </div>
+          {error && <span style={{ color: '#ef4444' }}>{error}</span>}
+          <div style={{ marginLeft: 'auto', display: 'flex', gap: 8 }}>
+            <button style={bannerBtn('#52525b')} onClick={() => setPhase('select')}>← Back</button>
+            <button style={bannerBtn(BRAND, ordered.length === 0)} disabled={ordered.length === 0} onClick={apply}>
+              Apply {ordered.length > 0 ? `(${ordered.map((o) => OP_META[o].label).join(', ')})` : ''}
+            </button>
+            <button style={bannerBtn('#71717a')} onClick={() => cancel()}>Cancel</button>
+          </div>
+          {confirming && (
+            <ConfirmDialog
+              opts={{
+                title: 'Confirm irreversible actions',
+                body:
+                  `About to apply ${ordered.map((o) => OP_META[o].label).join(', ')} to ${scope.length} ` +
+                  `Pond${scope.length === 1 ? '' : 's'}.\n\nThis includes irreversible actions and cannot be undone.`,
+                confirmLabel: 'Apply',
+                requireTyped: catchmentName || 'confirm',
+                action: async () => { await submitBatch(catchmentName || 'confirm'); },
+              }}
+              onClose={() => setConfirming(false)}
+            />
+          )}
+        </>
+      )}
     </div>
   );
 }
@@ -168,7 +288,7 @@ export function App() {
     <div className="ds-app" style={{ display: 'flex', flexDirection: 'column', width: '100%', overflow: 'hidden', fontFamily: 'ui-monospace, SFMono-Regular, monospace' }}>
       {needsKey && <KeyPrompt />}
       <DataViewerModal />
-      <RepairBanner />
+      <SelectorBanner />
       {/* On mobile the sidebar drops below the canvas as a collapsible bottom sheet. */}
       <div style={{ display: 'flex', flexDirection: isMobile ? 'column' : 'row', flex: 1, minHeight: 0 }}>
         <ReactFlowProvider>

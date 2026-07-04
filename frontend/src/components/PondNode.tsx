@@ -26,9 +26,9 @@ export const PondNode = memo(function PondNode({ data }: NodeProps) {
   const info = useLiveStore((s) => s.pondInfo[pondId]);
   const selectedPondId = useLiveStore((s) => s.selectedPondId);
   const selectPond = useLiveStore((s) => s.selectPond);
-  const repairMode = useLiveStore((s) => s.repairMode);
-  const inRepair = useLiveStore((s) => s.repairScope.includes(pondId));
-  const toggleRepair = useLiveStore((s) => s.toggleRepair);
+  const selecting = useLiveStore((s) => s.selectorMode && s.selectorPhase === 'select');
+  const inScope = useLiveStore((s) => s.selectorScope.includes(pondId));
+  const toggleSelect = useLiveStore((s) => s.toggleSelect);
   const refreshPending = useLiveStore((s) => s.pondInfo[pondId]?.refreshPending ?? false);
   const collapsed = useLiveStore((s) => !!s.collapsedPonds[pondId]);
   const toggleCollapse = useLiveStore((s) => s.toggleCollapse);
@@ -47,14 +47,14 @@ export const PondNode = memo(function PondNode({ data }: NodeProps) {
   const displayName = pond.isSpout ? pond.name.split('#').slice(1).join('#') || pond.name : pond.name;
   // Draws and Spouts both cross the Catchment boundary → dashed (ingress vs egress).
   const boundary = pond.isDraw || pond.isSpout;
-  // In repair mode, clicking a Pond toggles it in/out of the repair scope (a bright ring marks it).
-  const ringColor = repairMode && inRepair ? '#a3e635' : borderColor;
+  // In selector mode, clicking a Pond toggles it in/out of the scope (a bright ring marks it).
+  const ringColor = selecting && inScope ? '#a3e635' : borderColor;
 
   return (
     <div
       onClick={(e) => {
         e.stopPropagation();
-        if (repairMode) toggleRepair(pondId);
+        if (selecting) toggleSelect(pondId);
         else selectPond(pondId);
       }}
       style={{
@@ -62,7 +62,7 @@ export const PondNode = memo(function PondNode({ data }: NodeProps) {
         height: '100%',
         // Draws (ingress) and Spouts (egress) cross the Catchment boundary → dashed, vs a solid Pond.
         border: `2px ${boundary ? 'dashed' : 'solid'} ${borderColor}`,
-        boxShadow: repairMode && inRepair
+        boxShadow: selecting && inScope
           ? `0 0 0 3px ${ringColor}`
           : refreshPending
             ? `0 0 0 2px #ee9333aa`  // pending refresh — an amber hint

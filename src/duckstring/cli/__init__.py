@@ -3,6 +3,7 @@ from __future__ import annotations
 import typer
 
 from . import alert as alert_cmd
+from . import bulk as bulk_cmd
 from . import catchment as catchment_cmd
 from . import duct as duct_cmd
 from . import pond as pond_cmd
@@ -77,6 +78,7 @@ app.add_typer(alert_cmd.app, name="alert")
 
 pond_cmd.app.command("deploy")(deploy)
 pond_cmd.app.command("remove")(remove_pond)
+app.command("do")(bulk_cmd.do)
 app.command("status")(status)
 app.command("get")(get)
 app.command("query")(query)

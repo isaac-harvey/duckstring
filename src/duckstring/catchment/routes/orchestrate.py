@@ -238,6 +238,33 @@ def repair(request: Request, body: _RepairBody):
     return {"ok": True, **plan}
 
 
+class _BatchBody(BaseModel):
+    ponds: list[_RepairPond]
+    operations: list[str]
+    confirm: Optional[str] = None
+
+
+@router.post("/ponds/batch", dependencies=[auth.full])
+def batch(request: Request, body: _BatchBody):
+    """Apply a set of operations to a set of Ponds, in precedence order — the primitive behind the UI
+    Selector and ``duckstring do``. ``operations`` ⊆ kill/sleep/reset/wipe/remove/clear/repair/refresh;
+    Repair is exclusive with Remove/Reset, Remove implies (and subsumes) Reset. Any of reset/wipe/remove
+    require ``confirm`` to equal the Catchment name. 422 on a bad op-set or a missing/wrong confirm; a
+    per-Pond execution error is collected in the response, not fatal. See plans/selector_ui.md."""
+    try:
+        return _driver(request).batch(
+            [(p.name, p.major) for p in body.ponds], body.operations, confirm=body.confirm)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.post("/ponds/{name}/wipe-history", dependencies=[auth.full])
+def wipe_history(name: str, request: Request, major: int | None = None, version: str | None = None):
+    """Wipe a Pond's run history (its pond_run/ripple_run rows) — no data scrub, no state change."""
+    _driver(request).wipe_history(_resolve(request, name, major, version))
+    return {"ok": True}
+
+
 @router.post("/ponds/{name}/kill", dependencies=[auth.full])
 def kill(name: str, request: Request, major: int | None = None, version: str | None = None):
     """Kill a Pond — terminate its Duck and park it in a terminal killed state (cancels its Run)."""
