@@ -12,6 +12,8 @@ export type ConfirmOpts = {
   body: string;
   confirmLabel: string;
   requireTyped?: string;
+  // Optional rich detail rendered below the body in a scrollable box (e.g. the exact list of affected items).
+  details?: React.ReactNode;
   toggle?: { label: string; hint?: string; default?: boolean };
   action: (toggled: boolean) => Promise<void> | void;
 };
@@ -62,9 +64,17 @@ export function ConfirmDialog({ opts, onClose }: { opts: ConfirmOpts; onClose: (
         }}
       >
         <div style={{ fontSize: 13.5, fontWeight: 700, color: '#e4e4e7', marginBottom: 8 }}>{opts.title}</div>
-        <div style={{ fontSize: 12.5, color: '#a1a1aa', lineHeight: 1.55, marginBottom: opts.toggle || gated ? 12 : 16, whiteSpace: 'pre-wrap' }}>
+        <div style={{ fontSize: 12.5, color: '#a1a1aa', lineHeight: 1.55, marginBottom: opts.details ? 10 : opts.toggle || gated ? 12 : 16, whiteSpace: 'pre-wrap' }}>
           {opts.body}
         </div>
+        {opts.details && (
+          <div style={{
+            maxHeight: 160, overflowY: 'auto', border: '1px solid #27272a', borderRadius: 6,
+            background: '#0c0c10', padding: '6px 8px', marginBottom: opts.toggle || gated ? 12 : 16,
+          }}>
+            {opts.details}
+          </div>
+        )}
         {opts.toggle && (
           <label style={{ display: 'flex', alignItems: 'flex-start', gap: 8, marginBottom: 16, cursor: 'pointer' }}>
             <input

@@ -141,6 +141,8 @@ function SelectorBanner() {
   const scope = useLiveStore((s) => s.selectorScope);
   const ops = useLiveStore((s) => s.selectorOps);
   const error = useLiveStore((s) => s.selectorError);
+  const ponds = useLiveStore((s) => s.ponds);
+  const pondInfo = useLiveStore((s) => s.pondInfo);
   const catchmentName = useLiveStore((s) => s.catchment?.name ?? null);
   const selectAll = useLiveStore((s) => s.selectAll);
   const selectTree = useLiveStore((s) => s.selectTree);
@@ -250,8 +252,21 @@ function SelectorBanner() {
               opts={{
                 title: 'Confirm irreversible actions',
                 body:
-                  `About to apply ${ordered.map((o) => OP_META[o].label).join(', ')} to ${scope.length} ` +
-                  `Pond${scope.length === 1 ? '' : 's'}.\n\nThis includes irreversible actions and cannot be undone.`,
+                  `Apply ${ordered.map((o) => OP_META[o].label).join(', ')} to these ${scope.length} ` +
+                  `Pond${scope.length === 1 ? '' : 's'} — includes irreversible actions that cannot be undone:`,
+                details: (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+                    {[...scope].sort().map((id) => {
+                      const p = ponds[id];
+                      const version = pondInfo[id]?.version ?? id.split('@')[1];
+                      return (
+                        <div key={id} style={{ fontSize: 12, color: '#d4d4d8', whiteSpace: 'nowrap' }}>
+                          {p ? `${p.name}@${version}` : id}
+                        </div>
+                      );
+                    })}
+                  </div>
+                ),
                 confirmLabel: 'Apply',
                 requireTyped: catchmentName || 'confirm',
                 action: async () => { await submitBatch(catchmentName || 'confirm'); },
