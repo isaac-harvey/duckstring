@@ -278,12 +278,11 @@ function ControlsPanel() {
           <button
             title="Scrub every Pond's data + state to a fresh-deploy state (keeps deploys, config, secrets)"
             onClick={() => setResetConfirm({
-              title: 'Reset the entire Catchment?',
+              title: 'Reset Catchment?',
               body:
-                'This scrubs EVERY Pond — its registry, published data, and ledger — and rewinds all ' +
-                'freshness to a fresh-deploy state. Every worker restarts; Ponds rebuild from scratch when ' +
-                'next demanded.\n\nKept: your deployed code, operational config (triggers, windows, spouts, ' +
-                'alerts), secrets, and keys. This cannot be undone.',
+                'Delete all data and state (e.g. freshness) from all Ponds. ' +
+                'All code, config, secrets etc. are retained.\n\n' +
+                'This cannot be undone.',
               confirmLabel: 'Reset everything',
               requireTyped: catchmentName || 'reset all',
               action: async () => { await resetCatchment().catch(() => {}); },

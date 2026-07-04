@@ -531,11 +531,14 @@ export function Sidebar({ mobile = false }: { mobile?: boolean }) {
   const content = (
     <>
       {!selectedPond && !selectedRipple && !selectedTriggerId && (
-        <div style={{ fontSize: 12, color: '#71717a', lineHeight: 1.6 }}>
-          Select a Pond or Ripple to inspect its freshness and run history
-          {canDemand ? ', or to send a Tap, Pulse, Wave, or Tide' : ''}. Ponds are established by
-          deploying code — not from here.
-        </div>
+        <>
+          <div style={{ fontSize: 12, color: '#71717a', lineHeight: 1.6 }}>
+            Select a Pond or Ripple
+          </div>
+          <div style={{ fontSize: 12, color: '#71717a', lineHeight: 1.6 }}>
+            (deployed from CLI)
+          </div>
+        </>
       )}
 
       {/* Trigger node selected */}
@@ -742,14 +745,12 @@ export function Sidebar({ mobile = false }: { mobile?: boolean }) {
                 setConfirm({
                   title: `Remove “${target}”?`,
                   body:
-                    'This deletes the Pond line — its data, live state, and on-disk runtime, plus its own ' +
-                    'Spouts and alert channels. Its deployment record and run history are kept (a redeploy ' +
-                    'restores it). Downstream Ponds that read it will block until you fix them.',
+                    'Deletes the Pond, its data and attachments\n' +
+                    '(e.g. Spouts and Alerts)',
                   confirmLabel: 'Remove Pond',
                   requireTyped: target,
                   toggle: {
-                    label: 'Also wipe history — as if never deployed.',
-                    hint: 'Purges the deployment record, run history, and artifacts too. Not reversible by a redeploy.',
+                    label: "Wipe Pond's History",
                   },
                   action: async (wipe) => {
                     try {
