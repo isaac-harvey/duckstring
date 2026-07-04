@@ -562,6 +562,38 @@ def test_missing_source_asset_blocks_with_reason_not_failed():
 
 
 @pytest.mark.timeout(5)
+def test_missing_source_asset_does_not_busy_loop_at_same_freshness():
+    """A Pond parked on a missing Source asset must NOT re-dispatch a Run every tick while the Source
+    freshness is unchanged — the rewound run would otherwise re-fire at the same freshness forever (a
+    Duck-round-trip busy-loop that read-misses each time, floods run history, and starves the Catchment).
+    It re-attempts only once the Source publishes something genuinely fresher. See plans/reset.md."""
+    src = Pond("src", "src")
+    mid = Pond("mid", "mid", sources=["src"])
+    s = build([src, mid], [Ripple("r", "mid", "r")])
+    s.pond_states["src"].start_f = s.pond_states["src"].end_f = T0  # the Source has a freshness on disk
+    # `mid` ran at the Source's freshness (start_f=T0) then read src.x and missed.
+    s.pond_states["mid"].start_f = T0
+    s.ripple_states["r"].start_f = T0
+    s.ripple_states["r"].is_running = True
+    s = block_on_missing_asset(s, "mid", "src.x", T0 + STEP)
+    assert s.pond_states["mid"].missing_asset_f == T0  # remembered the missed freshness
+
+    # Drive many ticks over an UNCHANGED Source: `mid` must not re-run even once.
+    for i in range(20):
+        s = tick(T0 + (i + 2) * STEP, s)
+        s, _ = sentinel(T0 + (i + 2) * STEP, s)
+    assert [b.pond_id for b in s.pending_begin_runs] == [], "parked Pond busy-looped on the same freshness"
+    assert s.pond_states["mid"].runs_started == 0
+
+    # The Source advances → `mid` re-attempts exactly once.
+    later = T0 + secs(10)
+    s.pond_states["src"].start_f = s.pond_states["src"].end_f = later
+    s = tick(later, s)
+    s, _ = sentinel(later, s)
+    assert [b.pond_id for b in s.pending_begin_runs] == ["mid"], "did not re-attempt on a genuine Source advance"
+
+
+@pytest.mark.timeout(5)
 def test_restore_demand_quiescent_graph_no_spurious_demand():
     """A fully-idle graph with no outstanding demand stays quiescent — the invariant only re-derives held
     demand, it never invents it."""

@@ -544,6 +544,7 @@ class Driver:
                 ps.failed_f = NEVER
                 ps.failures = 0
                 ps.missing_asset = None
+                ps.missing_asset_f = NEVER
                 ps.refresh_pending = ps.repairing = False
                 ps.runs_started = ps.runs_completed = 0
                 for rid, rip in self.state.ripples.items():

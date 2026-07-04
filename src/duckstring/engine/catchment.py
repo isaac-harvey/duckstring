@@ -293,6 +293,12 @@ def block_on_missing_asset(state: EngineState, pid: PondId, reason: str, now: da
     downstream. Recovers via :func:`clear_missing_asset` on the next successful Run. See plans/reset.md."""
     s = state.clone()
     ps = s.pond_states[pid]
+    # Remember how fresh the Sources were when the read missed (their max end_f). The re-attempt is gated
+    # on a Source completing a NEWER Run than this (can_start_pond) — the recovery signal is a genuine
+    # Source republish, not the aggregate min-freshness (which the missing Source's own advance need not
+    # move). Without this the rewound run re-fires at the same freshness every Duck round-trip — a busy-loop
+    # that read-misses forever, floods run history, and starves the Catchment. See plans/reset.md.
+    ps.missing_asset_f = max((s.pond_states[sp].end_f for sp in s.ponds[pid].sources), default=NEVER)
     ps.start_f = ps.end_f  # abandon the incomplete run (the read failed; nothing published)
     for rid in ripples_of(s, pid):
         rs = s.ripple_states[rid]
@@ -312,6 +318,7 @@ def clear_missing_asset(state: EngineState, pid: PondId) -> EngineState:
     s = state.clone()
     if s.pond_states[pid].missing_asset is not None:
         s.pond_states[pid].missing_asset = None
+        s.pond_states[pid].missing_asset_f = NEVER
         derive_blocked(s, pid)
     return s
 
@@ -327,6 +334,14 @@ def can_start_pond(s: EngineState, pid: PondId, now: datetime) -> bool:
     f, _ = pond_source_f(s, pid, now)
     if f is None:
         return False
+    # Parked on a missing Source asset: re-attempt ONLY once a Source completes a newer Run than when we
+    # read-and-missed — otherwise the rewound run re-fires at the same freshness forever (a Duck-round-trip
+    # busy-loop). Keyed on max(Source end_f), not the min-based `f`, so the missing Source's own republish
+    # (which need not raise the min) still triggers recovery. See plans/reset.md.
+    if ps.missing_asset is not None:
+        src_f = max((s.pond_states[sp].end_f for sp in s.ponds[pid].sources), default=NEVER)
+        if src_f <= ps.missing_asset_f:
+            return False
     if not ps.is_failed:  # a blocked-but-not-failed Pond still drains available Source freshness
         mt = min_target(ps.targets)
         if mt is not None and f >= mt:

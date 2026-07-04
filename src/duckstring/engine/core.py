@@ -203,6 +203,10 @@ class PondState:
     missing_asset: str | None = None  # a Ripple read an unpublished Source asset ("source.table") — the
                                       # Pond is blocked *waiting* for it, not failed (no budget, no alert).
                                       # Transient (re-derived on the next read attempt), see plans/reset.md.
+    missing_asset_f: datetime = NEVER  # max Source end_f when the missing read happened: while parked,
+                                       # re-attempt ONLY once a Source completes a newer Run than this (else
+                                       # the rewound run would re-fire at the same freshness forever, a
+                                       # busy-loop). Recovers on a genuine Source republish. Transient.
     failed_f: datetime = NEVER  # freshness of the freshest Pond Run that has failed (NEVER if none)
     failures: int = 0  # failed Pond Runs since the last success (counted against retry_on_change)
     # Control (Wake/Force/Kill — see docs).
