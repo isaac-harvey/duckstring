@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from 'react';
 import { THEME_BLOCKED } from '@/lib/store';
+import { useIsMobile } from '@/lib/useIsMobile';
 
 // A destructive-confirmation request. `action` is the work to run on confirm (the dialog awaits it, then
 // closes; it receives the `toggle`'s checkbox state). `requireTyped`, when set, gates the confirm button
@@ -24,6 +25,7 @@ export function ConfirmDialog({ opts, onClose }: { opts: ConfirmOpts; onClose: (
   const [busy, setBusy] = useState(false);
   const [typed, setTyped] = useState('');
   const [toggled, setToggled] = useState(!!opts.toggle?.default);
+  const isMobile = useIsMobile();
   const gated = !!opts.requireTyped;
   const canConfirm = !busy && (!gated || typed === opts.requireTyped);
 
@@ -95,7 +97,9 @@ export function ConfirmDialog({ opts, onClose }: { opts: ConfirmOpts; onClose: (
               Type <span style={{ color: '#e4e4e7', fontWeight: 700 }}>{opts.requireTyped}</span> to confirm.
             </div>
             <input
-              autoFocus
+              // Don't auto-focus on mobile: the keyboard would pop up immediately and obscure the
+              // message (which lists the affected Ponds) before the user has read it.
+              autoFocus={!isMobile}
               value={typed}
               onChange={(e) => setTyped(e.target.value)}
               onKeyDown={(e) => { if (e.key === 'Enter') void go(); }}
