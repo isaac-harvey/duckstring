@@ -243,6 +243,39 @@ export async function repairPonds(
   return res.json();
 }
 
+// The bulk-operation vocabulary (see plans/selector_ui.md), in application-precedence order.
+export const BATCH_OPS = ['kill', 'sleep', 'reset', 'wipe', 'remove', 'clear', 'repair', 'refresh'] as const;
+export type BatchOp = (typeof BATCH_OPS)[number];
+
+export interface BatchResult {
+  operations: BatchOp[];
+  ponds: string[];
+  removed: string[];
+  errors: { pond: string | null; op: string; error: string }[];
+}
+
+// Apply a set of operations to a set of Ponds (ids "name@major"), in precedence order. `confirm` is the
+// catchment name, required by the server when any of reset/wipe/remove is present. Throws the server's
+// detail on a 4xx (bad op-set, missing/wrong confirm) so the caller can surface it.
+export async function batchPonds(
+  ids: string[],
+  operations: BatchOp[],
+  confirm: string | null,
+): Promise<BatchResult> {
+  const ponds = ids.map((id) => {
+    const at = id.lastIndexOf('@');
+    return { name: at === -1 ? id : id.slice(0, at), major: at === -1 ? null : Number(id.slice(at + 1)) };
+  });
+  const res = await fetch(`${apiBase()}/ponds/batch`, {
+    method: 'POST',
+    headers: authHeaders({ 'content-type': 'application/json' }),
+    body: JSON.stringify({ ponds, operations, confirm }),
+  });
+  if (res.status === 401) throw new UnauthorizedError();
+  if (!res.ok) throw new Error((await res.json().catch(() => null))?.detail ?? `batch failed (${res.status})`);
+  return res.json();
+}
+
 // Reset the whole Catchment to a fresh-deploy state (scrub data + state; keep deploys/config/secrets).
 export async function resetCatchment(clearHistory = false): Promise<{ ponds: number }> {
   const res = await fetch(`${apiBase()}/catchment/reset`, {
