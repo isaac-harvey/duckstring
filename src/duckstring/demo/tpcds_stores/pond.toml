@@ -1,0 +1,4 @@
+[pond]
+name = "tpcds_stores"
+version = "1.0.0"
+type = "inlet"

@@ -1,0 +1,8 @@
+[pond]
+name = "tpcds_priced"
+version = "1.0.0"
+
+[sources]
+tpcds_sales = "1.0.0"
+tpcds_items = "1.0.0"
+tpcds_stores = "1.0.0"

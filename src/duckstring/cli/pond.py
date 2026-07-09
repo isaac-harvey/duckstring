@@ -109,6 +109,24 @@ _TRICKLE_DEMO = (
     ("priced", "deploy third  (pond.trickle builder: incremental star enrichment)"),
     ("revenue", "deploy fourth, then: [dim]duckstring trigger pulse revenue[/dim]"),
 )
+# The real-data Trickle demos (plans/real-data-testing.md): each has ≥4 Ponds, a cross-Pond join, and two
+# independent Outlets to demo running one path at a different cadence than another.
+_TPCDS_DEMO = (
+    ("tpcds_sales", "deploy first  (append Trickle: TPC-DS store_sales fact, dsdgen-generated + streamed)"),
+    ("tpcds_items", "deploy second (merge Trickle: item dimension with CDC on price drift)"),
+    ("tpcds_stores", "deploy third  (merge Trickle: stable store dimension)"),
+    ("tpcds_priced", "deploy fourth (pond.trickle builder: 3-way incremental star join)"),
+    ("tpcds_category_revenue", "deploy fifth  (Outlet: revenue per category)"),
+    ("tpcds_store_revenue", "deploy sixth, then pulse either Outlet on its own cadence"),
+)
+_GHARCHIVE_DEMO = (
+    ("gh_events", "deploy first  (append Trickle: real GHArchive hourly event stream)"),
+    ("gh_actors", "deploy second (merge Trickle: actor dimension from the stream)"),
+    ("gh_pushes", "deploy third  (Path A builder: push events ⋈ gh_actors)"),
+    ("gh_repo_activity", "deploy fourth (Path A Outlet: activity per repo)"),
+    ("gh_stars", "deploy fifth  (Path B: star/fork signal, append Trickle)"),
+    ("gh_trending", "deploy sixth, then pulse either Outlet on its own cadence"),
+)
 _DEMO_PONDS = tuple(name for name, _ in _RIPPLE_DEMO)  # the default set (back-compat)
 
 
@@ -116,9 +134,11 @@ _DEMO_PONDS = tuple(name for name, _ in _RIPPLE_DEMO)  # the default set (back-c
 def demo(
     ripple: bool = typer.Option(False, "--ripple", help="The overwrite-Ripple pipeline (the default set)."),
     trickle: bool = typer.Option(False, "--trickle", help="The incremental-Trickle pipeline."),
+    tpcds: bool = typer.Option(False, "--tpcds", help="The TPC-DS real-data Trickle pipeline (generated)."),
+    gharchive: bool = typer.Option(False, "--gharchive", help="The GHArchive real-data Trickle pipeline (streamed)."),
 ) -> None:
-    """Create a demo pipeline as subdirectories: the overwrite-Ripple set (default / --ripple) or the
-    incremental-Trickle set (--trickle)."""
+    """Create a demo pipeline as subdirectories: the overwrite-Ripple set (default / --ripple), the
+    incremental-Trickle set (--trickle), or a real-data Trickle set (--tpcds / --gharchive)."""
     import shutil
 
     from rich.console import Console
@@ -126,10 +146,15 @@ def demo(
     console = Console()
     cwd = Path.cwd()
 
-    if ripple and trickle:
-        typer.echo("Error: pass only one of --ripple / --trickle.", err=True)
+    if sum((ripple, trickle, tpcds, gharchive)) > 1:
+        typer.echo("Error: pass only one of --ripple / --trickle / --tpcds / --gharchive.", err=True)
         raise typer.Exit(1)
-    ponds = _TRICKLE_DEMO if trickle else _RIPPLE_DEMO  # default (neither flag) = the Ripple set
+    ponds = (
+        _TPCDS_DEMO if tpcds
+        else _GHARCHIVE_DEMO if gharchive
+        else _TRICKLE_DEMO if trickle
+        else _RIPPLE_DEMO  # default (no flag) = the Ripple set
+    )
 
     existing = [name for name, _ in ponds if (cwd / name).exists()]
     if existing:
@@ -144,7 +169,12 @@ def demo(
     for name, _ in ponds:
         shutil.copytree(_DEMO_DIR / name, cwd / name)
 
-    kind = "Trickle (incremental)" if trickle else "Ripple"
+    kind = (
+        "TPC-DS (real-data Trickle)" if tpcds
+        else "GHArchive (real-data Trickle)" if gharchive
+        else "Trickle (incremental)" if trickle
+        else "Ripple"
+    )
     console.print(f"[green]Created[/green] {kind} demo pipeline:")
     for name, role in ponds:
         console.print(f"  [bold]{name}/[/bold] — {role}")

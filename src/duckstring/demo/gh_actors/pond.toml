@@ -1,0 +1,6 @@
+[pond]
+name = "gh_actors"
+version = "1.0.0"
+
+[sources]
+gh_events = "1.0.0"

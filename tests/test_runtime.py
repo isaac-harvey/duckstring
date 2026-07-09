@@ -184,6 +184,101 @@ def test_trickle_chain_runs_end_to_end(runtime):
         assert n > 0, f"{name}: empty reconstructed main"
 
 
+_TPCDS_PONDS = ("tpcds_sales", "tpcds_items", "tpcds_stores", "tpcds_priced",
+                "tpcds_category_revenue", "tpcds_store_revenue")
+_GHARCHIVE_PONDS = ("gh_events", "gh_actors", "gh_pushes", "gh_repo_activity", "gh_stars", "gh_trending")
+_GHARCHIVE_FIXTURES = Path(__file__).parent / "fixtures" / "gharchive"
+
+
+@pytest.mark.timeout(120)
+def test_tpcds_demo_chain_runs_end_to_end(runtime, monkeypatch):
+    """The TPC-DS real-data demo on real Duck subprocesses: two independent Outlets off one builder, over a
+    dsdgen-generated (offline, deterministic) fact + dimensions, shrunk to a tiny scale factor. A second
+    pulse exercises the emulated-stream batch-append + price-drift path (not just bootstrap)."""
+    url, root = runtime
+    monkeypatch.setenv("DUCKSTRING_TPCDS_SF", "0.01")  # inherited by the Duck subprocesses
+    monkeypatch.setenv("DUCKSTRING_TPCDS_BATCH", "1000")
+    monkeypatch.setenv("DUCKSTRING_TPCDS_PRICE_CHANGES", "10")
+    _deploy(url, _TPCDS_PONDS)
+
+    for outlet in ("tpcds_category_revenue", "tpcds_store_revenue"):
+        httpx.post(f"{url}/api/ponds/{outlet}/pulse", timeout=5.0)
+    assert _wait(lambda: all((_pond_status(url, o) or {}).get("end_f") is not None
+                             for o in ("tpcds_category_revenue", "tpcds_store_revenue"))), \
+        "TPC-DS Outlets never became fresh"
+    assert not any((_pond_status(url, n) or {}).get("is_failed") for n in _TPCDS_PONDS), \
+        "a TPC-DS Pond failed"
+
+    import json
+
+    # The append fact published a history + sidecar; the builder + Outlets are merge lines.
+    sales_dir = root / "ponds" / "tpcds_sales" / "m1" / "data"
+    assert json.loads((sales_dir / "_trickle.json").read_text())["store_sale"]["mode"] == "append"
+    for name, table in (("tpcds_priced", "priced_sale"),
+                        ("tpcds_category_revenue", "revenue_by_category")):
+        data_dir = root / "ponds" / name / "m1" / "data"
+        assert json.loads((data_dir / "_trickle.json").read_text())[table]["mode"] == "merge"
+
+    # Second pulse: the emulated stream appends a new batch and re-prices; the chain advances, not fails.
+    prev = _pond_status(url, "tpcds_category_revenue")["end_f"]
+    time.sleep(1.0)
+    httpx.post(f"{url}/api/ponds/tpcds_category_revenue/pulse", timeout=5.0)
+    assert _wait(lambda: (_pond_status(url, "tpcds_category_revenue") or {}).get("end_f") not in (None, prev)), \
+        "TPC-DS second run never advanced"
+    assert not (_pond_status(url, "tpcds_sales") or {}).get("is_failed"), "TPC-DS batch append failed"
+
+
+@pytest.mark.timeout(120)
+def test_gharchive_demo_chain_runs_end_to_end(runtime, monkeypatch):
+    """The GHArchive real-data demo on real Duck subprocesses, over committed fixture hours (no network):
+    one Inlet feeding two entirely separate paths (pushes⋈actors→repo_activity, stars→trending). BACKFILL
+    loads both fixture hours; a second pulse round exercises the hold-on-gap ingest (the next hour isn't
+    published, so the Inlet holds and the chain passes — it must not fail)."""
+    url, root = runtime
+    monkeypatch.setenv("DUCKSTRING_GHARCHIVE_BASE", str(_GHARCHIVE_FIXTURES))  # offline fixtures
+    monkeypatch.setenv("DUCKSTRING_GHARCHIVE_START", "2024-01-15-0")
+    monkeypatch.setenv("DUCKSTRING_GHARCHIVE_BACKFILL", "2")  # both committed fixture hours
+    _deploy(url, _GHARCHIVE_PONDS)
+
+    outlets = ("gh_repo_activity", "gh_trending")
+    for outlet in outlets:
+        httpx.post(f"{url}/api/ponds/{outlet}/pulse", timeout=5.0)
+    assert _wait(lambda: all((_pond_status(url, o) or {}).get("end_f") is not None for o in outlets)), \
+        "GHArchive Outlets never became fresh"
+    assert not any((_pond_status(url, n) or {}).get("is_failed") for n in _GHARCHIVE_PONDS), \
+        "a GHArchive Pond failed"
+
+    import json
+
+    import duckdb
+
+    from duckstring.dataplane import ParquetDataPlane
+
+    # The Inlet is an append Trickle; both separate paths produced non-empty output.
+    events_dir = root / "ponds" / "gh_events" / "m1" / "data"
+    assert json.loads((events_dir / "_trickle.json").read_text())["gh_event"]["mode"] == "append"
+    rcon = duckdb.connect()
+    for name, table in (("gh_events", "gh_event"), ("gh_pushes", "push"),
+                        ("gh_repo_activity", "repo_activity"),
+                        ("gh_stars", "star"), ("gh_trending", "trending")):
+        data_dir = root / "ponds" / name / "m1" / "data"
+        n = rcon.sql(
+            f"SELECT count(*) FROM ({ParquetDataPlane().read_select(data_dir, table)})"
+        ).fetchone()[0]
+        assert n > 0, f"{name}: empty output"
+
+    # Second pulse round: the next hour isn't published, so the Inlet holds on the gap — the chain runs to
+    # freshness as a pass (no new data), and crucially nothing fails.
+    prev = _pond_status(url, "gh_repo_activity")["end_f"]
+    time.sleep(1.0)
+    for outlet in outlets:
+        httpx.post(f"{url}/api/ponds/{outlet}/pulse", timeout=5.0)
+    assert _wait(lambda: (_pond_status(url, "gh_repo_activity") or {}).get("end_f") not in (None, prev)), \
+        "GHArchive second run never advanced"
+    assert not any((_pond_status(url, n) or {}).get("is_failed") for n in _GHARCHIVE_PONDS), \
+        "a GHArchive Pond failed on the second run (hold-on-gap)"
+
+
 def test_delete_table_removes_now_and_rebuilds_on_next_run(runtime):
     """`delete-table` removes a table (data + registry state) **immediately** — no run, no freshness
     change — and it reappears only when the Pond next genuinely runs, rebuilt whole by the builder's

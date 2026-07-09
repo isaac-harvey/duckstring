@@ -1,0 +1,7 @@
+[pond]
+name = "gh_trending"
+version = "1.0.0"
+type = "outlet"
+
+[sources]
+gh_stars = "1.0.0"

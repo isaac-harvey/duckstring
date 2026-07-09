@@ -1,6 +1,8 @@
 # Real-data demos: TPC-DS and GHArchive Trickle pipelines
 
-Status: **not built** (design only). Duckstring's Trickle chain has only ever run on the synthetic
+Status: **implemented** (both sets shipped as `duckstring pond demo --tpcds` / `--gharchive`, with
+deployed-Duck e2es in `tests/test_runtime.py`; the topology below is the built shape). Duckstring's Trickle
+chain had only ever run on the synthetic
 `orders`/`catalog` demo. That set proves the mechanics but not the pitch: a *big standing table, a tiny
 per-run delta*, on data an evaluator already recognises. Two datasets close that gap — **TPC-DS** (the
 canonical analytics star schema, generated) and **GHArchive** (a real public event stream, fetched). Both
@@ -38,18 +40,20 @@ delta, so this is genuine streamed real data, not emulation.
   fields), diffed per run so only newly-seen or changed actors hit the changelog.
 - **Path A → `gh_pushes`** (`pond.trickle` builder: `gh_events` PushEvents ⋈ `gh_actors`) →
   **`gh_repo_activity`** (Outlet, aggregate: commits & pushes per repo).
-- **Path B → `gh_stars`** (Trickle: filter WatchEvent/ForkEvent) → **`gh_trending`** (Outlet, aggregate:
-  stars per repo, `.accumulate` for a running total over time).
+- **Path B → `gh_stars`** (Trickle: filter WatchEvent/ForkEvent to an **append** table — the signal is
+  insert-only) → **`gh_trending`** (Outlet, aggregate: stars vs forks per repo). Path B is **entirely
+  disjoint** from Path A, sharing only the `gh_events` Inlet.
 
-Six Ponds, two Outlets, two disjoint paths sharing `gh_events` and the join to `gh_actors`.
+Six Ponds, two Outlets, two disjoint paths sharing only `gh_events` (the `gh_actors` join is Path A only).
 
 **Runtime-network caveat (the one real risk).** Fetching inside a ripple means the demo needs network at
-run time and isn't deterministic. Mitigations, all in-pattern: the ingest window is env-pointed
-(`DUCKSTRING_GHARCHIVE_URL`/date), so the test-suite e2e reads a **small committed fixture hour** from a
-local path instead of the network (the same way `DUCKSTRING_DEMO_*` shrinks the trickle e2e); an offline
-run skips with a warning rather than failing. If in practice this proves too flaky to ship as a demo, it
-falls back to `.sandbox/gharchive/` per the original brief — but the no-auth public bucket makes shipping
-it the expected outcome.
+run time and isn't deterministic. Mitigations, all in-pattern: the ingest source is env-pointed
+(`DUCKSTRING_GHARCHIVE_BASE` — a bucket URL by default, or a local directory of `{hour}.json.gz` files),
+so the test-suite e2e reads a **small committed 2-hour fixture** from a local path instead of the network
+(`tests/fixtures/gharchive/`, the same way `DUCKSTRING_DEMO_*` shrinks the trickle e2e). An hour that
+isn't published yet (a live-stream gap, or offline) makes the Inlet **hold** on that hour and pass — not
+fail. If in practice this proves too flaky to ship as a demo, it falls back to `.sandbox/gharchive/` per
+the original brief — but the no-auth public bucket makes shipping it the expected outcome.
 
 ## TPC-DS — emulated streaming, fully offline
 
@@ -60,14 +64,19 @@ generates the dimensions + a base fact at a scale factor; each run synthesises a
 few item prices — the same emulation `orders`+`catalog` already do, on the real TPC-DS schema.
 
 - **`tpcds_sales`** (Inlet, append Trickle) — bootstrap = `dsdgen` `store_sales` at `sf`; each run appends
-  a `_BATCH` of synthetic sales. Env-overridable scale (`DUCKSTRING_TPCDS_SF`, `_BATCH`).
+  a `_BATCH` of synthetic sales (FKs sampled from the ranges already in the history so joins resolve).
+  Env-overridable scale (`DUCKSTRING_TPCDS_SF`, `_BATCH`).
 - **`tpcds_items`** (merge Trickle) — the `item` dimension with a few prices drifting per run (CDC).
-- **Path A → `tpcds_priced`** (`pond.trickle`: sales ⋈ item ⋈ store) → **`tpcds_store_revenue`** (Outlet,
-  aggregate: revenue per store × category).
-- **Path B → `tpcds_customer_sales`** (Trickle: sales ⋈ customer) → **`tpcds_segments`** (Outlet,
-  aggregate: spend & order count per customer segment).
+- **`tpcds_stores`** (merge Trickle) — the `store` dimension; stable, so after the first run its delta is
+  empty (a free stable join operand — the honest other half of the CDC story).
+- **`tpcds_priced`** (`pond.trickle`: sales ⋈ item ⋈ store) — the shared 3-way builder join.
+- **Outlet A → `tpcds_category_revenue`** (aggregate: revenue per category).
+- **Outlet B → `tpcds_store_revenue`** (aggregate: revenue per store).
 
-Five Ponds, two Outlets, two disjoint paths sharing `tpcds_sales` and a join to `tpcds_items`.
+Six Ponds. Both Outlets consume the shared `tpcds_priced` builder and run on independent cadences — the
+"one path at a different frequency" demo. (This is the built shape; it swaps the earlier
+customer/segments Path B for a second Outlet off the shared builder — simpler, avoids the large `customer`
+dimension at scale, and keeps both Outlets genuinely independent.)
 
 ## What's genuinely new engineering
 
@@ -98,14 +107,23 @@ Five Ponds, two Outlets, two disjoint paths sharing `tpcds_sales` and a join to 
 - **Sizes are env-overridable** (`DUCKSTRING_TPCDS_*` / `DUCKSTRING_GHARCHIVE_*`) so the e2e tests shrink
   them, exactly as `DUCKSTRING_DEMO_*` already does.
 
-## Open questions
+## Resolved during the build
 
-- GHArchive fixture: commit one trimmed hour (a few thousand events) as the test fixture, or synthesise a
-  GHArchive-shaped fixture? Leaning: a real trimmed hour, so the parse path is exercised on real JSON shape.
-- TPC-DS default `sf` for a `demo`-scaffolded (non-test) run — big enough to feel real, small enough to
-  bootstrap in seconds. Leaning `sf=1` (~1 GB raw, but only `store_sales` + used dims materialise).
-- Whether the two demos share any helper (e.g. a fetch/generate utility) or stay fully self-contained per
-  the demo convention (each Pond dir standalone). Leaning: self-contained, matching every existing demo.
+- **GHArchive fixture** → two real trimmed hours (~1,530 events each, ~700 KB gzipped) in
+  `tests/fixtures/gharchive/`, so the parse path runs against real GHArchive JSON shape. Two hours (not
+  one) so the cursor can walk a genuine second hour.
+- **TPC-DS default `sf`** → `0.1` for a scaffolded run (not `1.0` — each of the three generating Ponds runs
+  its own `dsdgen`, so `1.0` × 3 is too slow for a first-touch demo; `0.1` still bootstraps a real fact in
+  a few seconds). The e2e shrinks to `0.01`.
+- **Shared helper vs self-contained** → fully self-contained, each Pond dir standalone (matching every
+  existing demo — no cross-Pond import).
+- **GHArchive gap handling** → **hold-on-gap** (retry the same hour next run), not skip-forward — correct
+  live-stream behaviour (the next hour simply hasn't landed) and it keeps repeated runs safe no-ops.
 
-**Confirm before building** — this is the plan for the brief in the original stub; check the topologies and
-the ship-both-as-demos call before I scaffold anything.
+## Follow-ups (not done)
+
+- Point the GHArchive demo's default `START` at a rolling-recent window rather than a fixed historical hour
+  (a fixed hour is reproducible but goes stale as "the latest" for a live demo).
+- A larger-scale performance write-up (the brief's original "real performance on recognisable datasets"
+  motivation) — the demos exist and run; a benchmark/blog measuring the delta-vs-standing-table contrast at
+  `sf=10`+ / a full GHArchive day is the natural next step.

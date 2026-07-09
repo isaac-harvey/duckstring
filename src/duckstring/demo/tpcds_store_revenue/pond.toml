@@ -1,0 +1,7 @@
+[pond]
+name = "tpcds_store_revenue"
+version = "1.0.0"
+type = "outlet"
+
+[sources]
+tpcds_priced = "1.0.0"

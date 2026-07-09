@@ -1,0 +1,7 @@
+[pond]
+name = "gh_repo_activity"
+version = "1.0.0"
+type = "outlet"
+
+[sources]
+gh_pushes = "1.0.0"
