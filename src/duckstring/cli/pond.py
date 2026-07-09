@@ -127,6 +127,13 @@ _GHARCHIVE_DEMO = (
     ("gh_stars", "deploy fifth  (Path B: star/fork signal, append Trickle)"),
     ("gh_trending", "deploy sixth, then pulse either Outlet on its own cadence"),
 )
+# A dbt-mode Pond deployed alongside a plain-Python Source (plans/dbt.md). shop_analytics is a dbt project
+# — each model a Ripple — reading shop_orders as a cross-Pond source(). Needs the dbt extra to deploy/run.
+_DBT_DEMO = (
+    ("shop_orders", "deploy first  (plain @ripple inlet: generates the sales source)"),
+    ("shop_analytics", "deploy second (dbt-mode: 3 models → 3 Ripples), then: "
+                       "[dim]duckstring trigger pulse shop_analytics[/dim]"),
+)
 _DEMO_PONDS = tuple(name for name, _ in _RIPPLE_DEMO)  # the default set (back-compat)
 
 
@@ -136,9 +143,11 @@ def demo(
     trickle: bool = typer.Option(False, "--trickle", help="The incremental-Trickle pipeline."),
     tpcds: bool = typer.Option(False, "--tpcds", help="The TPC-DS real-data Trickle pipeline (generated)."),
     gharchive: bool = typer.Option(False, "--gharchive", help="The GHArchive real-data Trickle pipeline (streamed)."),
+    dbt: bool = typer.Option(False, "--dbt", help="A dbt-mode Pond (a dbt project as a Pond) + its Source."),
 ) -> None:
     """Create a demo pipeline as subdirectories: the overwrite-Ripple set (default / --ripple), the
-    incremental-Trickle set (--trickle), or a real-data Trickle set (--tpcds / --gharchive)."""
+    incremental-Trickle set (--trickle), a real-data Trickle set (--tpcds / --gharchive), or a dbt-mode
+    Pond (--dbt; deploying/running it needs the dbt extra: pip install 'duckstring[dbt]')."""
     import shutil
 
     from rich.console import Console
@@ -146,12 +155,13 @@ def demo(
     console = Console()
     cwd = Path.cwd()
 
-    if sum((ripple, trickle, tpcds, gharchive)) > 1:
-        typer.echo("Error: pass only one of --ripple / --trickle / --tpcds / --gharchive.", err=True)
+    if sum((ripple, trickle, tpcds, gharchive, dbt)) > 1:
+        typer.echo("Error: pass only one of --ripple / --trickle / --tpcds / --gharchive / --dbt.", err=True)
         raise typer.Exit(1)
     ponds = (
         _TPCDS_DEMO if tpcds
         else _GHARCHIVE_DEMO if gharchive
+        else _DBT_DEMO if dbt
         else _TRICKLE_DEMO if trickle
         else _RIPPLE_DEMO  # default (no flag) = the Ripple set
     )
@@ -172,6 +182,7 @@ def demo(
     kind = (
         "TPC-DS (real-data Trickle)" if tpcds
         else "GHArchive (real-data Trickle)" if gharchive
+        else "dbt-mode" if dbt
         else "Trickle (incremental)" if trickle
         else "Ripple"
     )

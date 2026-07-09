@@ -1,0 +1,11 @@
+[pond]
+name = "shop_analytics"
+version = "1.0.0"
+type = "outlet"
+# dbt-mode: the pipeline is the dbt project's model graph — no @ripple code. Each model becomes a Ripple
+# (freshness / failure / retry tracked). The path is relative to this Pond directory.
+dbt_project = "dbt"
+
+[sources]
+# A dbt source('shop_orders', …) resolves to this declared Duckstring Source Pond's published tables.
+shop_orders = "1.0.0"

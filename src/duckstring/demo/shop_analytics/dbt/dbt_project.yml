@@ -1,0 +1,12 @@
+name: 'shop_analytics'
+version: '1.0.0'
+config-version: 2
+# Duckstring generates the profiles.yml and points this profile at the Pond's own DuckDB registry.
+profile: 'duckstring'
+model-paths: ["models"]
+
+models:
+  shop_analytics:
+    # Materialise as tables so Duckstring's data plane publishes them for cross-Pond consumption
+    # (it exports base tables, not views).
+    +materialized: table

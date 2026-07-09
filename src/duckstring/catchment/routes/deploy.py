@@ -82,9 +82,9 @@ def _check_version_contracts(db, pn_id: int, name: str, version: str, cfg: dict)
 
 
 def _pond_config(toml_path: Path) -> dict:
-    """Extract the deploy-relevant config from pond.toml: sources, retries, kind. (Windows are
-    operational config managed via `duckstring trigger window`, not declared at deploy time.)"""
-    cfg = {"sources": {}, "immediate_retries": 0, "source_retries": 0, "kind": None}
+    """Extract the deploy-relevant config from pond.toml: sources, retries, kind, dbt_project. (Windows
+    are operational config managed via `duckstring trigger window`, not declared at deploy time.)"""
+    cfg = {"sources": {}, "immediate_retries": 0, "source_retries": 0, "kind": None, "dbt_project": None}
     if not toml_path.exists():
         return cfg
     info = _read_toml(toml_path.read_text(encoding="utf-8"))
@@ -93,13 +93,19 @@ def _pond_config(toml_path: Path) -> dict:
     cfg["immediate_retries"] = pond.get("immediate_retries", 0)
     cfg["source_retries"] = pond.get("source_retries", 0)
     cfg["kind"] = pond.get("type")
+    cfg["dbt_project"] = pond.get("dbt_project")
     return cfg
 
 
 def _discover_ripples(source_dir: Path) -> list[dict]:
     from duckstring.core import collect_ripples, import_pond_module, pond_entrypoints, read_pond_toml
+    from duckstring.dbt_mode import dbt_project_subpath
 
-    ripples_entry, _ = pond_entrypoints(read_pond_toml(source_dir))
+    info = read_pond_toml(source_dir)
+    if dbt_project_subpath(info):
+        return _discover_dbt_ripples(source_dir, info)  # dbt-mode: models → ripples (no @ripple code)
+
+    ripples_entry, _ = pond_entrypoints(info)
     if not (source_dir / ripples_entry).exists():
         return []
     try:
@@ -108,6 +114,25 @@ def _discover_ripples(source_dir: Path) -> list[dict]:
     except Exception:
         collect_ripples()
         return []
+
+
+def _discover_dbt_ripples(source_dir: Path, info: dict) -> list[dict]:
+    """Translate a dbt-mode Pond's model graph into ripple rows (a model = a Ripple). Raises ValueError
+    (→ 422) with dbt's own error text if the project can't be parsed."""
+    import tempfile
+
+    from duckstring.dbt_mode import DbtError, manifest_to_ripples, parse_manifest, project_dir, write_profile
+
+    proj = project_dir(source_dir, info)
+    if not (proj / "dbt_project.yml").exists():
+        raise ValueError(f"dbt_project points at '{proj.name}/' but no dbt_project.yml is there")
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            profiles = write_profile(Path(tmp), ":memory:")  # parse touches no registry
+            manifest = parse_manifest(proj, profiles)
+        return manifest_to_ripples(manifest)
+    except DbtError as exc:
+        raise ValueError(str(exc)) from exc
 
 
 def _incoming_topology(ripples) -> dict[str, frozenset]:

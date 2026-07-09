@@ -35,11 +35,17 @@ dependencies = [
 [project.optional-dependencies]
 # Retained for back-compat: the Iceberg deps are in core now (Iceberg is the default plane).
 iceberg = []
+# dbt-mode Ponds (plans/dbt.md): deploy a dbt project as a Pond, each model a Ripple. Heavyweight and
+# opt-in — only pulled when a team actually runs dbt-mode. dbt-duckdb pulls dbt-core transitively.
+dbt = [
+  "dbt-duckdb>=1.9",
+]
 dev = [
   "pytest>=8.0",
   "pytest-timeout>=0.5",
   "ruff>=0.3",
   "mypy>=1.8",
+  "dbt-duckdb>=1.9",
 ]
 
 [tool.setuptools]

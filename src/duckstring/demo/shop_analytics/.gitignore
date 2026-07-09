@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+puddles/
+# dbt build artifacts (Duckstring points dbt at its own scratch dirs at runtime, but a local dbt run
+# writes these into the project).
+dbt/target/
+dbt/logs/
+dbt/dbt_packages/

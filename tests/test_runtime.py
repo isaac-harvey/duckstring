@@ -279,6 +279,52 @@ def test_gharchive_demo_chain_runs_end_to_end(runtime, monkeypatch):
         "a GHArchive Pond failed on the second run (hold-on-gap)"
 
 
+_DBT_PONDS = ("shop_orders", "shop_analytics")
+
+
+@pytest.mark.timeout(120)
+def test_dbt_mode_pond_chain_runs_end_to_end(runtime, monkeypatch):
+    """A dbt-mode Pond (plans/dbt.md) on real Duck subprocesses: a dbt project deploys as a Pond, each
+    model a Ripple. Proves the whole seam — deploy parses the manifest into ripple rows + ref-chain edges,
+    a plain @ripple Source feeds it, and the Duck runs each model via dbt against its own registry (after
+    materialising the cross-Pond source), publishing the model tables."""
+    pytest.importorskip("dbt.cli.main")  # the dbt extra (duckstring[dbt])
+    url, root = runtime
+    monkeypatch.setenv("DUCKSTRING_DBT_DEMO_SALES", "500")
+    _deploy(url, _DBT_PONDS)
+
+    # Deploy translated the dbt models into ripples + the ref() DAG into ripple edges.
+    sa = _pond_status(url, "shop_analytics")
+    assert {r["name"] for r in sa["ripples"]} == {"orders_clean", "revenue_by_product", "top_products"}
+    assert ["orders_clean", "revenue_by_product"] in sa["ripple_edges"]
+    assert ["revenue_by_product", "top_products"] in sa["ripple_edges"]
+
+    httpx.post(f"{url}/api/ponds/shop_analytics/pulse", timeout=5.0)
+    assert _wait(lambda: (_pond_status(url, "shop_analytics") or {}).get("end_f") is not None), \
+        "shop_analytics never became fresh"
+    assert not any((_pond_status(url, n) or {}).get("is_failed") for n in _DBT_PONDS), "a dbt-mode Pond failed"
+
+    import duckdb
+
+    from duckstring.dataplane import ParquetDataPlane
+
+    # Each dbt model published a base table; the source materialisation didn't leak into the output.
+    rcon = duckdb.connect()
+    for table in ("orders_clean", "revenue_by_product", "top_products"):
+        data_dir = root / "ponds" / "shop_analytics" / "m1" / "data"
+        n = rcon.sql(f"SELECT count(*) FROM ({ParquetDataPlane().read_select(data_dir, table)})").fetchone()[0]
+        assert n > 0, f"dbt model {table}: empty output"
+
+    # A second pulse re-runs the models against the refreshed source without failing.
+    prev = _pond_status(url, "shop_analytics")["end_f"]
+    time.sleep(1.0)
+    httpx.post(f"{url}/api/ponds/shop_analytics/pulse", timeout=5.0)
+    assert _wait(lambda: (_pond_status(url, "shop_analytics") or {}).get("end_f") not in (None, prev)), \
+        "dbt-mode second run never advanced"
+    assert not any((_pond_status(url, n) or {}).get("is_failed") for n in _DBT_PONDS), \
+        "a dbt-mode Pond failed on the second run"
+
+
 def test_delete_table_removes_now_and_rebuilds_on_next_run(runtime):
     """`delete-table` removes a table (data + registry state) **immediately** — no run, no freshness
     change — and it reappears only when the Pond next genuinely runs, rebuilt whole by the builder's

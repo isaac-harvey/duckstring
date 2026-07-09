@@ -20,14 +20,33 @@ _import_lock = threading.Lock()
 
 
 def load_topology(source_dir: Path) -> dict[str, list[str]]:
-    """Build the intra-Pond ``{ripple_name: [parent_names]}`` graph by importing the deployed
-    ripples entrypoint and reading the registered ripples (the Duck owns its own code)."""
+    """Build the intra-Pond ``{ripple_name: [parent_names]}`` graph. For a normal Pond this imports the
+    deployed ripples entrypoint and reads the registered ripples; for a **dbt-mode** Pond it parses the
+    dbt project and reads the model graph (a model = a Ripple). The Duck owns its own code either way."""
+    from ..core import read_pond_toml
+    from ..dbt_mode import dbt_project_subpath
+
+    info = read_pond_toml(source_dir)
+    if dbt_project_subpath(info):
+        return _dbt_topology(source_dir, info)
+
     ripples = _import_ripples(source_dir)
     func_to_name = {r["func"]: r["name"] for r in ripples}
     return {
         r["name"]: [func_to_name[p] for p in r["parents"] if p in func_to_name]
         for r in ripples
     }
+
+
+def _dbt_topology(source_dir: Path, info: dict) -> dict[str, list[str]]:
+    import tempfile
+
+    from ..dbt_mode import manifest_topology, parse_manifest, project_dir, write_profile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        profiles = write_profile(Path(tmp), ":memory:")  # topology parse touches no registry
+        manifest = parse_manifest(project_dir(source_dir, info), profiles)
+    return manifest_topology(manifest)
 
 
 def _import_ripples(source_dir: Path) -> list[dict]:

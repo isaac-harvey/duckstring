@@ -179,12 +179,21 @@ def main() -> None:
 
     root = Path(args.root)
     data_root = args.data_root or None
-    parents = load_topology(root / args.source_path)
+    source_dir = root / args.source_path
+    parents = load_topology(source_dir)
     major_dir = pond_major_dir(root, args.pond, args.major)
     major_dir.mkdir(parents=True, exist_ok=True)
     con = ledger.connect(major_dir / "pond.db")
     core = DuckCore(f"{args.pond}@{args.major}", con, parents)  # name@major label for log lines
-    executor = RippleExecutor(args.pond, args.major, args.version, args.source_path, root, data_root=data_root)
+
+    # A dbt-mode Pond runs its models via dbt, not @ripple functions — a different executor entirely.
+    from ..core import read_pond_toml
+    from ..dbt_mode import dbt_project_subpath
+    if dbt_project_subpath(read_pond_toml(source_dir)):
+        from .dbt_executor import DbtExecutor
+        executor = DbtExecutor(args.pond, args.major, args.version, args.source_path, root, data_root=data_root)
+    else:
+        executor = RippleExecutor(args.pond, args.major, args.version, args.source_path, root, data_root=data_root)
     client = CatchmentClient(args.catchment, args.pond, args.major, args.token)
     serve(core, executor, client)
 

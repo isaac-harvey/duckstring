@@ -1,6 +1,11 @@
 # dbt-mode Ponds: deploying a dbt project as a Pond with zero user code
 
-Status: **not built** (design only). dbt is the established way teams already define a sequence of SQL
+Status: **implemented** (v1). `dbt_mode.py` (translator + source materialisation) + `duck/dbt_executor.py`
+(the per-model dbt executor), wired through `routes/deploy.py` and the Duck; the `duckstring[dbt]` extra;
+a `pond demo --dbt` demo (`shop_orders` → `shop_analytics`) and a deployed-Duck e2e. The design below is
+what shipped; the resolved open question (the `source()` convention) is noted at the end.
+
+dbt is the established way teams already define a sequence of SQL
 transformations; a huge number of the mesh-pattern users Duckstring targets already have a dbt project they
 don't want to rewrite. A **dbt-mode Pond** lets that project deploy as-is: `pond.toml` points at the dbt
 project directory, and Duckstring interprets its model graph into Ripples entirely at deploy time — no
@@ -77,11 +82,25 @@ composition, but it also asks nothing of the user beyond a working dbt project.
   natively is out of scope; the whole model depends on the compiled SQL running against the Pond's own
   DuckDB registry.
 
-## Open questions
+## Resolved / as-built
 
-- The `source()` → cross-Pond convention (see above) is the one real design decision left; everything else is
-  mechanical translation.
-- Should per-model retry budgets (`immediate_retries`) default from somewhere dbt-native, or just inherit the
-  Pond's normal defaults like any other Ripple? Leaning: no special-casing, same defaults.
-- Whether to expose compiled SQL / dbt docs artifacts anywhere in the UI (Run Detail already shows a
-  traceback per Ripple — a dbt model failure's compiler error should surface the same way with no new UI).
+- **The `source()` → cross-Pond convention** (the one real design decision): a dbt `source('X', 'tbl')`
+  maps to Duckstring Source Pond `X`'s table `tbl` — `X` must be declared in `pond.toml [sources]`. Before
+  a model runs, `materialize_sources` reads the parsed manifest to learn the **exact relation dbt resolves
+  the source to** (`{schema}.{identifier}`) and writes the Source's published output there as a physical
+  table, so no guesswork and dbt reads a plain relation (no data-plane extensions in dbt's connection). A
+  source not matching a declared Source is left to dbt.
+- **Per-model retry budgets** → no dbt-native special-casing; a dbt-mode Pond inherits the Pond's normal
+  `immediate_retries`/`source_retries` like any other (models are Ripples).
+- **The connection model** (not in the original design, forced by dbt owning its own DuckDB connection):
+  `DbtExecutor` holds no persistent registry connection and serialises all registry access under one lock,
+  so no two connections to the registry file are ever open at once.
+
+## Still open / deferred
+
+- Exposing compiled SQL / dbt docs artifacts in the UI (a model failure's error already surfaces as a
+  Ripple traceback in Run Detail with no new UI — good enough for v1).
+- `is_incremental()` dbt models work (the registry persists), but Duckstring adds no incremental machinery
+  and doesn't reconcile dbt-incremental with Trickle — still the deliberate v1 non-goal.
+- Per-model runtime cost: each model run re-parses the project (~0.5s). Fine for now; a warm manifest cache
+  is the optimisation if it matters.

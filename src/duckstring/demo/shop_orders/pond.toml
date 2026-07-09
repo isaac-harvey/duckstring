@@ -1,0 +1,4 @@
+[pond]
+name = "shop_orders"
+version = "1.0.0"
+type = "inlet"

@@ -42,6 +42,7 @@ const sidebars: SidebarsConfig = {
         'guides/trickle',
         'guides/incremental-ripples',
         'guides/external-pipelines',
+        'guides/dbt',
         'guides/connecting-catchments',
         'guides/querying-data',
         'guides/web-ui',

@@ -33,6 +33,7 @@ products = "1.1.0?"      # trailing ? — optional
 | `source_retries` | no | `0` | Default budget for fresh Pond Runs attempted as Sources update, after a failure. |
 | `ripples` | no | `"src/pond.py"` | The module defining the Pond's `@ripple` functions. |
 | `puddles` | no | `"src/puddles.py"` | The module defining the Pond's `@puddle` functions for [local testing](../guides/local-testing.md). |
+| `dbt_project` | no | — | Makes this a [dbt-mode Pond](../guides/dbt.md): the dbt project directory (each model becomes a Ripple). Mutually exclusive with `ripples`. Needs the dbt extra. |
 
 The retry fields are **seeds, not settings**: they initialise the live budgets when the Pond is first deployed to a Catchment, after which the budgets are operator-owned (`duckstring control failure-budget`) and redeploys don't touch them. See [Fault Tolerance](../guides/fault-tolerance.md).
 

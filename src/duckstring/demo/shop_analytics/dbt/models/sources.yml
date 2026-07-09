@@ -1,0 +1,9 @@
+version: 2
+
+sources:
+  # The source name matches the Duckstring Source Pond in pond.toml [sources]; `schema` is the relation
+  # Duckstring materialises it into before the models run. source('shop_orders','sale') → shop_orders.sale.
+  - name: shop_orders
+    schema: shop_orders
+    tables:
+      - name: sale
