@@ -97,7 +97,7 @@ See [Windows](../guides/windows.md). The Pond name comes directly after `window`
 
 ## `duckstring spout` — egress bindings
 
-Publish a Pond's output to external systems. A Spout is operational config (persisted, survives redeploys), not declared in `pond.toml`. Credentials go in the destination URI as `${env:NAME}` (process environment) or `${secret:NAME}` ([secret store](#duckstring-secret--credential-store)) references, resolved only at egress time — never stored in the binding or logged. After each successful Pond Run, the egress worker delivers the Pond's published tables to the destination as snapshot Parquet (`{prefix}/{table}.parquet`).
+Publish a Pond's output to external systems. A Spout is operational config (persisted, survives redeploys), not declared in `pond.toml`. Credentials go in the destination URI as `${env:NAME}` (process environment) or `${secret:NAME}` ([secret store](#duckstring-secret--credential-store)) references, resolved only at egress time — never stored in the binding or logged. After each successful Pond Run, the egress worker delivers the Pond's published tables to the destination: by default (`--mode auto`/`full`) as snapshot Parquet (`{prefix}/{table}.parquet`); with **`--mode append`** an object-store destination instead **mirrors the table's published Duckstring collection** (the per-run parts, changelog and tiers, and the sidecar) — each delivery ships only the new files, so it stays cheap for large [Trickle](../guides/trickle.md) tables, and the destination is directly readable as a Duckstring layout (by another Catchment, or anything that reads the parts).
 
 `file://`, `s3://`, `gs://`, and `postgres://` work today. Object-store credentials go in the URI query: `s3://bucket/prefix?key_id=${env:AWS_KEY}&secret=${env:AWS_SECRET}&region=us-east-1` (also `endpoint`, `url_style`, `use_ssl`, `session_token`); `s3://` with no key falls back to the AWS credential chain (env / instance profile); `gs://` needs HMAC `key_id`+`secret`.
 
@@ -135,13 +135,13 @@ Two destinations work today: a **webhook** (`https://…`/`http://…`, a Slack-
 
 | Command | Description |
 |---|---|
-| `alert add --to {uri} [--pond N [--major M]] [--on failure,…\|all] [--stale 1h] [--name N]` | Add a channel. `--to` is an `https://`/`http://`/`mailto:` URI; `--pond` scopes it to one Pond line (`--major` picks the major, default: the Pond's highest deployed major; omit `--pond` for catchment-wide); `--on` is the event kinds (default `all`); `--stale` sets a freshness SLA (e.g. `1h`, `30m`) — required for `freshness` to fire; `--name` defaults to the scheme/scope. |
+| `alert add --to {uri} [--pond N [--major M]] [--on failure,…\|all] [--stale 1h] [--renotify 6h] [--name N]` | Add a channel. `--to` is an `https://`/`http://`/`mailto:` URI; `--pond` scopes it to one Pond line (`--major` picks the major, default: the Pond's highest deployed major; omit `--pond` for catchment-wide); `--on` is the event kinds (default `all`); `--stale` sets a freshness SLA (e.g. `1h`, `30m`) — required for `freshness` to fire; `--renotify` repeats the alert at that interval while the failure/staleness persists (default: once per episode); `--name` defaults to the scheme/scope. |
 | `alert ls` | List channels with their scope, events, SLA, and destination. |
 | `alert rm {name}` | Remove a channel. |
 | `alert test {name}` | Send a test notification through the channel (validates connectivity + credentials). |
 | `alert log [--limit N]` | Recent deliveries (channel, kind, pond, status, error) — the audit trail. |
 
-**Freshness is the headline.** A pipeline can be green with zero failures and still be *wrong* because nothing has refreshed it — a `--stale` channel is how you find out. A delivery failure never affects a Pond: it is retried and, if a channel stays broken, parked as `failed` in `alert log`, never cascaded. Channels are also managed from the web UI — a catchment-wide **Alerts** menu (beside 🔑 Secrets) and a per-Pond **Alerts** section in the sidebar. See also the Prometheus [`/metrics`](../guides/running-a-catchment.md#monitoring) endpoint.
+**Freshness is the headline.** A pipeline can be green with zero failures and still be *wrong* because nothing has refreshed it — a `--stale` channel is how you find out. By default a channel fires **once per episode** (and once on recovery); add `--renotify` if a webhook that fires once and then stays silently red for a week isn't enough — recovery still fires exactly once either way. A delivery failure never affects a Pond: it is retried and, if a channel stays broken, parked as `failed` in `alert log`, never cascaded. Channels are also managed from the web UI — a catchment-wide **Alerts** menu (beside 🔑 Secrets) and a per-Pond **Alerts** section in the sidebar. See also the Prometheus [`/metrics`](../guides/running-a-catchment.md#monitoring) endpoint.
 
 ## `duckstring control` — execution & health
 

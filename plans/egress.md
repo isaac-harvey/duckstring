@@ -3,7 +3,10 @@
 Status: **built** (the Spout construct as a real engine node, the `file://`/`s3://`/`gs://` snapshot
 drivers, the **incremental object-store mirror** (`mode=append` — the published collection reconciled
 by part name per delivery), the Postgres CDC driver, the egress worker, CLI/API/UI — the per-section
-Status lines below are current). Remaining: real-backend (MinIO/Postgres) CI e2es.
+Status lines below are current). The real-Postgres CDC e2e runs in CI (a postgres service +
+`DUCKSTRING_TEST_PG`). Remaining: a MinIO/s3 mirror e2e — blocked on an fsspec/httpfs *endpoint
+override* in `ObjectStorage`'s param mapping (today the s3 client can only target real AWS), a small
+storage.py addition.
 
 The OSS "last mile" — getting a Pond's output *out* of the Catchment and
 into the systems a team already runs (object storage, a transactional database), with a pluggable seam

@@ -104,7 +104,7 @@ Field notes:
 - `gen` / `runs_completed` — runs started / completed since the Catchment loaded.
 - `d_ms` — the Pond's window-derived freshness duration (0 without [Windows](../guides/windows.md)).
 - `trigger` — the standing trigger, e.g. `{"kind": "tide", "bound_ms": 14400000}`, or `null`.
-- The fault fields (`is_failed`, `is_blocked`, `is_killed`, `failed_f`, `failures`) and live budgets are described in [Fault Tolerance](../guides/fault-tolerance.md). When blocked, `missing_sources` (declared Sources absent from this Catchment, as `name@major`) and `blocked_by` (Sources that are themselves down) explain why; `error` carries a failed Pond's message.
+- The fault fields (`is_failed`, `is_blocked`, `is_killed`, `failed_f`, `failures`) and live budgets are described in [Fault Tolerance](../guides/fault-tolerance.md). When blocked, `missing_sources` (declared Sources absent from this Catchment, as `name@major`) and `blocked_by` (Sources that are themselves down) explain why; `error` carries a failed Pond's message, and `failure_kind` its sub-reason — `"contract"` when the Duck refused to publish a breaking schema change (last-good data intact; see [Versioning](../concepts/versioning.md)), `"error"` otherwise, `null` when healthy.
 - `catchment` — this Catchment's [stable identity](../guides/connecting-catchments.md#identity-and-the-lineage-view) `{id, name}`. `is_draw` marks a [Pond Draw](../guides/connecting-catchments.md) (fed by a duct, not run by a worker).
 - `edges` — the inter-Pond graph as `[source, sink]` pairs; `ripple_edges` the intra-Pond graph as `[parent, child]`.
 
@@ -193,8 +193,8 @@ All full-gated. A notification **channel** delivers failures and staleness to an
 
 | Endpoint | Description |
 |---|---|
-| `GET /api/alerts` | `{"channels": [{"name", "destination", "scope", "events", "stale_ms", "enabled", "created_at"}]}`. `scope` is a Pond name or `null` (catchment-wide). |
-| `POST /api/alerts` | Create a channel: `{"name", "destination", "scope"?, "events"?, "stale_ms"?}`. `destination` scheme ∈ `https/http/mailto`; `events` is a CSV of kinds or `all`; `stale_ms` sets a freshness SLA. `422` on a bad destination/event or duplicate name. |
+| `GET /api/alerts` | `{"channels": [{"name", "destination", "scope", "events", "stale_ms", "renotify_ms", "enabled", "created_at"}]}`. `scope` is a Pond name or `null` (catchment-wide). |
+| `POST /api/alerts` | Create a channel: `{"name", "destination", "scope"?, "events"?, "stale_ms"?, "renotify_ms"?}`. `destination` scheme ∈ `https/http/mailto`; `events` is a CSV of kinds or `all`; `stale_ms` sets a freshness SLA; `renotify_ms` repeats the alert at that interval while an episode persists (default: once per episode). `422` on a bad destination/event or duplicate name. |
 | `DELETE /api/alerts/{name}` | Remove a channel (`404` if absent). |
 | `POST /api/alerts/{name}/test` | Send a test notification (validates connectivity/credentials). Returns `{"ok": true}` or `{"ok": false, "error"}` — a connection problem is a `200` result, sanitised (never a credential). |
 | `GET /api/alerts/deliveries?limit=N` | Recent deliveries (`{"deliveries": [{"channel", "kind", "pond", "severity", "status", "attempts", "error", ...}]}`) — the audit log. |
