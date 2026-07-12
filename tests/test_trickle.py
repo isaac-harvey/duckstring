@@ -737,6 +737,42 @@ def test_agg_companion_published_and_resumable(tmp_path):
     snk.close()
 
 
+def test_sidecar_extension2_stats(tmp_path):
+    """State-format Extension 2: every published sidecar entry carries planner hints — ``stats``
+    ({rows, bytes, delta_rows_last}), a user-column ``schema`` map (system columns excluded), and
+    ``format: 2``. Hints only (the conformance differ ignores them); what a routing consumer
+    (``duckflock quote``) sizes a plan by without opening Parquet footers."""
+    con = duckdb.connect()
+    con.execute("SET TimeZone='UTC'")
+    d = tmp_path / "data"
+
+    # merge (2 rows), append (3 rows over 2 runs), overwrite (1 row)
+    T.merge_table(con, "m", con.sql("SELECT * FROM (VALUES (1,'a'),(2,'b')) t(id,v)"), ts(1), ("id",))
+    T.append_table(con, "a", con.sql("SELECT * FROM (VALUES (1,5),(2,6)) t(id,x)"), ts(1), ("id",))
+    con.execute("CREATE TABLE o AS SELECT 1 AS id, 'x' AS lbl")
+    publish(con, d, f=ts(1))
+    T.append_table(con, "a", con.sql("SELECT 3 AS id, 7 AS x"), ts(2), ("id",))
+    T.merge_table(con, "m", con.sql("SELECT * FROM (VALUES (1,'a'),(2,'B'),(3,'c')) t(id,v)"), ts(2), ("id",))
+    publish(con, d, f=ts(2))
+
+    sc = T.load_sidecar(d)
+    m, a, o = sc["m"], sc["a"], sc["o"]
+    assert m["format"] == a["format"] == o["format"] == 2
+    # rows = current state; delta_rows_last = this run's stamped rows (merge: changelog, append: base,
+    # overwrite: the whole rewrite).
+    assert m["stats"]["rows"] == 3
+    assert m["stats"]["delta_rows_last"] == 3  # 2's -1/+1 update + 3's insert
+    assert a["stats"]["rows"] == 3 and a["stats"]["delta_rows_last"] == 1
+    assert o["stats"]["rows"] == 1 and o["stats"]["delta_rows_last"] == 1
+    for e in (m, a, o):
+        assert e["stats"]["bytes"] > 0
+    # schema: user columns only, no _duckstring_* leakage.
+    assert set(m["schema"]) == {"id", "v"}
+    assert set(a["schema"]) == {"id", "x"}
+    assert o["schema"]["lbl"] == "VARCHAR"
+    con.close()
+
+
 def test_builder_filter_applies_to_delta_and_crosses_boundary(tmp_path):
     """`.filter()` distributes over the Z-set delta: a dimension change that pushes a row across the filter
     boundary inserts/retracts it incrementally (the old image passes/fails the filter on its own side)."""

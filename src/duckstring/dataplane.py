@@ -335,6 +335,7 @@ class ParquetDataPlane(DataPlane):
             if merge_mains:  # a checkpoint may have advanced f_base → refresh the sidecar
                 publish_plan(con, data_dir, f)
             _export_companions(con, data_dir, f)  # state-format Extension 1 (runs after the sidecar is final)
+            _enrich_sidecar(con, data_dir, f)     # state-format Extension 2 (stats/schema hints, best-effort)
 
         retry_on_lock(_export)
 
@@ -451,6 +452,91 @@ def _utc():
     from datetime import timezone
 
     return timezone.utc
+
+
+def _published_bytes(data_dir, table: str) -> int:
+    """Total published bytes backing ``table``'s current-state read — the wholesale file + per-run parts
+    + warm bands + changelog parts + cold base chunks. A planner size hint (mirrors the Rust driver's
+    ``published_bytes``)."""
+    from . import trickle_io as trickle
+
+    total = data_dir.size(f"{table}.parquet")
+    for t in (table, trickle.changelog_name(table), trickle.warm_name(table)):
+        for n in trickle.table_parts(data_dir, t):
+            total += data_dir.size(t, n)
+    base = trickle.base_dir_name(table)
+    for n in trickle.base_chunks(data_dir, table):
+        total += data_dir.size(base, n)
+    return total
+
+
+def _delta_rows_last(con, table: str, mode: str, f) -> int:
+    """This run's delta size: the count of rows stamped at ``f`` in the table's delta structure — the
+    merge **changelog**, the append **base**, or (overwrite) the whole rewrite."""
+    from . import trickle_io as trickle
+
+    if mode == "overwrite":
+        return int(con.execute(f'SELECT count(*) FROM "{table}"').fetchone()[0])
+    delta_table = trickle.changelog_name(table) if mode == "merge" else table
+    if f is None or not trickle._table_exists(con, delta_table):
+        return 0
+    return int(con.execute(
+        f'SELECT count(*) FROM "{delta_table}" WHERE "{trickle.F_COL}" = {trickle._ts(f)}'
+    ).fetchone()[0])
+
+
+def _entry_schema(con, table: str) -> dict | None:
+    """The user-column schema (name → DuckDB type) of a registry table, ``_duckstring_*`` system columns
+    excluded — described from the base table, or its changelog when no base relation exists (a young
+    merge main pre-checkpoint). ``None`` when neither exists."""
+    from . import trickle_io as trickle
+    from .trickle.context import SYSTEM_PREFIX
+
+    src = table
+    if not trickle._table_exists(con, src):
+        src = trickle.changelog_name(table)
+        if not trickle._table_exists(con, src):
+            return None
+    rel = con.sql(f'SELECT * FROM "{src}" LIMIT 0')
+    return {c: str(t) for c, t in zip(rel.columns, rel.types, strict=True) if not c.startswith(SYSTEM_PREFIX)}
+
+
+def _enrich_sidecar(con, data_dir, f) -> None:
+    """Stamp each sidecar entry with *state-format Extension 2* planner hints (see the DuckFlock
+    ``plans/state-format.md``, mirrored from the Rust driver's ``write_publish_sidecar``): per entry
+    ``stats: {rows, bytes, delta_rows_last}``, a user-column ``schema`` map, and ``format: 2``.
+
+    These are what let a routing/planning consumer (the ``duckflock quote`` client, the DuckFlock driver)
+    **estimate without opening Parquet footers** — hints, never load-bearing (footers stay the source of
+    truth; the conformance differ compares only the named ``mode/pk/floor/f/f_base`` fields, so the
+    extension is additive on the wire too). **Best-effort:** a failure to compute a hint never breaks a
+    publish — the entry just goes un-stamped."""
+    from . import trickle_io as trickle
+
+    data_dir = _as_storage(data_dir)
+    sidecar = trickle.load_sidecar(data_dir)
+    changed = False
+    for table, entry in sidecar.items():
+        if table in ("objects", "state") or not isinstance(entry, dict):
+            continue
+        mode = entry.get("mode", "overwrite")
+        try:
+            delta = _delta_rows_last(con, table, mode, f)
+            if mode == "overwrite":
+                rows = delta  # the whole rewrite is the current state
+            else:
+                rows = trickle.count_current(con, table) if mode == "merge" else int(
+                    con.execute(f'SELECT count(*) FROM "{table}"').fetchone()[0])
+            entry["stats"] = {"rows": rows, "bytes": _published_bytes(data_dir, table), "delta_rows_last": delta}
+            schema = _entry_schema(con, table)
+            if schema is not None:
+                entry["schema"] = schema
+            entry["format"] = 2
+            changed = True
+        except Exception:  # a hint, not a publish invariant
+            continue
+    if changed:
+        trickle.write_sidecar(data_dir, sidecar)
 
 
 def _compact_threshold(con=None, main=None) -> int:
