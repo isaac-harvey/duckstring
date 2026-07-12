@@ -1336,6 +1336,35 @@ def test_builder_append_spine_pk_fast_path(tmp_path, monkeypatch):
     snk.close()
 
 
+def test_builder_append_spine_pk_fast_path_same_f_replay(tmp_path):
+    """Regression: a same-``f`` replay of a spine-PK append run must be idempotent (an at-least-once host —
+    retries, DuckFlock's replay contract — re-executes an epoch). The bug: ``_new_spine_rows`` counted the
+    first attempt's own ``f``-stamped rows as history, so the replay ``DELETE(@f)`` dropped them and nothing
+    re-inserted them — silent loss of the epoch's rows. The prefilter now excludes rows stamped at ``f``."""
+    _cons, ol, pr = _star_sources(tmp_path)
+    snk = duckdb.connect(str(tmp_path / "snk.duckdb"))
+    snk_dir = tmp_path / "ponds" / "e" / "m1" / "data"
+
+    def run(f, pf):
+        _enriched(tmp_path, snk, snk_dir, f, pf, fail_on_conflict=False, log_drops=False)
+
+    ol([(10, "p1", 2), (11, "p2", 1)], ts(1))
+    pr([("p1", 5), ("p2", 9)], ts(1))
+    run(ts(1), NEVER)                                            # bootstrap
+    assert rows(snk, snk_dir, "enriched", "order_id, price") == [(10, 5), (11, 9)]
+
+    # A new spine row arrives at ts(2) — the first attempt appends order 12.
+    ol([(10, "p1", 2), (11, "p2", 1), (12, "p1", 3)], ts(2))
+    run(ts(2), ts(1))
+    single = rows(snk, snk_dir, "enriched", "order_id, price")
+    assert single == [(10, 5), (11, 9), (12, 5)]
+
+    # Replay the SAME epoch (same f/previous_f, same input) — must equal the single-run output, not drop it.
+    run(ts(2), ts(1))
+    assert rows(snk, snk_dir, "enriched", "order_id, price") == single
+    snk.close()
+
+
 # ─── .alias() / .sql() / .schema() (relational surface, Ibis-aligned) ────────────
 
 

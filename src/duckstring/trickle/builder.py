@@ -30,7 +30,18 @@ from __future__ import annotations
 import re
 
 from .context import SYSTEM_PREFIX
-from .io import D_COL, RESCAN_KINDS, _q, _table_exists, normalize_pk, read_meta, read_registry_delta, unique_name
+from .io import (
+    D_COL,
+    F_COL,
+    RESCAN_KINDS,
+    _q,
+    _table_exists,
+    _ts,
+    normalize_pk,
+    read_meta,
+    read_registry_delta,
+    unique_name,
+)
 
 _W = "_duckstring_w"  # scratch weight column for prior-state reconstruction (distinct from the Z-set D_COL)
 
@@ -645,7 +656,12 @@ class TrickleBuilder:
 
     def _new_spine_rows(self, spine_delta, name: str, out_pk):
         """The spine rows that arrived/changed this run whose (mapped) PK is **not yet** in the output
-        history — the only rows that can produce a new append row when the output is spine-PK keyed."""
+        history — the only rows that can produce a new append row when the output is spine-PK keyed.
+
+        The history prefilter **excludes rows stamped at the current run's ``f``** (this attempt's own
+        output on a same-``f`` replay): ``append_zset``'s replay ``DELETE(@f)`` then re-inserts the epoch's
+        rows, so counting them as history would drop them (silent data loss on any retried/replayed run —
+        first runs are unaffected because no ``f``-stamped output exists yet)."""
         con = self.ctx.con
         new = spine_delta.upserts
         smap = self._spine_pk_passthrough(out_pk, spine_delta.pk)
@@ -655,7 +671,10 @@ class TrickleBuilder:
         new.create_view(v, replace=True)
         spine_cols = ", ".join(_q(smap[p]) for p in out_pk)
         out_cols = ", ".join(_q(p) for p in out_pk)
-        return con.sql(f'SELECT * FROM {_q(v)} WHERE ({spine_cols}) NOT IN (SELECT {out_cols} FROM {_q(name)})')
+        return con.sql(
+            f'SELECT * FROM {_q(v)} WHERE ({spine_cols}) NOT IN '
+            f'(SELECT {out_cols} FROM {_q(name)} WHERE {_q(F_COL)} < {_ts(self.ctx.f)})'
+        )
 
     # ─── compute (the shared ΔO step behind .merge() and .append()) ───────────────
 
