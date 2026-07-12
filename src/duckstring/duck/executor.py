@@ -132,15 +132,31 @@ class RippleExecutor:
         # Object (non-tabular output) staging + own published location — see objects.py.
         self.staging_dir = pond_major_dir(root, pond_name, major) / STAGING_DIR
         self.own_data_dir = pond_data_dir(root, pond_name, major, data_root)
+        # Registry-loss recovery: the registry FILE is gone (host loss / migration / scale-to-zero)
+        # but published state survives → rebuild the registry from it (tiers + meta + the Extension-1
+        # agg/acc snapshots), so the next run resumes *incrementally* instead of re-bootstrapping.
+        # Deliberately keyed on the file's absence, NOT on an empty registry: a Refresh `wipe()` empties
+        # the file in place, and re-hydrating behind a wipe would defeat the cold rebuild.
+        recover = not self.registry_path.exists()
         # ONE registry instance for the Duck's life: ripples (and the export) each run on a `.cursor()`
         # off it. Separate `connect()`s to the same file in one process raise a "file handle conflict"
         # (a Binder error, not a transient lock) the moment two overlap — single instance avoids it.
         self._registry = duckdb.connect(str(self.registry_path))
+        if recover:
+            from ..dataplane import hydrate_registry
+
+            hydrated = hydrate_registry(self._registry, self.own_data_dir)
+            if hydrated:
+                print(f"[executor] registry file was missing — hydrated {len(hydrated)} table(s) "
+                      f"from the published state: {', '.join(hydrated)}", flush=True)
         self._cursor_lock = threading.Lock()
         # Which major line of each Source this Pond's reads resolve to (its pond.toml pins).
         sources = read_pond_toml(root / source_path).get("sources", {})
         self.source_majors = {sname: spec_major(spec) for sname, spec in sources.items()}
         self._pool = ThreadPoolExecutor(max_workers=max_workers)
+        # Set by wipe(), cleared by export(): the in-flight run is a Refresh (wipe-and-rebuild), so a
+        # DuckFlock-routed ripple must carry config.refresh (remote reads treat prior state as absent).
+        self._refresh_pending = False
 
     def _cursor(self):
         """A fresh connection sharing the one registry instance. Cursor creation is serialised; the
@@ -158,8 +174,24 @@ class RippleExecutor:
         timing: dict[str, datetime] = {}
 
         def _task():
+            from ..duckflock_backend import DuckflockConfig
+
             timing["started"] = datetime.now(timezone.utc)
             func = _load_ripple(self.source_path, str(self.root), ripple_name)
+            dfl = DuckflockConfig.from_env()
+            if dfl.enabled:
+                # DuckFlock routing (opt-in via DUCKSTRING_DUCKFLOCK_ENDPOINT): capture → quote →
+                # run locally or offload. route_ripple completes the ripple either way (every
+                # DuckFlock-side failure degrades to classic inside it) and hydrates a remote
+                # result back into the registry, so the rest of the run is path-identical.
+                from .duckflock_route import route_ripple
+
+                route_ripple(
+                    self, dfl, func, f, previous_f,
+                    sources_changed=sources_changed, skip_sink=skip_sink,
+                    refresh=self._refresh_pending,
+                )
+                return
             _run_ripple(
                 func, self.pond_name, self.version, self._cursor(), str(self.root),
                 self.source_majors, f, previous_f, self.data_root,
@@ -192,6 +224,7 @@ class RippleExecutor:
         # Objects commit only after the table publish passed the contract gate — a failed run leaves the
         # last-good Object intact (the staged writes are discarded on the next run / wipe).
         commit_objects(self.staging_dir, self.own_data_dir, f)
+        self._refresh_pending = False  # the rebuild published — subsequent runs are normal again
         return schema
 
     def wipe(self) -> None:
@@ -218,6 +251,7 @@ class RippleExecutor:
                 cur.close()
 
         retry_on_lock(_drop)
+        self._refresh_pending = True  # the next run is the rebuild — routed ripples carry config.refresh
         import shutil
 
         shutil.rmtree(self.staging_dir, ignore_errors=True)  # discard any uncommitted staged Objects

@@ -539,6 +539,83 @@ def _enrich_sidecar(con, data_dir, f) -> None:
         trickle.write_sidecar(data_dir, sidecar)
 
 
+def hydrate_registry(con, data_dir, tables=None) -> list[str]:
+    """Rebuild registry state **from the published layout** — the recovery inverse of :meth:`export`
+    (mirrors the DuckFlock driver's ``hydrate_output``; full-collection, because export mirrors the
+    registry back and a part left unhydrated would be pruned as retention-dropped).
+
+    For each sidecar base entry (or just ``tables`` when given): the base/main (overwrite wholesale file;
+    append parts; a merge main's cold base chunks), the ``__changelog`` / ``__band`` / ``__droplog``
+    companion parts, the meta row (mode/pk/floor from the sidecar; ``f_base`` from the sidecar;
+    ``f_warm`` from the newest published band's part name), and the *state-format Extension 1*
+    agg/acc accumulator snapshots (``state/{agg|acc}/{table}/``). Tables are ``CREATE OR REPLACE``d,
+    so hydration is idempotent and safe over a partially-present registry.
+
+    Two callers: **Duck registry-loss recovery** (the registry *file* is gone — host loss, migration,
+    scale-to-zero — but the published state survives; see ``RippleExecutor``) and the **DuckFlock
+    routing path** (a remotely-executed ripple's outputs land in a scratch publish dir and are read
+    back so the run's normal export + contract gate + downstream ripples see them). Returns the
+    hydrated base-table names."""
+    from . import trickle_io as trickle
+
+    store = _as_storage(data_dir)
+    plane = ParquetDataPlane()  # hydration reads the flat layer (every backend also writes it)
+    sidecar = trickle.load_sidecar(store)
+    hydrated: list[str] = []
+    for table, entry in sidecar.items():
+        if table in ("objects", "state") or not isinstance(entry, dict):
+            continue
+        if tables is not None and table not in tables:
+            continue
+        mode = entry.get("mode", "overwrite")
+        loaded = False
+        if mode == "merge":
+            # The registry main is the COLD BASE (a young merge main pre-checkpoint has none) —
+            # never the reconstruction; reconstruct happens at read time over base ⊎ changelog.
+            if trickle.base_chunks(store, table) or store.exists(f"{table}.parquet"):
+                sql = plane._raw_read_select(store, table)
+                con.execute(f'CREATE OR REPLACE TABLE {trickle._q(table)} AS {sql}')
+                loaded = True
+        else:  # append parts dir, or the overwrite wholesale file
+            if trickle.table_parts(store, table) or store.exists(f"{table}.parquet"):
+                sql = plane._raw_read_select(store, table)
+                con.execute(f'CREATE OR REPLACE TABLE {trickle._q(table)} AS {sql}')
+                loaded = True
+        for companion in (trickle.changelog_name(table), trickle.warm_name(table),
+                          f"{table}{trickle.DROPLOG_SUFFIX}"):
+            if trickle.table_parts(store, companion):
+                sql = plane._raw_read_select(store, companion)
+                con.execute(f'CREATE OR REPLACE TABLE {trickle._q(companion)} AS {sql}')
+                loaded = True
+        if mode in ("merge", "append") and loaded:
+            from datetime import datetime
+
+            trickle._record_meta(con, table, mode, tuple(entry.get("pk") or ()))
+            if entry.get("floor"):
+                trickle._advance_floor(con, table, bootstrap_f=datetime.fromisoformat(entry["floor"]))
+            if entry.get("f_base"):
+                trickle._set_f_base(con, table, datetime.fromisoformat(entry["f_base"]))
+            band_fs = [trickle.part_f(n) for n in trickle.table_parts(store, trickle.warm_name(table))]
+            f_warm = max(band_fs) if band_fs else (
+                datetime.fromisoformat(entry["f_base"]) if entry.get("f_base") else None)
+            if f_warm is not None:
+                trickle._set_f_warm(con, table, f_warm)
+        # Extension 1: the agg/acc accumulator snapshots (latest snapshot per companion).
+        for kind, prefix in (("agg", trickle.AGG_STATE_PREFIX), ("acc", trickle.ACC_STATE_PREFIX)):
+            snap_store = store.child("state", kind, table)
+            snaps = snap_store.parquet_names()
+            if snaps:
+                uri = snap_store.uri(snaps[-1])
+                con.execute(
+                    f'CREATE OR REPLACE TABLE {trickle._q(prefix + table)} AS '
+                    f"SELECT * FROM read_parquet('{uri}')"
+                )
+                loaded = True
+        if loaded:
+            hydrated.append(table)
+    return hydrated
+
+
 def _compact_threshold(con=None, main=None) -> int:
     """The checkpoint floor / target base-chunk size in bytes. A merge main checkpoints when its
     changelog-since-the-fold-watermark outgrows ``max(base size, this)`` — so it never checkpoints below

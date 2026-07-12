@@ -82,13 +82,15 @@ class Outcome:
     (quoted local), ``duckflock`` (submitted, succeeded), ``duckflock->classic`` (submitted-then-fell-
     back), ``quote->classic`` (quote failed → classic). ``executed_locally`` is True whenever the
     ripple ran on duckstring's own engine this call; ``ripple_result`` is what the ripple function
-    returned in that case; ``result_doc`` is the DuckFlock job result when the remote path succeeded."""
+    returned in that case; ``result_doc`` is the DuckFlock job result when the remote path succeeded;
+    ``plan`` is the captured plan document (present whenever capture succeeded)."""
 
     route: str
     executed_locally: bool
     ripple_result: object = None
     result_doc: dict | None = None
     quote: dict | None = None
+    plan: dict | None = None
     warnings: list[str] = field(default_factory=list)
 
 
@@ -102,11 +104,12 @@ def _iso(dt) -> str:
 
 
 def build_plan(pond, run_python, *, source_catalog, own_location: str, tenant: str, major: int,
-               job_id: str, express_root: str | None = None) -> dict:
+               job_id: str, express_root: str | None = None, refresh: bool = False) -> dict:
     """Capture ``run_python`` into the full ``duckflock_plan: 1`` document for ``pond``'s current epoch.
-    Raises :class:`~duckstring.trickle.capture.NonCapturable` for a ripple the recorder can't express."""
+    Raises :class:`~duckstring.trickle.capture.NonCapturable` for a ripple the recorder can't express.
+    ``refresh`` marks a wipe-and-rebuild run (DuckFlock treats every read as bootstrap)."""
     body = capture_plan(run_python, source_catalog=source_catalog, own_location=own_location)
-    cfg = {"refresh": False, "keep_warm_ttl_s": 0, "limits": {}}
+    cfg = {"refresh": bool(refresh), "keep_warm_ttl_s": 0, "limits": {}}
     if express_root is not None:
         cfg["express_location"] = express_root
     return envelope(
@@ -176,12 +179,15 @@ def _http_json(url: str, *, data: bytes | None = None, headers: dict | None = No
 
 
 def execute(config: DuckflockConfig, pond, run_python, *, source_catalog, own_location: str = "__OWN__",
-            job_id: str | None = None, quote_fn=None, submit_fn=None) -> Outcome:
+            job_id: str | None = None, quote_fn=None, submit_fn=None, prepare_remote=None,
+            refresh: bool = False) -> Outcome:
     """Route and run ``run_python`` for ``pond``'s current epoch. ``source_catalog(ref) ->
     {location, mode, pk, floor, f}`` supplies each source's storage facts (see
     :func:`duckstring.trickle.capture.capture_plan`). ``quote_fn``/``submit_fn`` default to the
-    ``duckflock`` CLI / HTTP API and are injectable for testing. Never raises for a DuckFlock-side
-    problem — it degrades to classic local execution with a warning."""
+    ``duckflock`` CLI / HTTP API and are injectable for testing. ``prepare_remote(plan)`` runs just
+    before a submit (the executor's seam for seeding the outputs' prior published state into the
+    plan's own location); its failure falls back like any other remote failure. Never raises for a
+    DuckFlock-side problem — it degrades to classic local execution with a warning."""
     quote_fn = quote_fn or default_quote
     submit_fn = submit_fn or default_submit
 
@@ -193,7 +199,7 @@ def execute(config: DuckflockConfig, pond, run_python, *, source_catalog, own_lo
         plan = build_plan(
             pond, run_python, source_catalog=source_catalog, own_location=own_location,
             tenant=config.tenant, major=config.major, job_id=job_id or _job_id(pond),
-            express_root=config.express_root,
+            express_root=config.express_root, refresh=refresh,
         )
     except NonCapturable as exc:
         return _classic(pond, run_python, "classic", _warn(warnings, f"ripple not capturable ({exc}) — running classic"))
@@ -203,24 +209,72 @@ def execute(config: DuckflockConfig, pond, run_python, *, source_catalog, own_lo
     except Exception as exc:  # a broken/absent quoter must never take the pond down — route local
         _warn(warnings, f"duckflock quote failed ({exc}) — routing local")
         out = _classic(pond, run_python, "quote->classic", warnings)
+        out.plan = plan
         return out
 
     route = (quote or {}).get("route", "duckflock")
     if route != "duckflock":
         out = _classic(pond, run_python, "local", warnings)
         out.quote = quote
+        out.plan = plan
         return out
 
     try:
+        if prepare_remote is not None:
+            prepare_remote(plan)
         doc = submit_fn(plan, config)
         if doc.get("status") == "success":
-            return Outcome("duckflock", executed_locally=False, result_doc=doc, quote=quote, warnings=warnings)
+            return Outcome("duckflock", executed_locally=False, result_doc=doc, quote=quote,
+                           plan=plan, warnings=warnings)
         _warn(warnings, f"duckflock job did not succeed ({doc.get('status')}: {doc.get('error')}) — falling back to classic")
     except Exception as exc:
         _warn(warnings, f"duckflock submit failed ({exc}) — falling back to classic")
     out = _classic(pond, run_python, "duckflock->classic", warnings)
     out.quote = quote
+    out.plan = plan
     return out
+
+
+def seed_scratch(own_dir, scratch, outputs) -> None:
+    """Seed a routed run's **scratch publish dir** with each output's prior published collections, so the
+    remote engine hydrates the same prior state a long-lived registry would hold. Copies only the output
+    tables' tiers (wholesale file / parts / ``__changelog`` / ``__band`` / ``__base`` / ``__droplog`` /
+    the Extension-1 ``state/`` snapshots) plus a sidecar filtered to those entries — proportional to the
+    output, not the pond. The scratch dir is recreated from empty each call (a stale seed would replay).
+
+    Why a scratch dir at all: DuckFlock publishes as it completes, but a classic Pond Run publishes
+    **once, at run end, behind the contract gate**. Routing an individual ripple straight at the real
+    data dir would make its output visible mid-run (and skip the gate); instead the remote job publishes
+    to scratch, the executor hydrates scratch back into the registry, and the run's normal export ships
+    it with everything else."""
+    import shutil
+    from pathlib import Path
+
+    from . import trickle_io as trickle
+
+    own_dir, scratch = Path(own_dir), Path(scratch)
+    shutil.rmtree(scratch, ignore_errors=True)
+    scratch.mkdir(parents=True, exist_ok=True)
+    sidecar = trickle.load_sidecar(own_dir)
+    keep: dict = {}
+    for t in outputs:
+        if (own_dir / f"{t}.parquet").exists():
+            shutil.copy2(own_dir / f"{t}.parquet", scratch / f"{t}.parquet")
+        for d in (t, trickle.changelog_name(t), trickle.warm_name(t),
+                  trickle.base_dir_name(t), f"{t}{trickle.DROPLOG_SUFFIX}"):
+            if (own_dir / d).is_dir():
+                shutil.copytree(own_dir / d, scratch / d)
+        for kind in ("agg", "acc"):
+            p = own_dir / "state" / kind / t
+            if p.is_dir():
+                shutil.copytree(p, scratch / "state" / kind / t)
+        if t in sidecar:
+            keep[t] = sidecar[t]
+    state = {k: v for k, v in (sidecar.get("state") or {}).items() if k.split("/", 1)[1] in set(outputs)}
+    if state:
+        keep["state"] = state
+    if keep:
+        trickle.write_sidecar(scratch, keep)
 
 
 def _classic(pond, run_python, route: str, warnings: list[str]) -> Outcome:

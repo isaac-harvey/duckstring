@@ -233,6 +233,187 @@ def test_config_from_env_defaults_disabled(monkeypatch):
     assert cfg.enabled and cfg.tenant == "acme" and cfg.major == 3
 
 
+# ─── the Duck executor routing hook (duck/duckflock_route.py) ────────────────────
+
+
+def _executor(tmp_path, name="o"):
+    """A RippleExecutor over a minimal deployed source tree (root = tmp_path)."""
+    from duckstring.duck.executor import RippleExecutor
+
+    src_dir = tmp_path / "sources" / name
+    (src_dir / "src").mkdir(parents=True, exist_ok=True)
+    (src_dir / "pond.toml").write_text(f'[pond]\nname = "{name}"\nversion = "1.0.0"\n[sources]\nsrc = "1"\n')
+    (src_dir / "src" / "pond.py").write_text("")
+    return RippleExecutor(name, 1, "1.0.0", f"sources/{name}", tmp_path)
+
+
+def _fake_remote_submit(tmp_path):
+    """A submit seam that behaves like the DuckFlock driver: hydrate the plan's own location (the
+    scratch seed = prior state), run the ripple's semantics against it, publish back to scratch."""
+    from datetime import datetime
+
+    from duckstring.dataplane import hydrate_registry
+
+    def submit(plan, config):
+        scratch = Path(next(e["location"] for e in plan["catalog"].values() if "duckflock_scratch" in e["location"]))
+        rcon = duckdb.connect()
+        rcon.execute("SET TimeZone='UTC'")
+        if not plan["config"]["refresh"]:
+            hydrate_registry(rcon, scratch)
+        p = Pond(plan["pond"]["name"], plan["pond"]["version"], rcon, root=tmp_path,
+                 source_majors={"src": 1},
+                 f=datetime.fromisoformat(plan["epoch"]["f"]),
+                 previous_f=datetime.fromisoformat(plan["epoch"]["previous_f"]))
+        result = _run_python(p)
+        ParquetDataPlane().export(rcon, scratch, f=p.f)
+        rcon.close()
+        return {"status": "success",
+                "statements": [{"output": o, "changed": bool(c)} for o, c in result]}
+
+    return submit
+
+
+def test_route_ripple_remote_two_epochs_matches_classic(tmp_path):
+    """The executor routing round-trip: seed scratch with prior state → 'remote' execution → publish to
+    scratch → hydrate back into the registry → the run-end export ships it. Two epochs (the second
+    incremental over the first's hydrated state) match classic execution exactly."""
+    from duckstring.duck.duckflock_route import route_ripple
+
+    _, _sc = _publish_source(tmp_path, "SELECT * FROM (VALUES (1,'a'),(2,'b')) t(id,v)", ts(1))
+    ex = _executor(tmp_path)
+    cfg = DuckflockConfig(endpoint="http://fake", tenant="t")
+    quote = lambda p, c: {"route": "duckflock"}  # noqa: E731
+    submit = _fake_remote_submit(tmp_path)
+
+    out1 = route_ripple(ex, cfg, _run_python, ts(1), NEVER, quote_fn=quote, submit_fn=submit)
+    assert out1.route == "duckflock" and not out1.executed_locally
+    ex.export(f=ts(1))  # the normal run-end publish ships the hydrated result
+
+    _publish_source(tmp_path, "SELECT * FROM (VALUES (1,'a'),(2,'B'),(3,'c')) t(id,v)", ts(2))
+    out2 = route_ripple(ex, cfg, _run_python, ts(2), ts(1), quote_fn=quote, submit_fn=submit)
+    assert out2.route == "duckflock"
+    ex.export(f=ts(2))
+
+    con = duckdb.connect()
+    con.execute("SET TimeZone='UTC'")
+    sql = ParquetDataPlane().read_select(tmp_path / "ponds" / "o" / "m1" / "data", "out")
+    got = sorted(con.sql(f"SELECT id, v FROM ({sql})").fetchall())
+    assert got == [(1, "a"), (2, "B"), (3, "c")]
+    # the registry holds the hydrated Trickle collection (downstream ripples/export see it as local)
+    import duckstring.trickle_io as T
+
+    assert T.read_meta(ex._registry).get("out", {}).get("mode") == "merge"
+    assert not (tmp_path / "ponds" / "o" / "m1" / "duckflock_scratch").exists()  # cleaned after hydrate
+    con.close()
+    ex.shutdown()
+
+    # classic reference over the same two epochs
+    ref = tmp_path / "ref"
+    _publish_source(ref, "SELECT * FROM (VALUES (1,'a'),(2,'b')) t(id,v)", ts(1))
+    p1 = _sink(ref, ts(1), NEVER)
+    _run_python(p1)
+    ParquetDataPlane().export(p1.con, ref / "ponds" / "o" / "m1" / "data", f=ts(1))
+    _publish_source(ref, "SELECT * FROM (VALUES (1,'a'),(2,'B'),(3,'c')) t(id,v)", ts(2))
+    p2 = Pond("o", "1.0.0", p1.con, root=ref, source_majors={"src": 1}, f=ts(2), previous_f=ts(1))
+    _run_python(p2)
+    ParquetDataPlane().export(p2.con, ref / "ponds" / "o" / "m1" / "data", f=ts(2))
+    rcon = duckdb.connect()
+    rcon.execute("SET TimeZone='UTC'")
+    ref_sql = ParquetDataPlane().read_select(ref / "ponds" / "o" / "m1" / "data", "out")
+    assert sorted(rcon.sql(f"SELECT id, v FROM ({ref_sql})").fetchall()) == got
+    rcon.close()
+    p1.con.close()
+
+
+def test_route_ripple_remote_failure_runs_classic_on_registry(tmp_path):
+    """A remote failure inside the routed path still completes the ripple classically ON THE EXECUTOR'S
+    REGISTRY — the run continues as if routing never existed."""
+    from duckstring.duck.duckflock_route import route_ripple
+
+    _publish_source(tmp_path, "SELECT 1 AS id, 'a' AS v", ts(1))
+    ex = _executor(tmp_path)
+    out = route_ripple(
+        ex, DuckflockConfig(endpoint="http://fake"), _run_python, ts(1), NEVER,
+        quote_fn=lambda p, c: {"route": "duckflock"},
+        submit_fn=lambda p, c: (_ for _ in ()).throw(ConnectionError("down")),
+    )
+    assert out.route == "duckflock->classic" and out.executed_locally
+    ex.export(f=ts(1))
+    con = duckdb.connect()
+    con.execute("SET TimeZone='UTC'")
+    sql = ParquetDataPlane().read_select(tmp_path / "ponds" / "o" / "m1" / "data", "out")
+    assert sorted(con.sql(f"SELECT id, v FROM ({sql})").fetchall()) == [(1, "a")]
+    con.close()
+    ex.shutdown()
+
+
+def test_route_ripple_refresh_carries_flag_and_empty_seed(tmp_path):
+    """After a wipe (a Refresh run), a routed plan carries config.refresh and the scratch seed is
+    EMPTY — the remote engine must treat prior state as absent, mirroring the local cold rebuild."""
+    from duckstring.duck.duckflock_route import route_ripple
+
+    _publish_source(tmp_path, "SELECT 1 AS id, 'a' AS v", ts(1))
+    ex = _executor(tmp_path)
+    quote = lambda p, c: {"route": "duckflock"}  # noqa: E731
+    submit = _fake_remote_submit(tmp_path)
+    route_ripple(ex, DuckflockConfig(endpoint="http://fake"), _run_python, ts(1), NEVER,
+                 quote_fn=quote, submit_fn=submit)
+    ex.export(f=ts(1))
+    ex.wipe()
+    assert ex._refresh_pending
+
+    seen = {}
+
+    def spy_submit(plan, config):
+        scratch = Path(next(e["location"] for e in plan["catalog"].values()
+                            if "duckflock_scratch" in e["location"]))
+        seen["refresh"] = plan["config"]["refresh"]
+        seen["seeded"] = sorted(p.name for p in scratch.iterdir()) if scratch.exists() else []
+        return submit(plan, config)
+
+    route_ripple(ex, DuckflockConfig(endpoint="http://fake"), _run_python, ts(2), NEVER,
+                 refresh=ex._refresh_pending, quote_fn=quote, submit_fn=spy_submit)
+    assert seen["refresh"] is True
+    assert seen["seeded"] == []  # no prior state shipped to a refresh run
+    ex.export(f=ts(2))
+    assert not ex._refresh_pending  # cleared once the rebuild published
+    ex.shutdown()
+
+
+def test_executor_submit_routes_when_enabled(tmp_path, monkeypatch):
+    """The executor's _task branches to route_ripple iff DUCKSTRING_DUCKFLOCK_ENDPOINT is set."""
+    import duckstring.duck.duckflock_route as dr
+    import duckstring.duck.executor as exmod
+
+    _publish_source(tmp_path, "SELECT 1 AS id, 'a' AS v", ts(1))
+    ex = _executor(tmp_path)
+    monkeypatch.setattr(exmod, "_load_ripple", lambda *a: _run_python)
+    calls = []
+
+    def spy_route(e, cfg, func, f, pf, **kw):
+        calls.append(cfg.endpoint)
+        func_con = e._cursor()
+        try:
+            func(Pond("o", "1.0.0", func_con, root=tmp_path, source_majors={"src": 1}, f=f, previous_f=pf))
+        finally:
+            func_con.close()
+
+    monkeypatch.setattr(dr, "route_ripple", spy_route)
+
+    done, err = [], []
+    monkeypatch.delenv("DUCKSTRING_DUCKFLOCK_ENDPOINT", raising=False)
+    ex.submit("r", ts(1), NEVER, lambda *a: done.append(a), lambda *a: err.append(a)).result()
+    assert not calls and not err  # disabled → classic, no routing
+
+    monkeypatch.setenv("DUCKSTRING_DUCKFLOCK_ENDPOINT", "http://fake")
+    ex.submit("r", ts(2), ts(1), lambda *a: done.append(a), lambda *a: err.append(a)).result()
+    import time
+
+    time.sleep(0.05)  # let the done-callback fire
+    assert calls == ["http://fake"] and not err
+    ex.shutdown()
+
+
 # ─── gated end-to-end against the REAL duckflock binary (the conformance property) ──
 
 
