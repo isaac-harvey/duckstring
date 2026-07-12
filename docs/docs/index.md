@@ -1,14 +1,14 @@
 ---
 title: Introduction
-description: Duckstring treats data transformations as software packages. There is no DAG.
+description: Duckstring is a Python framework for data pipelines where every transform is a versioned package.
 slug: /intro
 ---
 
 # Duckstring
 
-*There is no DAG.*
+Duckstring is a Python framework for data pipelines in which every transform is a **versioned package**. Each transform declares its parents the way `pyproject.toml` declares dependencies, and Duckstring resolves the execution graph, runs it on demand, and recomputes only what changed.
 
-Duckstring is built on a single observation: data transformations have the same dependency structure as software packages. If you version each transform and let it declare its parents — the same way `pyproject.toml` declares dependencies — the execution DAG forms itself. What you get is independent deployment, automatic version compatibility routing, and a pipeline that runs at optimal parallelism without a scheduler you have to think about.
+It's built on a single observation: data transformations have the same dependency structure as software packages. Version each transform and let it declare what it consumes, and you get independent deployment, automatic version compatibility routing, and a pipeline that runs at optimal parallelism without a scheduler you have to think about.
 
 ## The problem
 
@@ -50,6 +50,8 @@ flowchart LR
 ```
 
 Execution is **freshness-based**, not schedule-based. Instead of cron expressions and DAG runs, every node carries a freshness timestamp and demand flows through the graph like Kanban signals: pull demand propagates upstream and naturally throttles the whole pipeline to its bottleneck; push demand drives a target to a given freshness. [Theory](theory.md) covers the full model.
+
+*There is no DAG.*
 
 ## Vocabulary
 

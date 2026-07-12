@@ -1,5 +1,6 @@
 # Duckstring
-*There is no DAG.*
+
+Build data pipelines the way you build software: version each transform, declare its dependencies, and Duckstring resolves the execution DAG automatically.
 
 Duckstring treats data transformations as software packages. Upstream dependencies are declared per Pond (unit operation), defining the DAG without the need for its direct management. 
 
@@ -62,6 +63,8 @@ Ponds execute on demand signals sent to an Outlet, in two flavours — **push** 
 | **Pull** | Tap | Wave |
 
 A Tide keeps an Outlet no staler than a bound (`duckstring trigger tide reports 1d`); a Wave keeps it as fresh as the pipeline can supply. See [Triggers](https://docs.duckstring.com/guides/triggers) for the full semantics.
+
+*There is no DAG.*
 
 ## Going further
 
