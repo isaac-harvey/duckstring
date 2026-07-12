@@ -679,6 +679,64 @@ def test_agg_count_metric_is_incremental(tmp_path):
     snk.close()
 
 
+def test_agg_companion_published_and_resumable(tmp_path):
+    """State-format Extension 1: an incremental ``.aggregate()`` publishes its registry accumulator
+    companion (``_duckstring_agg_{table}``) as a snapshot under ``state/agg/{table}/{f}.parquet`` — the
+    published form a registry-less host (DuckFlock) or a Duck recovering from registry loss hydrates to
+    resume incremental compute. Round-trip: the snapshot is byte-faithful to the registry companion, the
+    sidecar records it, only the latest snapshot is kept, it stays hidden from the read surface, and
+    hydrating it into a fresh registry reproduces the exact accumulator state (identical resumption)."""
+    from duckstring import agg
+
+    f_con, f_dir = _producer(tmp_path, "fact")
+    snk = duckdb.connect(str(tmp_path / "snk.duckdb"))
+    snk_dir = tmp_path / "ponds" / "o" / "m1" / "data"
+
+    def run(f, pf):
+        p = Pond("o", "1.0.0", snk, root=tmp_path, source_majors={"fact": 1}, f=f, previous_f=pf)
+        p.trickle("fact.f").aggregate(by="k", mn=agg.min("v"), n=agg.count()).merge("by_k", pk="k")
+        publish(snk, snk_dir, f=f)
+
+    T.merge_table(f_con, "f", f_con.sql("SELECT * FROM (VALUES (1,10,'A'),(2,20,'A'),(3,5,'B')) v(id,v,k)"),
+                  ts(1), ("id",))
+    publish(f_con, f_dir, f=ts(1))
+    run(ts(1), NEVER)
+
+    # The companion snapshot exists at state/agg/by_k/{f1}.parquet and equals the registry companion verbatim.
+    snap1 = snk_dir / "state" / "agg" / "by_k" / T.part_name(ts(1))
+    assert snap1.exists()
+    reg_rows = snk.sql('SELECT * FROM "_duckstring_agg_by_k" ORDER BY k').fetchall()
+    snap_rows = snk.sql(f"SELECT * FROM read_parquet('{snap1}') ORDER BY k").fetchall()
+    assert snap_rows == reg_rows
+    assert T.load_sidecar(snk_dir)["state"] == {"agg/by_k": {"f": ts(1).isoformat()}}
+    # Hidden from the read surface: the companion isn't a listed/readable table.
+    assert "_duckstring_agg_by_k" not in ParquetDataPlane().list_tables(snk_dir)
+    assert "by_k" in ParquetDataPlane().list_tables(snk_dir)
+
+    # Epoch 2: the snapshot rolls forward and the previous one is pruned (snapshot, not log, semantics).
+    T.merge_table(f_con, "f", f_con.sql("SELECT * FROM (VALUES (1,10,'A'),(3,5,'B'),(4,1,'B')) v(id,v,k)"),
+                  ts(2), ("id",))
+    publish(f_con, f_dir, f=ts(2))
+    run(ts(2), ts(1))
+    kept = sorted(p.name for p in (snk_dir / "state" / "agg" / "by_k").glob("*.parquet"))
+    assert kept == [T.part_name(ts(2))]  # only the latest snapshot survives
+    assert T.load_sidecar(snk_dir)["state"] == {"agg/by_k": {"f": ts(2).isoformat()}}
+    persistent = rows(snk, snk_dir, "by_k", "k, mn, n")
+    assert persistent == [("A", 10, 1), ("B", 1, 2)]
+
+    # Hydrate the (surviving) epoch-2 companion snapshot into a *fresh* registry and confirm it reproduces
+    # the registry accumulator state bit-for-bit — the resumption-sufficiency property DuckFlock relies on.
+    snap2 = snk_dir / "state" / "agg" / "by_k" / T.part_name(ts(2))
+    reg2 = snk.sql('SELECT * FROM "_duckstring_agg_by_k" ORDER BY k').fetchall()
+    fresh = duckdb.connect()
+    fresh.execute("SET TimeZone='UTC'")
+    fresh.execute(f'CREATE TABLE "_duckstring_agg_by_k" AS SELECT * FROM read_parquet(\'{snap2}\')')
+    hydrated = fresh.sql('SELECT * FROM "_duckstring_agg_by_k" ORDER BY k').fetchall()
+    assert hydrated == reg2
+    fresh.close()
+    snk.close()
+
+
 def test_builder_filter_applies_to_delta_and_crosses_boundary(tmp_path):
     """`.filter()` distributes over the Z-set delta: a dimension change that pushes a row across the filter
     boundary inserts/retracts it incrementally (the old image passes/fails the filter on its own side)."""

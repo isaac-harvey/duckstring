@@ -334,6 +334,7 @@ class ParquetDataPlane(DataPlane):
                 _publish_tiered_main(con, data_dir, main, f)
             if merge_mains:  # a checkpoint may have advanced f_base → refresh the sidecar
                 publish_plan(con, data_dir, f)
+            _export_companions(con, data_dir, f)  # state-format Extension 1 (runs after the sidecar is final)
 
         retry_on_lock(_export)
 
@@ -393,6 +394,63 @@ def _export_parts(con, data_dir, table: str, f) -> None:
     for fi, name in existing.items():  # drop parts the registry no longer retains (or the superseded marker)
         if fi not in reg_fs:
             part_store.remove(name)
+
+
+def _export_companions(con, data_dir, f) -> None:
+    """Publish the registry aggregate/accumulate **state companions** as *state-format Extension 1*
+    snapshots (see ``plans/state-format.md`` — the DuckFlock consumer's normative layout, mirrored by
+    the Rust driver's ``publish_companions``).
+
+    Incremental ``.aggregate()`` / ``.accumulate()`` keep their cross-run fold state in registry-only
+    companion tables (``_duckstring_agg_{table}`` / ``_duckstring_acc_{table}``). A registry-less host
+    (or a Duck recovering from registry loss) can only resume incremental compute if that state is
+    published, so each run writes one **whole-companion snapshot** to::
+
+        {data_dir}/state/{agg|acc}/{table}/{f}.parquet
+
+    Snapshot (not log) semantics: the previous snapshot is pruned after the sidecar commit — exactly the
+    latest per companion is kept (companions are one-row-per-group; a table that outgrows snapshotting has
+    outgrown accumulate/aggregate). The snapshots live under ``state/`` so ``read_table`` / ``/api/data``
+    globs never expose them (the reserved-prefix rule already hides the registry versions). Listed in the
+    sidecar's ``state`` section as ``{"agg/{table}": {"f": …}, …}`` so a reader pairs the companion at a
+    freshness with the main at the same freshness. Additive: no existing read path changes."""
+    from . import trickle_io as trickle
+
+    if f is None:  # a snapshot is stamped with the run freshness; nothing to key an f-named part on
+        return
+    data_dir = _as_storage(data_dir)
+    f_iso = f.astimezone(_utc()).isoformat()
+    written: list[tuple[str, str, str]] = []  # (kind, table, kept part name)
+    state_section: dict[str, dict] = {}
+    for base in trickle.read_meta(con):
+        for prefix, kind in ((trickle.AGG_STATE_PREFIX, "agg"), (trickle.ACC_STATE_PREFIX, "acc")):
+            reg = f"{prefix}{base}"
+            if not trickle._table_exists(con, reg):
+                continue
+            if con.execute(f'SELECT count(*) FROM "{reg}"').fetchone()[0] == 0:
+                continue
+            store = data_dir.child("state", kind, base)
+            store.mkdir()
+            part = trickle.part_name(f)
+            with store.copy_to(part) as uri:
+                con.execute(f'COPY (SELECT * FROM "{reg}") TO \'{uri}\' (FORMAT PARQUET)')
+            state_section[f"{kind}/{base}"] = {"f": f_iso}
+            written.append((kind, base, part))
+    if state_section:  # record the snapshots in the sidecar's `state` section (skipped by read/diff surfaces)
+        sidecar = trickle.load_sidecar(data_dir)
+        sidecar["state"] = state_section
+        trickle.write_sidecar(data_dir, sidecar)
+    for kind, base, keep in written:  # prune superseded snapshots — keep exactly the latest per companion
+        store = data_dir.child("state", kind, base)
+        for old in store.parquet_names():
+            if old != keep:
+                store.remove(old)
+
+
+def _utc():
+    from datetime import timezone
+
+    return timezone.utc
 
 
 def _compact_threshold(con=None, main=None) -> int:
