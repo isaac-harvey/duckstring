@@ -37,7 +37,8 @@ def test_get_egress_resolves_file_driver():
     drv = get_egress("file:///tmp/out")
     caps = drv.capabilities()
     assert isinstance(caps, Capabilities)
-    assert caps == Capabilities(supports_delta=False, supports_delete=False, transactional=False)
+    assert caps == Capabilities(supports_delta=False, supports_delete=False, transactional=False,
+                                mirrors_layout=True)
 
 
 def test_get_egress_rejects_unknown_scheme_and_resolves_known():
@@ -396,3 +397,108 @@ def test_egress_spout_specific_table(tmp_path):
     _egress_spout(tmp_path, job)
     assert (out / "revenue.parquet").exists()
     assert not (out / "other.parquet").exists()  # only the named table
+
+
+# ─── mode=append: mirror the published collection (the incremental object-store path) ──
+
+
+def _publish_trickle(root, name, major, rows_sql, f):
+    """Publish a merge Trickle `fact` for pond `name` via the real data plane (parts + sidecar)."""
+    import duckstring.trickle_io as T
+    from duckstring.dataplane import ParquetDataPlane
+
+    con = getattr(_publish_trickle, "_cons", {}).get((str(root), name))
+    if con is None:
+        con = duckdb.connect()
+        con.execute("SET TimeZone='UTC'")
+        _publish_trickle._cons = getattr(_publish_trickle, "_cons", {})
+        _publish_trickle._cons[(str(root), name)] = con
+    T.merge_table(con, "fact", con.sql(rows_sql), f, ("id",))
+    ParquetDataPlane().export(con, pond_data_dir(root, name, major).root, f=f)
+    return con
+
+
+def _mirror_read(dest, table):
+    from duckstring.dataplane import ParquetDataPlane
+
+    con = duckdb.connect()
+    con.execute("SET TimeZone='UTC'")
+    sql = ParquetDataPlane().read_select(dest, table)
+    rows = sorted(con.sql(f"SELECT id, v FROM ({sql})").fetchall())
+    con.close()
+    return rows
+
+
+def test_mode_append_mirrors_collection_incrementally(tmp_path):
+    """mode=append delivers the table's published collection to the destination — parts idempotent by
+    name (only the new epoch's parts ship), sidecar last — and the destination stays a readable
+    Duckstring layout (reconstructable by ParquetDataPlane)."""
+    import duckstring.trickle_io as T
+
+    f1, f2 = datetime(2026, 6, 1, tzinfo=UTC), datetime(2026, 6, 2, tzinfo=UTC)
+    out = tmp_path / "lake"
+    job = {"pond_name": "sales", "major": 1, "table": "fact",
+           "destination": f"file://{out}", "mode": "append", "f": f1.isoformat()}
+
+    _publish_trickle(tmp_path, "sales", 1, "SELECT * FROM (VALUES (1,'a'),(2,'b')) t(id,v)", f1)
+    _egress_spout(tmp_path, job)
+    assert _mirror_read(out, "fact") == [(1, "a"), (2, "b")]
+    assert (out / "fact__changelog" / T.part_name(f1)).exists()
+    assert T.load_sidecar(out)["fact"]["mode"] == "merge"
+
+    # epoch 2: only the new part ships; the delivered state advances
+    _publish_trickle(tmp_path, "sales", 1, "SELECT * FROM (VALUES (1,'a'),(2,'B'),(3,'c')) t(id,v)", f2)
+    p1_mtime = (out / "fact__changelog" / T.part_name(f1)).stat().st_mtime_ns
+    job2 = dict(job, f=f2.isoformat())
+    _egress_spout(tmp_path, job2)
+    assert _mirror_read(out, "fact") == [(1, "a"), (2, "B"), (3, "c")]
+    assert (out / "fact__changelog" / T.part_name(f2)).exists()
+    # the f1 part was not rewritten (idempotent by name — the incremental property)
+    assert (out / "fact__changelog" / T.part_name(f1)).stat().st_mtime_ns == p1_mtime
+
+
+def test_mode_append_reconciles_folds(tmp_path, monkeypatch):
+    """LSM maintenance at the source (warm folds / cold compaction under a tiny threshold) must
+    reconcile at the destination — folded-away hot parts are REMOVED so a reconstruction never
+    double-counts, and the base/band artifacts arrive."""
+    monkeypatch.setenv("DUCKSTRING_COMPACT_THRESHOLD", "1")
+    out = tmp_path / "lake"
+    rows = {
+        1: "SELECT * FROM (VALUES (1,'a'),(2,'b')) t(id,v)",
+        2: "SELECT * FROM (VALUES (1,'a'),(2,'B'),(3,'c')) t(id,v)",
+        3: "SELECT * FROM (VALUES (1,'A'),(2,'B'),(3,'c'),(4,'d')) t(id,v)",
+        4: "SELECT * FROM (VALUES (1,'A'),(2,'B'),(3,'C'),(4,'d')) t(id,v)",
+    }
+    want = [(1, "A"), (2, "B"), (3, "C"), (4, "d")]
+    for k in (1, 2, 3, 4):
+        f = datetime(2026, 6, k, tzinfo=UTC)
+        _publish_trickle(tmp_path, "sales2", 1, rows[k], f)
+        _egress_spout(tmp_path, {"pond_name": "sales2", "major": 1, "table": "fact",
+                                 "destination": f"file://{out}", "mode": "append", "f": f.isoformat()})
+    assert _mirror_read(out, "fact") == want
+    # destination artifact sets mirror the source's exactly (fold/compaction reconciled)
+    src = pond_data_dir(tmp_path, "sales2", 1).root
+    for d in ("fact", "fact__changelog", "fact__band", "fact__base"):
+        src_names = sorted(p.name for p in (src / d).glob("*.parquet")) if (src / d).is_dir() else []
+        dst_names = sorted(p.name for p in (out / d).glob("*.parquet")) if (out / d).is_dir() else []
+        assert dst_names == src_names, d
+
+
+def test_mode_append_requires_published_entry(tmp_path):
+    _publish_table(tmp_path, "sales3", 1, "plain", "SELECT 1 AS id")  # raw file, no sidecar
+    with pytest.raises(ValueError, match="mode=append"):
+        _egress_spout(tmp_path, {"pond_name": "sales3", "major": 1, "table": "plain",
+                                 "destination": f"file://{tmp_path / 'x'}", "mode": "append",
+                                 "f": datetime(2026, 6, 1, tzinfo=UTC).isoformat()})
+
+
+def test_mode_full_snapshot_unchanged_for_trickle(tmp_path):
+    """mode=full (and auto) keeps the v1 snapshot behaviour — one {table}.parquet of the clean
+    current state, no mirrored layout."""
+    f1 = datetime(2026, 6, 1, tzinfo=UTC)
+    _publish_trickle(tmp_path, "sales4", 1, "SELECT * FROM (VALUES (1,'a')) t(id,v)", f1)
+    out = tmp_path / "snap"
+    _egress_spout(tmp_path, {"pond_name": "sales4", "major": 1, "table": "fact",
+                             "destination": f"file://{out}", "mode": "full", "f": f1.isoformat()})
+    assert (out / "fact.parquet").exists()
+    assert not (out / "fact__changelog").exists()

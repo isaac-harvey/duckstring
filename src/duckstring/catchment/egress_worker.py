@@ -30,6 +30,8 @@ def _egress_spout(root: Path, job: dict, data_root: str | None = None) -> None:
     A **transactional, delta-capable** destination (Postgres) syncs *incrementally*: read the changelog
     delta over ``(destination watermark, f]`` and ``apply_delta`` (upserts + deletes), falling back to a
     full reload on a full read (bootstrap / coverage-miss / a changed overwrite source). Others snapshot."""
+    from datetime import datetime
+
     import duckdb
 
     from ..dataplane import get_data_plane
@@ -44,7 +46,9 @@ def _egress_spout(root: Path, job: dict, data_root: str | None = None) -> None:
     dp = get_data_plane()
     # The data + the CDC cursor ride the **source's** real freshness; the Spout's run freshness (job["f"])
     # is only the engine/throttle clock (the window end, when windowed) — used for completion, not the data.
-    f = job.get("source_f") or job["f"]
+    # A real job (take_spout_jobs) carries ISO strings; the delta/as-of machinery needs datetimes.
+    raw_f = job.get("source_f") or job["f"]
+    f = datetime.fromisoformat(raw_f) if isinstance(raw_f, str) else raw_f
 
     con = duckdb.connect()  # in-memory: reads the exported snapshot, never the live registry
     try:
@@ -53,9 +57,21 @@ def _egress_spout(root: Path, job: dict, data_root: str | None = None) -> None:
         data_dir.duckdb_setup(con)  # object store → httpfs + credentials (no-op local)
         sidecar = load_sidecar(data_dir)
         tables = [job["table"]] if job["table"] else dp.list_tables(data_dir)
+        mode = (job.get("mode") or "auto").lower()
         for table in tables:
             pk = sidecar.get(table, {}).get("pk") or None
-            if caps.supports_delta and caps.transactional:
+            if mode == "append" and getattr(caps, "mirrors_layout", False):
+                # The incremental object-store path (opt-in — `mode=append`): mirror the table's
+                # published collection to the destination, syncing only new/changed artifacts. The
+                # destination stays a readable Duckstring layout (parts + tiers + sidecar).
+                entry = sidecar.get(table)
+                if entry is None:
+                    raise ValueError(
+                        f"mode=append mirrors a published Duckstring collection, but table {table!r} "
+                        f"has no sidecar entry at the source — use mode=full for a plain snapshot"
+                    )
+                driver.mirror(data_dir, table, entry, f=f)
+            elif caps.supports_delta and caps.transactional:
                 if not pk:  # the transactional-PK requirement, enforced at egress for a not-yet-checked source
                     raise ValueError(
                         f"egress to a transactional destination needs a primary key — table {table!r} is "
