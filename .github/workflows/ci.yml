@@ -6,13 +6,73 @@ on:
     branches: [main]
 
 jobs:
+  # The core suite across the supported Python range (pyproject requires-python >= 3.10).
   test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: pip install -e .[dev]
+      - run: ruff check .
+      - run: pytest
+
+  # The dbt extra (dbt-mode Ponds): the e2e importorskips without it, so exercise it explicitly.
+  dbt:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
+      - run: pip install -e .[dev,dbt]
+      - run: pytest -k dbt
+
+  # Real-backend egress: the Postgres CDC driver against an actual Postgres (the DuckDB-attached
+  # stand-in covers the SQL shape; only a real server proves the ATTACH + txn + watermark semantics).
+  postgres-egress:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: ds
+          POSTGRES_PASSWORD: ds
+          POSTGRES_DB: ds
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U ds"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
       - run: pip install -e .[dev]
-      - run: ruff check .
-      - run: pytest
+      - run: pytest tests/test_egress_postgres.py tests/test_egress_file.py tests/test_spout.py
+        env:
+          DUCKSTRING_TEST_PG: postgres://ds:ds@127.0.0.1:5432/ds
+
+  # The web UI: typecheck + the vitest unit suite (pure lib/component logic).
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+        working-directory: frontend
+      - run: npm run typecheck
+        working-directory: frontend
+      - run: npm test
+        working-directory: frontend
