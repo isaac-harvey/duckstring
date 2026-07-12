@@ -310,6 +310,78 @@ def test_capture_envelope_wraps_body():
     assert plan["statements"] == body["statements"]
 
 
+def test_capture_group_by_aggregate_alias():
+    """The Ibis-shaped ``.group_by(by).aggregate(**metrics)`` captures identically to
+    ``.aggregate(by=by, ...)`` (the inherited surface resolves group_by into the same _agg)."""
+    def run(host):
+        host.trickle("src.line", p=1.0).alias("l").group_by("pid").aggregate(
+            total=agg.sum("qty"), n=agg.count(),
+        ).merge("by_product")
+        return []
+
+    stmt = _cap(run)["statements"][0]
+    _eq(stmt["aggregate"], {"by": ["pid"], "metrics": {
+        "total": {"kind": "sum", "col": "qty"},
+        "n": {"kind": "count"},
+    }})
+    assert stmt["output"]["pk"] is None  # literal pk argument recorded; effective pk is the by key
+
+
+def test_capture_retain_t_serialises_as_seconds():
+    from datetime import timedelta
+
+    def run(host):
+        host.trickle("src.line", p=1.0).merge("kept_t", pk="id", retain_t=timedelta(days=2))
+        host.trickle("src.event", p=1.0).append("kept_a", pk="id", retain_t=timedelta(hours=1), retain_n=5)
+        return []
+
+    stmts = _cap(run)["statements"]
+    _eq(stmts[0]["output"]["options"], {"retain_t_s": 172800.0})
+    _eq(stmts[1]["output"]["options"], {"retain_t_s": 3600.0, "retain_n": 5})
+
+
+def test_capture_bushy_join_dag():
+    """A bushy ``(a⋈b)⋈(c⋈d)`` shape: the operand of a join may itself be a join DAG, and the
+    positional aliases resolve by left-to-right leaf order across the whole tree."""
+    def run(host):
+        left = host.trickle("orders.order_line", p=1.0) \
+            .join(host.trickle("prices.price", p=1.0), on={"pid": "id"})
+        right = host.trickle("src.line", p=1.0) \
+            .join(host.trickle("cat.product", p=1.0), on={"pid": "id"})
+        left.join(right, on={"pid": "pid"}, how="left") \
+            .select("s0.id AS id, s1.unit, s2.qty, s3.label").merge("bushy", pk="id")
+        return []
+
+    dag = _cap(run)["statements"][0]["dag"]
+    _eq(dag, {
+        "node": "join", "how": "left",
+        "on": [{"left": "pid", "right": "pid"}],
+        "left": {
+            "node": "join", "how": "inner",
+            "on": [{"left": "pid", "right": "id"}],
+            "left": {"node": "source", "ref": "orders.order_line", "alias": "s0", "p": 1.0},
+            "right": {"node": "source", "ref": "prices.price", "alias": "s1", "p": 1.0},
+        },
+        "right": {
+            "node": "join", "how": "inner",
+            "on": [{"left": "pid", "right": "id"}],
+            "left": {"node": "source", "ref": "src.line", "alias": "s2", "p": 1.0},
+            "right": {"node": "source", "ref": "cat.product", "alias": "s3", "p": 1.0},
+        },
+    })
+
+
+def test_capture_multi_column_on_list():
+    def run(host):
+        host.trickle("src.line", p=1.0).alias("a") \
+            .join(host.trickle("cat.product", p=1.0).alias("b"), on=["pid", "id"]) \
+            .select("a.id AS id").merge("mc", pk="id")
+        return []
+
+    on = _cap(run)["statements"][0]["dag"]["on"]
+    _eq(on, [{"left": "pid", "right": "pid"}, {"left": "id", "right": "id"}])
+
+
 def test_capture_reduce_metric_is_non_capturable():
     def run(host):
         host.trickle("src.line", p=1.0).along("id") \
