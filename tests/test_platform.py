@@ -34,7 +34,7 @@ def test_launcher_defers_spawn_until_base_url(monkeypatch, tmp_path):
 
     spawned: list[list[str]] = []
     monkeypatch.setattr(
-        launcher_mod.subprocess, "Popen", lambda cmd: (spawned.append(cmd), _FakeProc())[1]
+        launcher_mod.subprocess, "Popen", lambda cmd, **kw: (spawned.append(cmd), _FakeProc())[1]
     )
 
     launcher = launcher_mod.SubprocessLauncher(tmp_path, None, token="t")
@@ -56,7 +56,7 @@ def test_launcher_terminate_drops_pending(monkeypatch, tmp_path):
 
     spawned: list[list[str]] = []
     monkeypatch.setattr(
-        launcher_mod.subprocess, "Popen", lambda cmd: (spawned.append(cmd), _FakeProc())[1]
+        launcher_mod.subprocess, "Popen", lambda cmd, **kw: (spawned.append(cmd), _FakeProc())[1]
     )
 
     launcher = launcher_mod.SubprocessLauncher(tmp_path, None, token="t")

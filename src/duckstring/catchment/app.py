@@ -12,7 +12,7 @@ from fastapi.staticfiles import StaticFiles
 from . import auth
 from .db import connect, ensure_identity, migrate
 from .driver import Driver
-from .launcher import NoopLauncher, SubprocessLauncher
+from .launcher import NoopLauncher, SubprocessLauncher, load_launcher_class
 from .routes import router
 
 _STATIC_DIR = Path(__file__).parent / "static"
@@ -41,7 +41,12 @@ async def _lifespan(app: FastAPI):
         # keys, so rotating those never disrupts running Ducks).
         # base_url None = unknown (the platform picked the bind address): the launcher defers spawns
         # until the dial-back middleware learns the address from the first request.
-        launcher = SubprocessLauncher(
+        # DUCKSTRING_DUCK_LAUNCHER=module:Class (prereqs D6) swaps the implementation — same
+        # constructor contract, same interface; the Duck still dials back over the duck channel.
+        launcher_cls = SubprocessLauncher
+        if os.environ.get("DUCKSTRING_DUCK_LAUNCHER"):
+            launcher_cls = load_launcher_class(os.environ["DUCKSTRING_DUCK_LAUNCHER"])
+        launcher = launcher_cls(
             app.state.root, base_url, token=app.state.duck_token, data_root=app.state.data_root
         )
     driver = Driver(app.state.db, app.state.root, base_url, launcher, data_root=app.state.data_root)

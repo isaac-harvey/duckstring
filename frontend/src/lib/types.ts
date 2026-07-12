@@ -69,6 +69,8 @@ export interface PondInfo {
   failureKind: 'contract' | 'error' | null; // the failed sub-reason (contract = the additive-schema gate refused the publish)
   immediateRetries: number; // live budget: Ripple retries within a Run
   sourceRetries: number; // live budget: Runs retried on a Source change
+  // Duck config (effective + override); null for Draws/Spouts (no Duck runs them).
+  duck: { size: string; flock: boolean; override: { size: string | null; flock: boolean | null } } | null;
   // Spout nodes only: its egress config + standing-Wake armed state.
   spout?: { destination: string; table: string | null; mode: string; armed: boolean } | null;
 }

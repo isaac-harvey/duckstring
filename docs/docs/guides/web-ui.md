@@ -7,7 +7,7 @@ description: The Catchment's built-in monitoring and control surface.
 
 Every Catchment serves a web UI at its root URL — `http://127.0.0.1:7474` for a default local Catchment. It's the live view of everything this documentation describes: the Pond graph with freshness flowing through it, run history down to individual Ripple attempts, and the same trigger and control surface as the CLI.
 
-The UI works wherever the Catchment is reachable: behind a platform login (its session cookies flow automatically), under a path prefix (all references are relative — e.g. Posit Connect's `/content/{guid}/`), and on a Catchment started with an [API key](running-a-catchment.md#authentication), where it prompts for the key on first visit and keeps it in the browser.
+The UI works wherever the Catchment is reachable: behind a platform login (its session cookies flow automatically), under a path prefix (all references are relative — e.g. Posit Connect's `/content/{guid}/`), and on a Catchment started with an [API key](running-a-catchment.md#authentication), where it prompts for the key on first visit and keeps it in the browser. A tool that already holds a key can skip the prompt by deep-linking `{url}/#key={key}` — the key is adopted into browser storage on load and immediately stripped from the URL.
 
 One thing it deliberately is not: a pipeline editor. **Topology comes from deploying code** — Ponds and their Sources are declared in `pond.toml` and `src/pond.py`, never authored in a UI. The UI operates the pipeline; the packages define it.
 

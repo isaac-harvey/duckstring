@@ -180,6 +180,12 @@ def main() -> None:
     root = Path(args.root)
     data_root = args.data_root or None
     source_dir = root / args.source_path
+    client = CatchmentClient(args.catchment, args.pond, args.major, args.token)
+    if not source_dir.is_dir():
+        # Remote-Duck boot (prereqs D6): this host doesn't share the Catchment's disk — fetch the
+        # deployed source bundle over the duck channel and unpack it where the executor expects it.
+        _unpack_artifact(client.fetch_artifact(), source_dir)
+        print(f"[duck:{args.pond}@{args.major}] fetched source artifact -> {source_dir}", flush=True)
     parents = load_topology(source_dir)
     major_dir = pond_major_dir(root, args.pond, args.major)
     major_dir.mkdir(parents=True, exist_ok=True)
@@ -194,8 +200,25 @@ def main() -> None:
         executor = DbtExecutor(args.pond, args.major, args.version, args.source_path, root, data_root=data_root)
     else:
         executor = RippleExecutor(args.pond, args.major, args.version, args.source_path, root, data_root=data_root)
-    client = CatchmentClient(args.catchment, args.pond, args.major, args.token)
     serve(core, executor, client)
+
+
+def _unpack_artifact(tar_bytes: bytes, dest: Path) -> None:
+    """Unpack a fetched source bundle under ``dest``, refusing member paths that escape it (the
+    stdlib data filter where available — 3.12+, and backported 3.10.12/3.11.4 — else a manual check)."""
+    import io
+    import tarfile
+
+    dest.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(fileobj=io.BytesIO(tar_bytes)) as tar:
+        if hasattr(tarfile, "data_filter"):
+            tar.extractall(dest, filter="data")
+        else:  # pragma: no cover — pre-backport interpreters
+            base = dest.resolve()
+            for m in tar.getmembers():
+                if not (base / m.name).resolve().is_relative_to(base):
+                    raise ValueError(f"artifact member escapes destination: {m.name}")
+            tar.extractall(dest)
 
 
 if __name__ == "__main__":

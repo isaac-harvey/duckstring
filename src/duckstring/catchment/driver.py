@@ -18,6 +18,7 @@ SQLite is the durable mirror, the per-Pond ``pond.db`` ledgers the fallback.
 from __future__ import annotations
 
 import json
+import os
 import threading
 from datetime import datetime, timedelta, timezone
 
@@ -152,6 +153,10 @@ def _topo_order(scope: set[str], parents: dict[str, set[str]]) -> list[str]:
 BATCH_OPS = ("kill", "sleep", "reset", "wipe", "remove", "clear", "repair", "refresh")
 IRREVERSIBLE_OPS = frozenset({"reset", "wipe", "remove"})
 
+# The Duck preset-size vocabulary (prereqs D5). Presets only — never raw instance shapes; what a
+# size means physically is the launcher's business (the local subprocess ignores it).
+DUCK_SIZES = ("s", "m", "l", "xl")
+
 
 class Driver:
     def __init__(self, db, root, base_url: str | None, launcher, data_root: str | None = None):
@@ -193,6 +198,9 @@ class Driver:
         self._alerted_failures: dict[str, tuple] = {}  # key → (kind, scope_pond, scope_major, f, title, message)
         self._renotify_channels = False  # any enabled channel with a re-notify interval (refreshed per sweep)
         self._stale_breached: set[tuple[int, str]] = set()
+        # Per-Pond Duck config overrides (prereqs D5), key → {"size": str|None, "flock": bool|None};
+        # None = inherit the Catchment default (env). Loaded from pond_duck in reload().
+        self.duck_overrides: dict[str, dict] = {}
         # Monotonic counter bumped on every state change — the UI long-polls /api/status against it, so
         # the display updates the instant the engine state moves rather than on a fixed timer.
         self.state_version = 0
@@ -277,6 +285,13 @@ class Driver:
                     "SELECT immediate_retries, source_retries FROM pond_retry WHERE pond_id = ?", (pond_id,)
                 ).fetchone()
                 imm, onc = retry if retry else (0, 0)
+                duck_row = db.execute(
+                    "SELECT size, flock FROM pond_duck WHERE pond_id = ?", (pond_id,)
+                ).fetchone()
+                self.duck_overrides[key] = (
+                    {"size": duck_row[0], "flock": (None if duck_row[1] is None else bool(duck_row[1]))}
+                    if duck_row else {"size": None, "flock": None}
+                )
                 # always_run is a Pond property ORed up from its Ripples: any always_run Ripple means
                 # the Pond runs every time (never engine-passed). See plans/no-change-skip.md.
                 always_run = bool(db.execute(
@@ -665,7 +680,7 @@ class Driver:
             # 3. Delete the pond(id)-keyed config + the pond selection row. Keep pond_version / ripple /
             #    ripple_run / pond_run / pond_version_schema / pond_name (the retained record).
             for tbl in ("pond_state", "pond_target", "pond_open", "pond_trigger", "pond_retry",
-                        "pond_window", "pond_spout", "pond_to_pond"):
+                        "pond_window", "pond_spout", "pond_duck", "pond_to_pond"):
                 self.db.execute(f"DELETE FROM {tbl} WHERE pond_id = ?", (pond_id,))
             self.db.execute("DELETE FROM pond WHERE id = ?", (pond_id,))
             # 3b. --wipe: purge the deployment record + run history + {version}/ artifacts for this major,
@@ -903,6 +918,52 @@ class Driver:
     def retry_config(self, pond: str) -> dict:
         p = self.state.ponds[pond]
         return {"immediate_retries": p.retry_immediately, "source_retries": p.retry_on_change}
+
+    @staticmethod
+    def duck_defaults() -> dict:
+        """The Catchment-wide Duck defaults, from env (`DUCKSTRING_DUCK_SIZE` / `DUCKSTRING_DUCK_FLOCK`).
+        Inert for the classic subprocess Duck (size is advisory; flock only matters with a co-resident
+        DuckFlock driver), sizing for remote launchers."""
+        return {
+            "size": os.environ.get("DUCKSTRING_DUCK_SIZE", "s").lower(),
+            "flock": os.environ.get("DUCKSTRING_DUCK_FLOCK", "on").lower() not in ("off", "0", "false"),
+        }
+
+    def set_duck(self, pond: str, size: str | None = None, flock: bool | None = None,
+                 clear: bool = False) -> None:
+        """Set (or with ``clear`` drop) a Pond's Duck config override (persisted to pond_duck; owned by
+        the operator, like retry budgets). Unset fields keep their current override; ``clear`` reverts
+        the Pond to the Catchment defaults."""
+        if size is not None and size not in DUCK_SIZES:
+            raise ValueError(f"size must be one of {', '.join(DUCK_SIZES)}")
+        with self.lock:
+            pond_id = self.meta[pond]["pond_id"]
+            if clear:
+                self.db.execute("DELETE FROM pond_duck WHERE pond_id = ?", (pond_id,))
+                self.duck_overrides[pond] = {"size": None, "flock": None}
+            else:
+                cur = self.duck_overrides.get(pond, {"size": None, "flock": None})
+                new = {"size": size if size is not None else cur["size"],
+                       "flock": flock if flock is not None else cur["flock"]}
+                self.db.execute(
+                    "INSERT INTO pond_duck (pond_id, size, flock) VALUES (?, ?, ?) "
+                    "ON CONFLICT(pond_id) DO UPDATE SET size = excluded.size, flock = excluded.flock",
+                    (pond_id, new["size"], None if new["flock"] is None else int(new["flock"])),
+                )
+                self.duck_overrides[pond] = new
+            self.db.commit()
+            self.state_version += 1  # the config shows in /api/status
+
+    def duck_config(self, pond: str) -> dict:
+        """The Pond's effective Duck config: the override where set, else the Catchment default."""
+        o = self.duck_overrides.get(pond, {"size": None, "flock": None})
+        d = self.duck_defaults()
+        return {
+            "size": o["size"] or d["size"],
+            "flock": d["flock"] if o["flock"] is None else o["flock"],
+            "override": {"size": o["size"], "flock": o["flock"]},
+            "defaults": d,
+        }
 
     def sleep(self, pond: str, upstream: bool = False) -> None:
         with self.lock:
@@ -1950,7 +2011,7 @@ class Driver:
         db.execute("DELETE FROM ripple_run WHERE pond_version_id = ?", (pv_id,))
         db.execute("DELETE FROM pond_run WHERE pond_version_id = ?", (pv_id,))
         for tbl in ("pond_state", "pond_target", "pond_open", "pond_trigger", "pond_retry",
-                    "pond_window", "pond_spout", "pond_to_pond"):
+                    "pond_window", "pond_spout", "pond_duck", "pond_to_pond"):
             db.execute(f"DELETE FROM {tbl} WHERE pond_id = ?", (pond_id,))
         db.execute("DELETE FROM pond WHERE id = ?", (pond_id,))
         db.execute("DELETE FROM ripple WHERE pond_version_id = ?", (pv_id,))
@@ -2050,7 +2111,7 @@ class Driver:
                 self._pending_egress.append((pond, f))
             self._signal_egress()
             return
-        self.launcher.ensure(pond, meta["version"], meta["source_path"])
+        self.launcher.ensure(pond, meta["version"], meta["source_path"], duck=self.duck_config(pond))
         self.last_seen[pond] = now  # grace clock: a freshly (re)spawned Duck isn't immediately stale
         self._idle_since.pop(pond, None)  # it's running again — reset its reap grace clock
         # Cancel any not-yet-collected shutdown: this Pond is running again, so the Duck must not exit.
@@ -2437,6 +2498,10 @@ class Driver:
                     "failure_kind": failure_kind,  # "contract" | "error" | null — the failed sub-reason
                     "immediate_retries": self.state.ponds[key].retry_immediately,
                     "source_retries": self.state.ponds[key].retry_on_change,
+                    # The Duck config (prereqs D5): effective size/flock + whether it's an override.
+                    # Draws/Spouts are not run by a Duck, so they carry none.
+                    "duck": (None if self.meta[key].get("is_draw") or self.meta[key].get("is_spout")
+                             else self.duck_config(key)),
                     "ripples": ripples,
                     "ripple_edges": ripple_edges,
                 })

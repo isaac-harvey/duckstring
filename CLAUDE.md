@@ -65,7 +65,7 @@ src/duckstring/
     driver.py              #   Driver: engine brain + Duck coordinator + persistence + trigger/window/spout CRUD + restart restore
     egress_worker.py       #   the egress worker: reconciliation loop delivering published output to Spouts (see Egress)
     alert_worker.py        #   the alert worker: drains the alert_delivery outbox → notifier.send (see Alerts)
-    launcher.py            #   SubprocessLauncher (spawns Ducks) / NoopLauncher (tests)
+    launcher.py            #   SubprocessLauncher (spawns Ducks; passes per-Pond duck config as env) / NoopLauncher (tests); DUCKSTRING_DUCK_LAUNCHER=module:Class swaps the implementation (D6)
     db.py                  #   SQLite connect + migration runner
     secrets.py             #   SecretStore — the write-only catchment secret store (secrets.json, 0600, names-only read; see Secrets)
     schema/001_init.sql    #   Database schema (see below)
@@ -79,6 +79,7 @@ src/duckstring/
     trigger.py             #   tap/pulse/wave/tide/remove ; window add/list/remove (cli/window.py)
     control.py             #   wake/sleep/force/kill/clear/failure-budget (a Pond's execution & health)
     pond.py, deploy.py     #   pond init/demo/hydrate/run/deploy
+    duck.py                #   duck show/set {pond} [--size s|m|l|xl] [--flock on|off] [--clear] — per-Pond Duck config (D5; pond_duck table, defaults DUCKSTRING_DUCK_SIZE/_FLOCK)
     puddle.py              #   puddle ls/show/query (inspect ./puddles via in-memory DuckDB views)
     spout.py               #   spout add/ls/rm {pond} — egress bindings (see Egress)
     secret.py              #   secret set/ls/rm — the write-only secret store (value prompted, never in argv)
@@ -257,7 +258,7 @@ SQLite `duck.db` at the catchment root. Schema in `catchment/schema/001_init.sql
 - **`pond`** — the **selected** version, one per `(pond_name, major)` → `pond_version` (upserted on deploy). This is "the Pond" and the FK target for all live demand/freshness/graph tables.
 - Topology (keyed on `pond_version`): `ripple`, `ripple_to_ripple` (intra-pond edges, all required).
 - Contract (keyed on `pond_version`): `pond_version_schema` (one row per output `(table, column, type)`, captured on accepted runs; reserved `primary_key` flag for Trickle) — see Version contract.
-- Live state (keyed on `pond`): `pond_to_pond` (sink `pond_id` → source `pond_name_id` + `source_major`, so a sink can deploy before its source), `pond_state` (start_f/end_f/d_ms/has_pull/has_received_pull **+ is_failed/is_blocked/failed_f/failures/is_killed/pull_local**), `pond_target` (push target set), `pond_retry` (immediate_retries/source_retries — live budgets), `pond_window` (PK `(pond_id, name)`), `pond_trigger` (PK `pond_id`; kind wave/tide, bound_ms), `pond_spout` (PK `(pond_id, name)`; egress bindings — table/destination/mode/schedule + the worker's watermark/retries/failures/is_failed/error, see Egress).
+- Live state (keyed on `pond`): `pond_to_pond` (sink `pond_id` → source `pond_name_id` + `source_major`, so a sink can deploy before its source), `pond_state` (start_f/end_f/d_ms/has_pull/has_received_pull **+ is_failed/is_blocked/failed_f/failures/is_killed/pull_local**), `pond_target` (push target set), `pond_retry` (immediate_retries/source_retries — live budgets), `pond_window` (PK `(pond_id, name)`), `pond_trigger` (PK `pond_id`; kind wave/tide, bound_ms), `pond_duck` (PK `pond_id`; size/flock override — migration `018`, the D5 Duck config), `pond_spout` (PK `(pond_id, name)`; egress bindings — table/destination/mode/schedule + the worker's watermark/retries/failures/is_failed/error, see Egress).
 - History (keyed on `pond_version` + freshness `f`): `pond_run` (`status` ∈ running/success/failed/killed, `error`, `traceback`) and `ripple_run` (**PK includes `retry`** — one row per attempt = the retry trace; `status`, `error`, `traceback`). `started_at`/`finished_at` are the Duck's wall-clock execution span (reported on the `ripple` event) — the UI's run durations. All timestamps are UTC ISO-8601 (tz-aware).
 - The **per-Pond run ledger is NOT in `duck.db`** — it lives at `ponds/{name}/m{major}/pond.db` (owned by `engine/pond.py`): the Duck's operational/recovery record (`ripple_run_state`, `pond_run`). The Catchment's `pond_run`/`ripple_run` are the canonical history.
 

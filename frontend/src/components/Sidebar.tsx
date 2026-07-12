@@ -455,6 +455,7 @@ export function Sidebar({ mobile = false }: { mobile?: boolean }) {
   const removeTrigger = useLiveStore((s) => s.removeTrigger);
   const clearFailure = useLiveStore((s) => s.clearFailure);
   const setBudget = useLiveStore((s) => s.setBudget);
+  const setDuck = useLiveStore((s) => s.setDuck);
 
   // Access level gates the action surface (the backend enforces it too — this just avoids dead buttons).
   // read: status/history/data only · demand: + the Triggers menu · full: + Control/Windows/Failures.
@@ -675,6 +676,42 @@ export function Sidebar({ mobile = false }: { mobile?: boolean }) {
                 <Btn onClick={() => clearFailure(selectedPond.id)} color={THEME_SUCCESS}>Clear Failure</Btn>
               </div>
             )}
+          </Section>
+          )}
+
+          {/* Duck config: preset size + Flock escalation. Operational (operator-owned), so full only;
+              Draws/Spouts carry none (no Duck runs them). Inert on a stock local Catchment. */}
+          {canControl && selectedInfo?.duck && (
+          <Section>
+            <Label>Duck</Label>
+            <div style={{ display: 'flex', gap: 6, alignItems: 'center', marginBottom: 6 }}>
+              <span style={{ flex: 1, fontSize: 11, color: '#a1a1aa' }}>Size</span>
+              {(['s', 'm', 'l', 'xl'] as const).map((sz) => (
+                <Btn
+                  small
+                  key={sz}
+                  color={selectedInfo.duck!.size === sz ? THEME_BRAND : '#52525b'}
+                  onClick={() => setDuck(selectedPond.id, { size: sz })}
+                >
+                  {sz.toUpperCase()}
+                </Btn>
+              ))}
+            </div>
+            <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+              <span style={{ flex: 1, fontSize: 11, color: '#a1a1aa' }}>Flock</span>
+              <Btn
+                small
+                color={selectedInfo.duck.flock ? THEME_BRAND : '#52525b'}
+                onClick={() => setDuck(selectedPond.id, { flock: !selectedInfo.duck!.flock })}
+              >
+                {selectedInfo.duck.flock ? 'On' : 'Off'}
+              </Btn>
+              {(selectedInfo.duck.override.size !== null || selectedInfo.duck.override.flock !== null) && (
+                <Btn small color={THEME_PULL} onClick={() => setDuck(selectedPond.id, { clear: true })}>
+                  Default
+                </Btn>
+              )}
+            </div>
           </Section>
           )}
 

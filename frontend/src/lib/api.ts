@@ -43,6 +43,21 @@ export function setApiKey(key: string | null): void {
   }
 }
 
+// Key handoff: a console can deep-link the UI as {url}/#key={apiKey} — the key is moved into
+// localStorage on load and stripped from the URL (history.replaceState, so it never lands in the
+// address bar, browser history, or a copy-paste). Runs once at module init, before the first fetch.
+function adoptHashKey(): void {
+  try {
+    const m = window.location.hash.match(/^#key=([^&]+)/);
+    if (!m) return;
+    setApiKey(decodeURIComponent(m[1]));
+    window.history.replaceState(null, '', window.location.pathname + window.location.search);
+  } catch {
+    /* no window (SSR/export prerender) or storage unavailable — the hash is simply ignored */
+  }
+}
+if (typeof window !== 'undefined') adoptHashKey();
+
 function authHeaders(extra: Record<string, string> = {}): Record<string, string> {
   const key = getApiKey();
   return key ? { ...extra, authorization: `Bearer ${key}` } : extra;
@@ -95,6 +110,8 @@ export interface RawPond {
   failure_kind?: 'contract' | 'error' | null; // the failed sub-reason (contract = the schema gate refused the publish)
   immediate_retries: number;
   source_retries: number;
+  // The Duck config (effective size/flock + the raw override); null for Draws/Spouts (no Duck runs them).
+  duck: { size: string; flock: boolean; override: { size: string | null; flock: boolean | null } } | null;
   ripples: RawRipple[];
   ripple_edges: [string, string][]; // [sourceName, sinkName] within the Pond
 }
@@ -316,6 +333,14 @@ export function setBudget(pond: string, immediateRetries: number, sourceRetries:
     immediate_retries: immediateRetries,
     source_retries: sourceRetries,
   });
+}
+
+// Duck config (preset size + Flock escalation). clear=true drops the override (Catchment defaults).
+export function setDuck(
+  pond: string,
+  body: { size?: string | null; flock?: boolean | null; clear?: boolean },
+): Promise<void> {
+  return postJSON(pondPath(pond, 'duck'), body);
 }
 
 // ─── Spouts (egress) ─────────────────────────────────────────────────────────

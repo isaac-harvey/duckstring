@@ -1,17 +1,31 @@
 """Pond launcher: brings a Duck process to life and tears it down.
 
-Local-subprocess only for now (one Duck per executing Pond — that is, per ``name@major`` line). The
-Duck dials back to the Catchment, so "remote" later is just a different launcher with the same
-interface — nothing else changes.
+Local-subprocess by default (one Duck per executing Pond — that is, per ``name@major`` line). The
+Duck dials back to the Catchment, so remote is just a different launcher with the same interface:
+set ``DUCKSTRING_DUCK_LAUNCHER=module:Class`` (prereqs D6) to swap the implementation — the class is
+constructed with the same ``(root, base_url, token=…, data_root=…)`` and receives each Pond's Duck
+config (size/flock, prereqs D5) on ``ensure``. Nothing else changes.
 """
 
 from __future__ import annotations
 
+import importlib
+import os
 import subprocess
 import sys
 from pathlib import Path
 
 from ..keys import split_pond_key
+
+
+def load_launcher_class(spec: str):
+    """Resolve a ``module:Class`` launcher spec (``DUCKSTRING_DUCK_LAUNCHER``). Raises ImportError /
+    AttributeError loudly — a Catchment configured for a custom launcher must not silently fall back
+    to spawning local subprocesses."""
+    module_name, _, class_name = spec.partition(":")
+    if not module_name or not class_name:
+        raise ValueError(f"DUCKSTRING_DUCK_LAUNCHER must be 'module:Class', got {spec!r}")
+    return getattr(importlib.import_module(module_name), class_name)
 
 
 class SubprocessLauncher:
@@ -26,15 +40,15 @@ class SubprocessLauncher:
         # The data-plane root passed through to each Duck (object store / Volume / path); None = local default.
         self.data_root = data_root
         self._procs: dict[str, subprocess.Popen] = {}  # pond key (name@major) → process
-        self._pending: dict[str, tuple[str, str]] = {}  # spawns deferred until base_url is known
+        self._pending: dict[str, tuple] = {}  # spawns deferred until base_url is known
 
     def set_base_url(self, url: str) -> None:
         """Set the dial-back address and spawn any Ducks that were waiting on it. Their queued jobs
         are untouched — a Duck collects them on its first poll."""
         self.base_url = url
         pending, self._pending = self._pending, {}
-        for pond_key, (version, source_path) in pending.items():
-            self.ensure(pond_key, version, source_path)
+        for pond_key, (version, source_path, duck) in pending.items():
+            self.ensure(pond_key, version, source_path, duck=duck)
 
     def is_running(self, pond_key: str) -> bool:
         if pond_key in self._pending:
@@ -42,13 +56,19 @@ class SubprocessLauncher:
         proc = self._procs.get(pond_key)
         return proc is not None and proc.poll() is None
 
-    def ensure(self, pond_key: str, version: str, source_path: str) -> None:
+    def ensure(self, pond_key: str, version: str, source_path: str, duck: dict | None = None) -> None:
         if self.base_url is None:
-            self._pending[pond_key] = (version, source_path)
+            self._pending[pond_key] = (version, source_path, duck)
             return
         if self.is_running(pond_key):
             return
         name, major = split_pond_key(pond_key)
+        # The Duck config rides as env: size is advisory locally (the subprocess is whatever the host
+        # is), flock gates the co-resident DuckFlock driver's distribution (DuckflockConfig.from_env).
+        env = dict(os.environ)
+        if duck:
+            env["DUCKSTRING_DUCK_SIZE"] = duck.get("size") or "s"
+            env["DUCKSTRING_DUCK_FLOCK"] = "on" if duck.get("flock", True) else "off"
         self._procs[pond_key] = subprocess.Popen(
             [
                 sys.executable, "-m", "duckstring.duck",
@@ -61,7 +81,8 @@ class SubprocessLauncher:
                 "--root", str(self.root),
                 "--source-path", source_path,
                 f"--data-root={self.data_root or ''}",
-            ]
+            ],
+            env=env,
         )
 
     def terminate(self, pond_key: str, wait: bool = False) -> None:
@@ -83,9 +104,14 @@ class SubprocessLauncher:
 
 class NoopLauncher:
     """A launcher that never spawns anything — for tests/contexts that exercise the engine and
-    persistence without running real Duck processes."""
+    persistence without running real Duck processes. Accepts the standard launcher constructor
+    args so it is itself a valid ``DUCKSTRING_DUCK_LAUNCHER`` target."""
 
     manages_processes = False  # nothing to watch — liveness checking is skipped
+
+    def __init__(self, root: Path | None = None, base_url: str | None = None,
+                 token: str = "", data_root: str | None = None):
+        pass
 
     def set_base_url(self, url: str) -> None:
         pass
@@ -93,7 +119,7 @@ class NoopLauncher:
     def is_running(self, pond_key: str) -> bool:
         return False
 
-    def ensure(self, pond_key: str, version: str, source_path: str) -> None:
+    def ensure(self, pond_key: str, version: str, source_path: str, duck: dict | None = None) -> None:
         pass
 
     def terminate(self, pond_key: str, wait: bool = False) -> None:

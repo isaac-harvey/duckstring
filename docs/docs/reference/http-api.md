@@ -152,6 +152,8 @@ All under `/api/ponds/{name}/…`, all returning `{"ok": true}`; `404` for unkno
 | `POST …/clear` | — | Reset failed/killed; unblock downstream |
 | `GET …/budget` | — | `{"immediate_retries", "source_retries"}` |
 | `POST …/budget` | `{"immediate_retries": 1, "source_retries": 2}` | Set the live retry budgets |
+| `GET …/duck` | — | The Pond's effective worker config: `{"size", "flock", "override", "defaults"}` |
+| `POST …/duck` | `{"size": "m", "flock": false}` or `{"clear": true}` | Override (or reset) the Pond's worker preset size / offload flag |
 
 ## Windows
 
@@ -255,4 +257,4 @@ The recursive upstream lineage: `{catchments: [{id, name, reachable, ponds, edge
 
 ## Worker protocol (informational)
 
-Two further endpoints exist for the Catchment's own worker processes (Ducks) — listed for completeness, not for external use: workers hold a short poll on `GET /api/duck/{name}/{major}/jobs` for commands (`begin_run` / `shutdown`) and report progress to `POST /api/duck/{name}/{major}/events`, idempotently on freshness (one Duck per major line). Both are worker-initiated — the dial-back design that lets local and remote workers share one protocol. See [Architecture](architecture.md).
+Two further endpoints exist for the Catchment's own worker processes (Ducks) — listed for completeness, not for external use: workers hold a short poll on `GET /api/duck/{name}/{major}/jobs` for commands (`begin_run` / `shutdown`), report progress to `POST /api/duck/{name}/{major}/events`, idempotently on freshness (one Duck per major line), and can fetch the deployed source bundle from `GET /api/duck/{name}/{major}/artifact` (how a worker on another host gets its code — the Catchment stays the artifact authority). All are worker-initiated — the dial-back design that lets local and remote workers share one protocol. See [Architecture](architecture.md).

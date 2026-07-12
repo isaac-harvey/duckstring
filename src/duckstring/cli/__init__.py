@@ -5,6 +5,7 @@ import typer
 from . import alert as alert_cmd
 from . import bulk as bulk_cmd
 from . import catchment as catchment_cmd
+from . import duck as duck_cmd
 from . import duct as duct_cmd
 from . import pond as pond_cmd
 from . import puddle as puddle_cmd
@@ -72,6 +73,7 @@ app.add_typer(pond_cmd.app, name="pond")
 app.add_typer(puddle_cmd.app, name="puddle")
 app.add_typer(trigger_app, name="trigger")
 app.add_typer(control_app, name="control")
+app.add_typer(duck_cmd.app, name="duck")
 app.add_typer(spout_cmd.app, name="spout")
 app.add_typer(secret_cmd.app, name="secret")
 app.add_typer(alert_cmd.app, name="alert")

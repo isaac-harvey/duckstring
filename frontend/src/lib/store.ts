@@ -23,6 +23,7 @@ import {
   type BatchOp,
   clearFailure,
   setBudget,
+  setDuck,
   addWindow,
   removeWindow,
   controlSpout,
@@ -159,6 +160,7 @@ function transformStatus(payload: StatusPayload): StatusSlice {
       failureKind: p.failure_kind ?? null,
       immediateRetries: p.immediate_retries,
       sourceRetries: p.source_retries,
+      duck: p.duck ?? null,
       spout: p.spout ?? null,
     };
     pondViews[p.id] = nodeView(p, p.d_ms);
@@ -279,6 +281,7 @@ export interface LiveState extends StatusSlice {
 
   clearFailure(pond: PondId): Promise<void>;
   setBudget(pond: PondId, immediateRetries: number, sourceRetries: number): Promise<void>;
+  setDuck(pond: PondId, body: { size?: string | null; flock?: boolean | null; clear?: boolean }): Promise<void>;
 
   addWindow(pond: PondId, body: AddWindowBody): Promise<void>;
   removeWindow(pond: PondId, name: string): Promise<void>;
@@ -583,6 +586,7 @@ export const useLiveStore = create<LiveState>((set, get) => ({
   clearFailure: (pond) => act(get, set, () => clearFailure(pond)),
   setBudget: (pond, immediateRetries, sourceRetries) =>
     act(get, set, () => setBudget(pond, immediateRetries, sourceRetries)),
+  setDuck: (pond, body) => act(get, set, () => setDuck(pond, body)),
 
   // Spout control (the standing Wake) — wake/force/sleep/kill/clear/resync on a Spout node id.
   spoutControl: (spoutId, action) => act(get, set, () => controlSpout(spoutId, action)),

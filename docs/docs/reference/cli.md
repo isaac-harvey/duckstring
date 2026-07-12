@@ -159,6 +159,15 @@ See [Control](../guides/control.md) and [Fault Tolerance](../guides/fault-tolera
 | `control clear {pond}` | Reset a failed/killed Pond to idle and unblock downstream, without running. |
 | `control failure-budget {pond} [-i N] [-o N]` | Show (no flags) or set the retry budgets: `--immediate` Ripple retries per run, `--on-change` Pond Runs retried as Sources update. |
 
+## `duckstring duck` — per-Pond worker config
+
+```bash
+duckstring duck show [pond]
+duckstring duck set {pond} [--size s|m|l|xl] [--flock on|off] [--clear]
+```
+
+Operational config for the Pond's worker, owned by the operator (never `pond.toml`): a preset **size** and whether the worker may escalate work to an execution offload engine (**flock**). Unset values inherit the Catchment defaults (`DUCKSTRING_DUCK_SIZE` / `DUCKSTRING_DUCK_FLOCK`); `--clear` reverts to them. Inert on a stock local Catchment — the local worker is whatever the host is — and picked up by remote launchers that size worker machines.
+
 ## `duckstring status` — live monitor
 
 ```bash

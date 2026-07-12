@@ -327,6 +327,36 @@ def get_budget(name: str, request: Request, major: int | None = None, version: s
     return _driver(request).retry_config(_resolve(request, name, major, version))
 
 
+# ─── Duck config (prereqs D5) ────────────────────────────────────────────────
+
+
+class _DuckBody(BaseModel):
+    size: str | None = None    # 's' | 'm' | 'l' | 'xl'; None = keep the current override
+    flock: bool | None = None  # None = keep the current override
+    clear: bool = False        # drop the override entirely (revert to the Catchment defaults)
+
+
+@router.post("/ponds/{name}/duck", dependencies=[auth.full])
+def set_duck(
+    name: str, body: _DuckBody, request: Request,
+    major: int | None = None, version: str | None = None,
+):
+    """Set the Pond's Duck config override (preset size / Flock escalation). Operational config,
+    operator-owned — never pond.toml."""
+    key = _resolve(request, name, major, version)
+    try:
+        _driver(request).set_duck(key, size=body.size, flock=body.flock, clear=body.clear)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+    return {"ok": True}
+
+
+@router.get("/ponds/{name}/duck", dependencies=[auth.read])
+def get_duck(name: str, request: Request, major: int | None = None, version: str | None = None):
+    """The Pond's effective Duck config (override where set, else the Catchment default)."""
+    return _driver(request).duck_config(_resolve(request, name, major, version))
+
+
 # ─── Cross-Catchment exposure (open / tap-on-get) ────────────────────────────
 
 
