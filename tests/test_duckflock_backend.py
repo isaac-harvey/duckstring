@@ -215,6 +215,24 @@ def test_non_capturable_ripple_runs_classic(tmp_path):
     assert any("not capturable" in w for w in out.warnings)
 
 
+def test_raw_con_ripple_runs_classic(tmp_path):
+    """A ripple reaching for ``pond.con`` (or any host surface the recorder doesn't model) is
+    non-capturable BY CONSTRUCTION — it must degrade to classic, never fail with an
+    AttributeError (caught live: the demo inlets' raw-con ingest failed under routing)."""
+    _, source_catalog = _publish_source(tmp_path, "SELECT 1 AS id, 'a' AS v", ts(1))
+    pond = _sink(tmp_path, ts(1), NEVER)
+
+    def con_ripple(p):
+        p.con.execute("CREATE OR REPLACE TABLE raw AS SELECT 1 AS id, 'a' AS v")
+        return None
+
+    out = execute(DuckflockConfig(bin="duckflock"), pond, con_ripple,
+                  source_catalog=source_catalog, quote_fn=lambda p, c: {"route": "duckflock"})
+    assert out.route == "classic" and out.executed_locally
+    assert any("not capturable" in w for w in out.warnings)
+    assert _table_exists(pond.con, "raw")  # the classic run actually executed
+
+
 # ─── config from the environment ────────────────────────────────────────────────
 
 

@@ -344,6 +344,15 @@ class CapturePond:
     def skip(self, *a, **k):
         self._no("pond.skip()")
 
+    def __getattr__(self, name: str):
+        # Any host surface the recorder doesn't model (``pond.con``, ``pond.f``, object staging,
+        # future additions) is non-capturable BY CONSTRUCTION — raise the loud, catchable signal,
+        # never a bare AttributeError (which would fail the ripple instead of degrading it to
+        # classic execution).
+        raise NonCapturable(
+            f"pond.{name} is not capturable — the ripple runs on the classic host path"
+        )
+
 
 def capture_plan(run_python, *, source_catalog, own_location: str = "__OWN__") -> dict:
     """Capture a ripple function into the plan-IR **body** ``{"catalog", "statements"}``.

@@ -208,6 +208,12 @@ def execute(config: DuckflockConfig, pond, run_python, *, source_catalog, own_lo
         )
     except NonCapturable as exc:
         return _classic(pond, run_python, "classic", _warn(warnings, f"ripple not capturable ({exc}) — running classic"))
+    except Exception as exc:
+        # A capture bug (or user code the recorder trips over in an unforeseen way) must degrade,
+        # not fail the ripple: classic execution is the semantic oracle, and a genuine user error
+        # will raise identically there — attributed to the ripple, as it should be.
+        return _classic(pond, run_python, "classic",
+                        _warn(warnings, f"capture failed unexpectedly ({exc!r}) — running classic"))
 
     try:
         quote = quote_fn(plan, config)
