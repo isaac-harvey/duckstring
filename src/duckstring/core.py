@@ -673,6 +673,3 @@ class Pond:
         return TrickleBuilder(self, spine_ref, p=p)
 
 
-class Ripple:
-    # TODO: runtime wrapper around a registered ripple function — name, func, parents list
-    pass

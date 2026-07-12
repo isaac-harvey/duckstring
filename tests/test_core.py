@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import duckstring
 from duckstring import ripple
-from duckstring.core import Catchment, Pond, Ripple
+from duckstring.core import Catchment, Pond
 
 
 def test_ripple_exported():
@@ -49,7 +49,6 @@ def test_ripple_with_name_arg():
 def test_stub_classes_importable():
     assert Catchment is not None
     assert Pond is not None
-    assert Ripple is not None
 
 
 def test_previous_f_defaults_to_never():

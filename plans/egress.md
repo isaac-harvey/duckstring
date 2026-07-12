@@ -1,6 +1,10 @@
 # Egress: publishing a Pond's output to external systems
 
-Status: **designed, unbuilt.** The OSS "last mile" — getting a Pond's output *out* of the Catchment and
+Status: **built** (the Spout construct as a real engine node, the `file://`/`s3://`/`gs://` snapshot
+drivers, the Postgres CDC driver, the egress worker, CLI/API/UI — the per-section Status lines below
+are current). Remaining: the incremental object-store path + real-backend (MinIO/Postgres) CI e2es.
+
+The OSS "last mile" — getting a Pond's output *out* of the Catchment and
 into the systems a team already runs (object storage, a transactional database), with a pluggable seam
 so the long tail is community- (and later cloud-) owned. Builds directly on the Trickle data layer
 (`plans/trickle.md`, `src/duckstring/trickle_io.py`): **egress is a Trickle consumer whose storage is
