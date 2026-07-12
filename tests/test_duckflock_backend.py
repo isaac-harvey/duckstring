@@ -1,16 +1,13 @@
-"""DuckFlock execution routing (duckstring as the DuckFlock client SDK). The backend captures a
-ripple's plan, quotes it (``duckflock quote``), and either runs it classically on duckstring's own
-engine (``route: local``) or submits it to DuckFlock (``route: duckflock``). Every DuckFlock-side
-failure degrades to classic local execution with a warning; with no endpoint configured the backend
-is a no-op. Offline tests inject fake quote/submit seams; a gated test drives the real ``duckflock``
-binary end-to-end (skipped unless ``DUCKFLOCK_BIN`` is set)."""
+"""DuckFlock execution routing (the embedded-driver backend). The backend captures a ripple's
+plan, quotes it (``duckflock quote``), and either runs it classically on duckstring's own engine
+(``route: local``) or through the co-resident driver (``duckflock run`` as a subprocess). Every
+DuckFlock-side failure degrades to classic local execution with a warning; with no ``DUCKFLOCK_BIN``
+configured the backend is a no-op. Offline tests inject fake quote/run seams; a gated test drives
+the real ``duckflock`` binary end-to-end (skipped unless ``DUCKFLOCK_BIN`` is set)."""
 
 from __future__ import annotations
 
-import json
 import os
-import subprocess
-import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -91,40 +88,40 @@ def test_disabled_config_runs_classic(tmp_path):
 def test_route_local_runs_classic(tmp_path):
     _, source_catalog = _publish_source(tmp_path, "SELECT 1 AS id, 'a' AS v", ts(1))
     pond = _sink(tmp_path, ts(1), NEVER)
-    cfg = DuckflockConfig(endpoint="http://fake", tenant="acme")
+    cfg = DuckflockConfig(bin="duckflock", tenant="acme")
 
     def quote_fn(plan, config):
         assert plan["duckflock_plan"] == 1 and plan["pond"]["name"] == "o"
         return {"route": "local", "why": "tiny", "chosen_modes": ["comprehensive"]}
 
-    def submit_fn(plan, config):
-        raise AssertionError("must not submit a locally-routed plan")
+    def run_fn(plan, config):
+        raise AssertionError("must not run a locally-routed plan through the driver")
 
-    out = execute(cfg, pond, _run_python, source_catalog=source_catalog, quote_fn=quote_fn, submit_fn=submit_fn)
+    out = execute(cfg, pond, _run_python, source_catalog=source_catalog, quote_fn=quote_fn, run_fn=run_fn)
     assert out.route == "local" and out.executed_locally
     assert out.quote["route"] == "local"
     assert _own_rows(pond, tmp_path) == [(1, "a")]
 
 
-# ─── the duckflock route submits and surfaces the result, without local execution ──
+# ─── the duckflock route runs the driver and surfaces the result, without local execution ──
 
 
-def test_route_duckflock_submits_and_surfaces_result(tmp_path):
+def test_route_duckflock_runs_driver_and_surfaces_result(tmp_path):
     _, source_catalog = _publish_source(tmp_path, "SELECT 1 AS id, 'a' AS v", ts(1))
     pond = _sink(tmp_path, ts(2), ts(1))
-    cfg = DuckflockConfig(endpoint="http://fake", tenant="acme")
+    cfg = DuckflockConfig(bin="duckflock", tenant="acme")
     seen = {}
 
     def quote_fn(plan, config):
         return {"route": "duckflock", "why": "big"}
 
-    def submit_fn(plan, config):
+    def run_fn(plan, config):
         seen["job_id"] = plan["job_id"]
         seen["epoch"] = plan["epoch"]
         return {"job_id": plan["job_id"], "status": "success",
                 "statements": [{"output": "out", "changed": True}], "execution": "single_node"}
 
-    out = execute(cfg, pond, _run_python, source_catalog=source_catalog, quote_fn=quote_fn, submit_fn=submit_fn)
+    out = execute(cfg, pond, _run_python, source_catalog=source_catalog, quote_fn=quote_fn, run_fn=run_fn)
     assert out.route == "duckflock"
     assert not out.executed_locally
     assert out.result_doc["status"] == "success"
@@ -142,8 +139,8 @@ def test_never_previous_f_serialises_to_sentinel(tmp_path):
         grabbed["epoch"] = plan["epoch"]
         return {"route": "duckflock"}
 
-    execute(DuckflockConfig(endpoint="http://fake"), pond, _run_python, source_catalog=source_catalog,
-            quote_fn=quote_fn, submit_fn=lambda p, c: {"status": "success"})
+    execute(DuckflockConfig(bin="duckflock"), pond, _run_python, source_catalog=source_catalog,
+            quote_fn=quote_fn, run_fn=lambda p, c: {"status": "success"})
     assert grabbed["epoch"]["previous_f"] == "0001-01-01T00:00:00+00:00"
 
 
@@ -157,24 +154,24 @@ def test_quote_failure_falls_back_to_classic(tmp_path):
     def quote_fn(plan, config):
         raise RuntimeError("duckflock binary missing")
 
-    out = execute(DuckflockConfig(endpoint="http://fake"), pond, _run_python,
+    out = execute(DuckflockConfig(bin="duckflock"), pond, _run_python,
                   source_catalog=source_catalog, quote_fn=quote_fn)
     assert out.route == "quote->classic" and out.executed_locally
     assert any("quote failed" in w for w in out.warnings)
     assert _own_rows(pond, tmp_path) == [(1, "a")]
 
 
-def test_submit_failure_falls_back_to_classic(tmp_path):
+def test_run_failure_falls_back_to_classic(tmp_path):
     _, source_catalog = _publish_source(tmp_path, "SELECT 1 AS id, 'a' AS v", ts(1))
     pond = _sink(tmp_path, ts(1), NEVER)
 
     out = execute(
-        DuckflockConfig(endpoint="http://fake"), pond, _run_python, source_catalog=source_catalog,
+        DuckflockConfig(bin="duckflock"), pond, _run_python, source_catalog=source_catalog,
         quote_fn=lambda p, c: {"route": "duckflock"},
-        submit_fn=lambda p, c: (_ for _ in ()).throw(ConnectionError("endpoint down")),
+        run_fn=lambda p, c: (_ for _ in ()).throw(ConnectionError("driver crashed")),
     )
     assert out.route == "duckflock->classic" and out.executed_locally
-    assert any("submit failed" in w for w in out.warnings)
+    assert any("run failed" in w for w in out.warnings)
     assert _own_rows(pond, tmp_path) == [(1, "a")]
 
 
@@ -183,9 +180,9 @@ def test_failed_job_falls_back_to_classic(tmp_path):
     pond = _sink(tmp_path, ts(1), NEVER)
 
     out = execute(
-        DuckflockConfig(endpoint="http://fake"), pond, _run_python, source_catalog=source_catalog,
+        DuckflockConfig(bin="duckflock"), pond, _run_python, source_catalog=source_catalog,
         quote_fn=lambda p, c: {"route": "duckflock"},
-        submit_fn=lambda p, c: {"status": "failed", "error": {"code": "BUILD_ERROR", "message": "boom"}},
+        run_fn=lambda p, c: {"status": "failed", "error": {"code": "BUILD_ERROR", "message": "boom"}},
     )
     assert out.route == "duckflock->classic" and out.executed_locally
     assert any("did not succeed" in w for w in out.warnings)
@@ -211,7 +208,7 @@ def test_non_capturable_ripple_runs_classic(tmp_path):
         called["quote"] = True
         return {"route": "duckflock"}
 
-    out = execute(DuckflockConfig(endpoint="http://fake"), pond, reduce_ripple,
+    out = execute(DuckflockConfig(bin="duckflock"), pond, reduce_ripple,
                   source_catalog=source_catalog, quote_fn=quote_fn)
     assert out.route == "classic" and out.executed_locally
     assert not called["quote"]  # capture failed before quoting
@@ -222,15 +219,34 @@ def test_non_capturable_ripple_runs_classic(tmp_path):
 
 
 def test_config_from_env_defaults_disabled(monkeypatch):
-    for k in list(os.environ):
-        if k.startswith("DUCKSTRING_DUCKFLOCK_"):
-            monkeypatch.delenv(k, raising=False)
+    for k in ("DUCKFLOCK_BIN", "DUCKFLOCK_TENANT", "DUCKFLOCK_EXPRESS_ROOT",
+              "DUCKFLOCK_RECORD_LOCAL", "DUCKSTRING_DUCK_FLOCK"):
+        monkeypatch.delenv(k, raising=False)
     assert not DuckflockConfig.from_env().enabled
-    monkeypatch.setenv("DUCKSTRING_DUCKFLOCK_ENDPOINT", "http://x:7877")
-    monkeypatch.setenv("DUCKSTRING_DUCKFLOCK_TENANT", "acme")
-    monkeypatch.setenv("DUCKSTRING_DUCKFLOCK_MAJOR", "3")
+    monkeypatch.setenv("DUCKFLOCK_BIN", "/opt/duckflock/duckflock")
+    monkeypatch.setenv("DUCKFLOCK_TENANT", "acme")
+    monkeypatch.setenv("DUCKFLOCK_EXPRESS_ROOT", "/scratch/express")
     cfg = DuckflockConfig.from_env()
-    assert cfg.enabled and cfg.tenant == "acme" and cfg.major == 3
+    assert cfg.enabled and cfg.tenant == "acme" and cfg.flock
+    assert cfg.express_location == "/scratch/express"
+    # escalation-disabled mode ("local" Ducks): distribution off ⇒ EMPTY express_location, never
+    # absent (absent would let the driver's own env fallback re-enable distribution).
+    monkeypatch.setenv("DUCKSTRING_DUCK_FLOCK", "off")
+    assert DuckflockConfig.from_env().express_location == ""
+
+
+def test_flock_off_plans_carry_empty_express_location(tmp_path):
+    _, source_catalog = _publish_source(tmp_path, "SELECT 1 AS id, 'a' AS v", ts(1))
+    pond = _sink(tmp_path, ts(1), NEVER)
+    cfg = DuckflockConfig(bin="duckflock", express_root="/scratch/express", flock=False)
+    grabbed = {}
+
+    def quote_fn(plan, config):
+        grabbed["config"] = plan["config"]
+        return {"route": "local"}
+
+    execute(cfg, pond, _run_python, source_catalog=source_catalog, quote_fn=quote_fn)
+    assert grabbed["config"]["express_location"] == ""
 
 
 # ─── the Duck executor routing hook (duck/duckflock_route.py) ────────────────────
@@ -248,13 +264,13 @@ def _executor(tmp_path, name="o"):
 
 
 def _fake_remote_submit(tmp_path):
-    """A submit seam that behaves like the DuckFlock driver: hydrate the plan's own location (the
+    """A run seam that behaves like the DuckFlock driver: hydrate the plan's own location (the
     scratch seed = prior state), run the ripple's semantics against it, publish back to scratch."""
     from datetime import datetime
 
     from duckstring.dataplane import hydrate_registry
 
-    def submit(plan, config):
+    def run(plan, config):
         scratch = Path(next(e["location"] for e in plan["catalog"].values() if "duckflock_scratch" in e["location"]))
         rcon = duckdb.connect()
         rcon.execute("SET TimeZone='UTC'")
@@ -270,7 +286,7 @@ def _fake_remote_submit(tmp_path):
         return {"status": "success",
                 "statements": [{"output": o, "changed": bool(c)} for o, c in result]}
 
-    return submit
+    return run
 
 
 def test_route_ripple_remote_two_epochs_matches_classic(tmp_path):
@@ -281,16 +297,16 @@ def test_route_ripple_remote_two_epochs_matches_classic(tmp_path):
 
     _, _sc = _publish_source(tmp_path, "SELECT * FROM (VALUES (1,'a'),(2,'b')) t(id,v)", ts(1))
     ex = _executor(tmp_path)
-    cfg = DuckflockConfig(endpoint="http://fake", tenant="t")
+    cfg = DuckflockConfig(bin="duckflock", tenant="t")
     quote = lambda p, c: {"route": "duckflock"}  # noqa: E731
-    submit = _fake_remote_submit(tmp_path)
+    run = _fake_remote_submit(tmp_path)
 
-    out1 = route_ripple(ex, cfg, _run_python, ts(1), NEVER, quote_fn=quote, submit_fn=submit)
+    out1 = route_ripple(ex, cfg, _run_python, ts(1), NEVER, quote_fn=quote, run_fn=run)
     assert out1.route == "duckflock" and not out1.executed_locally
     ex.export(f=ts(1))  # the normal run-end publish ships the hydrated result
 
     _publish_source(tmp_path, "SELECT * FROM (VALUES (1,'a'),(2,'B'),(3,'c')) t(id,v)", ts(2))
-    out2 = route_ripple(ex, cfg, _run_python, ts(2), ts(1), quote_fn=quote, submit_fn=submit)
+    out2 = route_ripple(ex, cfg, _run_python, ts(2), ts(1), quote_fn=quote, run_fn=run)
     assert out2.route == "duckflock"
     ex.export(f=ts(2))
 
@@ -333,9 +349,9 @@ def test_route_ripple_remote_failure_runs_classic_on_registry(tmp_path):
     _publish_source(tmp_path, "SELECT 1 AS id, 'a' AS v", ts(1))
     ex = _executor(tmp_path)
     out = route_ripple(
-        ex, DuckflockConfig(endpoint="http://fake"), _run_python, ts(1), NEVER,
+        ex, DuckflockConfig(bin="duckflock"), _run_python, ts(1), NEVER,
         quote_fn=lambda p, c: {"route": "duckflock"},
-        submit_fn=lambda p, c: (_ for _ in ()).throw(ConnectionError("down")),
+        run_fn=lambda p, c: (_ for _ in ()).throw(ConnectionError("down")),
     )
     assert out.route == "duckflock->classic" and out.executed_locally
     ex.export(f=ts(1))
@@ -355,9 +371,9 @@ def test_route_ripple_refresh_carries_flag_and_empty_seed(tmp_path):
     _publish_source(tmp_path, "SELECT 1 AS id, 'a' AS v", ts(1))
     ex = _executor(tmp_path)
     quote = lambda p, c: {"route": "duckflock"}  # noqa: E731
-    submit = _fake_remote_submit(tmp_path)
-    route_ripple(ex, DuckflockConfig(endpoint="http://fake"), _run_python, ts(1), NEVER,
-                 quote_fn=quote, submit_fn=submit)
+    run = _fake_remote_submit(tmp_path)
+    route_ripple(ex, DuckflockConfig(bin="duckflock"), _run_python, ts(1), NEVER,
+                 quote_fn=quote, run_fn=run)
     ex.export(f=ts(1))
     ex.wipe()
     assert ex._refresh_pending
@@ -369,10 +385,10 @@ def test_route_ripple_refresh_carries_flag_and_empty_seed(tmp_path):
                             if "duckflock_scratch" in e["location"]))
         seen["refresh"] = plan["config"]["refresh"]
         seen["seeded"] = sorted(p.name for p in scratch.iterdir()) if scratch.exists() else []
-        return submit(plan, config)
+        return run(plan, config)
 
-    route_ripple(ex, DuckflockConfig(endpoint="http://fake"), _run_python, ts(2), NEVER,
-                 refresh=ex._refresh_pending, quote_fn=quote, submit_fn=spy_submit)
+    route_ripple(ex, DuckflockConfig(bin="duckflock"), _run_python, ts(2), NEVER,
+                 refresh=ex._refresh_pending, quote_fn=quote, run_fn=spy_submit)
     assert seen["refresh"] is True
     assert seen["seeded"] == []  # no prior state shipped to a refresh run
     ex.export(f=ts(2))
@@ -381,7 +397,7 @@ def test_route_ripple_refresh_carries_flag_and_empty_seed(tmp_path):
 
 
 def test_executor_submit_routes_when_enabled(tmp_path, monkeypatch):
-    """The executor's _task branches to route_ripple iff DUCKSTRING_DUCKFLOCK_ENDPOINT is set."""
+    """The executor's _task branches to route_ripple iff DUCKFLOCK_BIN is set."""
     import duckstring.duck.duckflock_route as dr
     import duckstring.duck.executor as exmod
 
@@ -391,7 +407,7 @@ def test_executor_submit_routes_when_enabled(tmp_path, monkeypatch):
     calls = []
 
     def spy_route(e, cfg, func, f, pf, **kw):
-        calls.append(cfg.endpoint)
+        calls.append(cfg.bin)
         func_con = e._cursor()
         try:
             func(Pond("o", "1.0.0", func_con, root=tmp_path, source_majors={"src": 1}, f=f, previous_f=pf))
@@ -401,16 +417,16 @@ def test_executor_submit_routes_when_enabled(tmp_path, monkeypatch):
     monkeypatch.setattr(dr, "route_ripple", spy_route)
 
     done, err = [], []
-    monkeypatch.delenv("DUCKSTRING_DUCKFLOCK_ENDPOINT", raising=False)
+    monkeypatch.delenv("DUCKFLOCK_BIN", raising=False)
     ex.submit("r", ts(1), NEVER, lambda *a: done.append(a), lambda *a: err.append(a)).result()
     assert not calls and not err  # disabled → classic, no routing
 
-    monkeypatch.setenv("DUCKSTRING_DUCKFLOCK_ENDPOINT", "http://fake")
+    monkeypatch.setenv("DUCKFLOCK_BIN", "/opt/duckflock/duckflock")
     ex.submit("r", ts(2), ts(1), lambda *a: done.append(a), lambda *a: err.append(a)).result()
     import time
 
     time.sleep(0.05)  # let the done-callback fire
-    assert calls == ["http://fake"] and not err
+    assert calls == ["/opt/duckflock/duckflock"] and not err
     ex.shutdown()
 
 
@@ -419,9 +435,9 @@ def test_executor_submit_routes_when_enabled(tmp_path, monkeypatch):
 
 @pytest.mark.skipif(not os.environ.get("DUCKFLOCK_BIN"), reason="set DUCKFLOCK_BIN to the duckflock CLI")
 def test_real_duckflock_route_matches_classic(tmp_path):
-    """The plane-state-identity property from the duckstring side: a plan routed to the REAL duckflock
-    engine (via `duckflock run` as the submit seam) publishes byte-identical output to classic
-    execution — and a stats-tagged trivial plan routes local."""
+    """The plane-state-identity property from the duckstring side: a plan routed through the REAL
+    co-resident driver (the default `duckflock run` subprocess path — no injected seams) publishes
+    byte-identical output to classic execution — and a stats-tagged trivial plan routes local."""
     duckflock = os.environ["DUCKFLOCK_BIN"]
     _, source_catalog = _publish_source(tmp_path, "SELECT * FROM (VALUES (1,'a'),(2,'b')) t(id,v)", ts(1))
 
@@ -429,21 +445,11 @@ def test_real_duckflock_route_matches_classic(tmp_path):
     own_dir = tmp_path / "ponds" / "o" / "m1" / "data"
     own_dir.mkdir(parents=True, exist_ok=True)
 
-    def cli_run_submit(plan, config):
-        with tempfile.NamedTemporaryFile("w", suffix=".plan.json", delete=False) as pf:
-            json.dump(plan, pf)
-            ppath = pf.name
-        rpath = ppath + ".result.json"
-        subprocess.run([duckflock, "run", "--plan", ppath, "--result", rpath],
-                       check=True, capture_output=True, text=True)
-        return json.loads(Path(rpath).read_text())
-
-    cfg = DuckflockConfig(endpoint="http://unused", tenant="test", quote_bin=duckflock, record_local=False)
+    cfg = DuckflockConfig(bin=duckflock, tenant="test", record_local=False)
 
     # (1) no catalog stats → the real quote routes `duckflock`; run it and capture the published output.
     pond = _sink(tmp_path, ts(1), NEVER)
-    out = execute(cfg, pond, _run_python, source_catalog=source_catalog,
-                  own_location=str(own_dir), submit_fn=cli_run_submit)
+    out = execute(cfg, pond, _run_python, source_catalog=source_catalog, own_location=str(own_dir))
     assert out.route == "duckflock", out.warnings
     rcon = duckdb.connect()
     rcon.execute("SET TimeZone='UTC'")
@@ -465,8 +471,7 @@ def test_real_duckflock_route_matches_classic(tmp_path):
     _, sc_stats = _publish_source(broot, "SELECT * FROM (VALUES (1,'a')) t(id,v)", ts(1))
     pond2 = _sink(broot, ts(1), NEVER)
     out2 = execute(cfg, pond2, _run_python,
-                   source_catalog=lambda ref: sc_stats(ref, stats={"rows": 1, "bytes": 16}),
-                   submit_fn=cli_run_submit)
+                   source_catalog=lambda ref: sc_stats(ref, stats={"rows": 1, "bytes": 16}))
     assert out2.route == "local" and out2.executed_locally
 
 

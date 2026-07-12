@@ -182,8 +182,8 @@ class RippleExecutor:
             func = _load_ripple(self.source_path, str(self.root), ripple_name)
             dfl = DuckflockConfig.from_env()
             if dfl.enabled:
-                # DuckFlock routing (opt-in via DUCKSTRING_DUCKFLOCK_ENDPOINT): capture → quote →
-                # run locally or offload. route_ripple completes the ripple either way (every
+                # DuckFlock routing (opt-in via DUCKFLOCK_BIN — the co-resident driver): capture →
+                # quote → run locally or offload. route_ripple completes the ripple either way (every
                 # DuckFlock-side failure degrades to classic inside it) and hydrates a remote
                 # result back into the registry, so the rest of the run is path-identical.
                 from .duckflock_route import route_ripple

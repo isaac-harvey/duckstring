@@ -29,7 +29,7 @@ The freshness/push-token runtime is **implemented and tested** (the old generati
 src/duckstring/
   core.py                  # Pond/Ripple handles + @ripple/@puddle decorators (incremental I/O is a Pond-handle capability — there is NO @trickle node type) + Catchment client + pond.toml/entrypoint/import helpers
   dataplane.py             # The DATA PLANE: how a Pond publishes/reads tables cross-Pond (pluggable; Iceberg default). Also hydrate_registry (published state → registry, the export inverse — Duck registry-loss recovery + the DuckFlock routing read-back) and the Extension-1 state/ companion snapshots + Extension-2 sidecar stats. See Data plane.
-  duckflock_backend.py     # DuckFlock execution routing (opt-in via DUCKSTRING_DUCKFLOCK_ENDPOINT): capture → quote → run classic or POST /jobs + poll; every offload failure degrades to classic. The client SDK; the Duck hook is duck/duckflock_route.py.
+  duckflock_backend.py     # DuckFlock execution routing (opt-in via DUCKFLOCK_BIN — the co-resident driver): capture → quote → run classic or `duckflock run --plan` as a subprocess (no HTTP client, no submit/poll); DUCKSTRING_DUCK_FLOCK=off ⇒ empty express_location (distribution off); every driver failure degrades to classic. The Duck hook is duck/duckflock_route.py.
   iceberg_plane.py         # IcebergDataPlane: the default backend (core deps; DUCKSTRING_DATA_PLANE=parquet opts out)
   iceberg_catalog.py       # FileCatalog: a JSON-pointer pyiceberg catalog (no SQLAlchemy) used by iceberg_plane
   schema_contract.py       # Version contract: extract_schema(con) + contract_violations(output, contract) (additive check)

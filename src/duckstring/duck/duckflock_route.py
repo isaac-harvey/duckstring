@@ -1,13 +1,13 @@
 """The Duck-side DuckFlock routing hook — where :mod:`duckstring.duckflock_backend` meets the
 :class:`~duckstring.duck.executor.RippleExecutor`.
 
-Enabled per Catchment/Duck by ``DUCKSTRING_DUCKFLOCK_ENDPOINT`` (see
+Enabled per Catchment/Duck by ``DUCKFLOCK_BIN`` — the co-resident driver CLI (see
 :class:`~duckstring.duckflock_backend.DuckflockConfig`); absent, the executor runs every ripple on the
 classic path unchanged. Enabled, each ripple is captured → quoted → routed:
 
 - **local** (or non-capturable / any DuckFlock failure) → the ripple runs classically on the
   executor's registry cursor, exactly as before.
-- **duckflock** → the remote job publishes into a per-run **scratch dir** seeded with the outputs'
+- **duckflock** → ``duckflock run`` (a subprocess) publishes into a per-run **scratch dir** seeded with the outputs'
   prior published state (:func:`~duckstring.duckflock_backend.seed_scratch`), and the results are
   hydrated back into the registry (:func:`~duckstring.dataplane.hydrate_registry`) — so downstream
   ripples, the run-end export, and the contract gate all see them exactly as if the ripple had run
@@ -32,7 +32,7 @@ SCRATCH_DIR = "duckflock_scratch"
 
 def route_ripple(ex, config: DuckflockConfig, func, f, previous_f, *,
                  sources_changed: bool = True, skip_sink=None, refresh: bool = False,
-                 quote_fn=None, submit_fn=None) -> Outcome:
+                 quote_fn=None, run_fn=None) -> Outcome:
     """Route one ripple ``func`` through the DuckFlock backend for executor ``ex``. Runs the ripple
     (locally or remotely) to completion; the classic fallback inside :func:`execute` means this call
     completes the ripple whatever DuckFlock does. Raises only what the ripple itself raises."""
@@ -43,7 +43,7 @@ def route_ripple(ex, config: DuckflockConfig, func, f, previous_f, *,
     if not getattr(pond_data_dir(ex.root, ex.pond_name, ex.major, ex.data_root), "is_local", False):
         log.warning("duckflock routing needs a local own data dir (object-store DUCKSTRING_DATA_ROOT "
                     "seeding is not supported yet) — running classic")
-        config = replace(config, endpoint=None)  # disabled → execute() takes the classic path
+        config = replace(config, bin=None)  # disabled → execute() takes the classic path
 
     config = replace(config, major=ex.major)  # the envelope carries the executor's real major line
     scratch = pond_major_dir(ex.root, ex.pond_name, ex.major) / SCRATCH_DIR
@@ -79,7 +79,7 @@ def route_ripple(ex, config: DuckflockConfig, func, f, previous_f, *,
         )
         out = execute(
             config, pond, func, source_catalog=source_catalog, own_location=str(scratch),
-            prepare_remote=prepare_remote, refresh=refresh, quote_fn=quote_fn, submit_fn=submit_fn,
+            prepare_remote=prepare_remote, refresh=refresh, quote_fn=quote_fn, run_fn=run_fn,
         )
         if out.route == "duckflock":  # remote success → read the scratch results back into the registry
             outputs = [s["output"]["name"] for s in out.plan["statements"]]
