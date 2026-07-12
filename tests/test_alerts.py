@@ -314,3 +314,87 @@ def test_worker_marks_sent_and_parks_failed(tmp_path):
     assert log["bad"]["status"] == "failed" and log["bad"]["attempts"] == 6
     # A parked delivery is no longer offered to the worker.
     assert d.take_alert_deliveries() == []
+
+
+# ─── Re-notify cadence (opt-in) ─────────────────────────────────────────────────
+
+
+def test_failure_renotifies_at_interval_while_episode_persists(tmp_path, monkeypatch):
+    """A channel with renotify_ms re-fires the SAME failure alert once per interval while the Pond stays
+    failed (time-bucketed dedup); recovery still fires exactly once. A channel without renotify keeps the
+    once-per-episode behaviour untouched."""
+    import duckstring.catchment.driver as drv
+
+    d = _driver(tmp_path)
+    d.add_channel("pager", "https://x/pager", scope=None, events="failure,recovery", renotify_ms=60_000)
+    d.add_channel("quiet", "https://x/quiet", scope=None, events="failure,recovery")  # no cadence
+    key = pond_key("sales", 1)
+
+    t0 = _now()
+    monkeypatch.setattr(drv, "_now", lambda: t0)
+    d.state.pond_states[key].start_f = t0
+    d._fail_whole_pond(key, t0, "kaboom")
+    assert [r[0] for r in _deliveries(d)] == ["failure", "failure"]  # one per channel
+
+    # Same interval → the bucketed key dedups; nothing new on a tick.
+    d._check_renotify(t0)
+    assert len(_deliveries(d)) == 2
+
+    # Next interval, still failed → ONLY the renotify channel re-fires.
+    t1 = t0 + timedelta(seconds=61)
+    monkeypatch.setattr(drv, "_now", lambda: t1)
+    d._check_renotify(t1)
+    kinds = [r[0] for r in _deliveries(d)]
+    assert kinds == ["failure", "failure", "failure"]
+
+    # Clear → exactly one recovery per channel; no further re-notifies.
+    d.clear(key)
+    t2 = t1 + timedelta(seconds=61)
+    monkeypatch.setattr(drv, "_now", lambda: t2)
+    d._check_renotify(t2)
+    kinds = [r[0] for r in _deliveries(d)]
+    assert kinds.count("recovery") == 2 and kinds.count("failure") == 3
+
+
+def test_freshness_renotifies_at_interval(tmp_path, monkeypatch):
+    import duckstring.catchment.driver as drv
+
+    d = _driver(tmp_path)
+    d.add_channel("sla", "https://x/sla", scope="sales", events="freshness",
+                  stale_ms=60_000, renotify_ms=120_000)
+    key = pond_key("sales", 1)
+    ps = d.state.pond_states[key]
+
+    t0 = _now()
+    monkeypatch.setattr(drv, "_now", lambda: t0)
+    ps.end_f = t0 - timedelta(seconds=300)
+    d._check_freshness(t0)
+    assert [r[0] for r in _deliveries(d)] == ["freshness"]
+    d._check_freshness(t0)  # same bucket → no dupe
+    assert len(_deliveries(d)) == 1
+
+    t1 = t0 + timedelta(seconds=121)  # next bucket, still stale → re-fires
+    monkeypatch.setattr(drv, "_now", lambda: t1)
+    d._check_freshness(t1)
+    assert [r[0] for r in _deliveries(d)] == ["freshness", "freshness"]
+
+    ps.end_f = t1  # fresh again → one recovery, and no more re-fires after
+    d._check_freshness(t1)
+    assert [r[0] for r in _deliveries(d)] == ["freshness", "freshness", "recovery"]
+
+
+def test_killed_pond_is_never_renotified(tmp_path, monkeypatch):
+    import duckstring.catchment.driver as drv
+
+    d = _driver(tmp_path)
+    d.add_channel("pager", "https://x/pager", scope=None, events="failure", renotify_ms=1_000)
+    key = pond_key("sales", 1)
+    t0 = _now()
+    monkeypatch.setattr(drv, "_now", lambda: t0)
+    d.state.pond_states[key].start_f = t0
+    d._fail_whole_pond(key, t0, "kaboom")
+    d.kill(key)
+    t1 = t0 + timedelta(seconds=5)
+    monkeypatch.setattr(drv, "_now", lambda: t1)
+    d._check_renotify(t1)
+    assert [r[0] for r in _deliveries(d)] == ["failure"]  # a kill is intentional — silence

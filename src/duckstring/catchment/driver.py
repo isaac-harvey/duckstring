@@ -190,7 +190,8 @@ class Driver:
         # a failure/contract/spout alert for → their recovery is emitted centrally in _process when they
         # clear; _stale_breached tracks (channel_id, pond_key) currently over their freshness SLA.
         self._alert_cb = None
-        self._alerted_failures: dict[str, tuple[str, str | None, str | None]] = {}
+        self._alerted_failures: dict[str, tuple] = {}  # key → (kind, scope_pond, scope_major, f, title, message)
+        self._renotify_channels = False  # any enabled channel with a re-notify interval (refreshed per sweep)
         self._stale_breached: set[tuple[int, str]] = set()
         # Monotonic counter bumped on every state change — the UI long-polls /api/status against it, so
         # the display updates the instant the engine state moves rather than on a fixed timer.
@@ -1242,7 +1243,8 @@ class Driver:
     # ─── Alerts (failure & freshness notifications — see plans/alerts.md) ────────
 
     def add_channel(self, name: str, destination: str, scope: str | None,
-                    events: str = "all", stale_ms: int | None = None) -> None:
+                    events: str = "all", stale_ms: int | None = None,
+                    renotify_ms: int | None = None) -> None:
         """Create a notification channel (operational config, like a Spout). ``scope`` is ``"name@major"``
         (one line) or ``None`` (catchment-wide) — a Pond-scoped channel is always a specific major. A bare
         ``"name"`` resolves to the Pond's **highest deployed major** (like every other CLI/API surface); an
@@ -1265,21 +1267,21 @@ class Driver:
             if existing:
                 raise ValueError(f"An alert channel named '{name}' already exists")
             self.db.execute(
-                "INSERT INTO alert_channel (name, destination, scope_name, scope_major, events, stale_ms) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (name, destination, scope_name, scope_major, events, stale_ms),
+                "INSERT INTO alert_channel (name, destination, scope_name, scope_major, events, stale_ms, "
+                "renotify_ms) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (name, destination, scope_name, scope_major, events, stale_ms, renotify_ms),
             )
             self.db.commit()
 
     def list_channels(self) -> list[dict]:
         with self.lock:
             rows = self.db.execute(
-                "SELECT name, destination, scope_name, scope_major, events, stale_ms, enabled, created_at "
-                "FROM alert_channel ORDER BY name"
+                "SELECT name, destination, scope_name, scope_major, events, stale_ms, enabled, created_at, "
+                "renotify_ms FROM alert_channel ORDER BY name"
             ).fetchall()
             return [
                 {"name": r[0], "destination": r[1], "scope": _format_scope(r[2], r[3]), "events": r[4],
-                 "stale_ms": r[5], "enabled": bool(r[6]), "created_at": r[7]}
+                 "stale_ms": r[5], "enabled": bool(r[6]), "created_at": r[7], "renotify_ms": r[8]}
                 for r in rows
             ]
 
@@ -1359,12 +1361,12 @@ class Driver:
 
             wanted = match_kinds or (kind,)
             channels = self.db.execute(
-                "SELECT id, events, scope_name, scope_major FROM alert_channel WHERE enabled = 1"
+                "SELECT id, events, scope_name, scope_major, renotify_ms FROM alert_channel WHERE enabled = 1"
             ).fetchall()
             if not channels:
                 return
             enqueued = False
-            for cid, events, scope_name, ch_major in channels:
+            for cid, events, scope_name, ch_major, renotify_ms in channels:
                 # A Pond-scoped channel matches exactly its (name, major); catchment-wide (name NULL) matches all.
                 if scope_name is not None and (scope_name != scope_pond or ch_major != scope_major):
                     continue
@@ -1376,6 +1378,12 @@ class Driver:
                     f=f, catchment=self._catchment_display(), detail=detail or {},
                 )
                 dedup = f"{kind}:{scope_pond or '-'}:{f or '-'}"
+                # Re-notify cadence (opt-in): a channel with renotify_ms fences per TIME BUCKET, not per
+                # episode — the tick's re-emission then passes the UNIQUE fence once per interval while
+                # the episode persists. A recovery stays once-per-episode (nothing re-fires it).
+                if renotify_ms and kind != "recovery":
+                    bucket = int(_now().timestamp() * 1000 // int(renotify_ms))
+                    dedup = f"{dedup}:r{bucket}"
                 cur = self.db.execute(
                     "INSERT OR IGNORE INTO alert_delivery "
                     "(channel_id, dedup_key, event_kind, pond_name, severity, payload) "
@@ -1401,7 +1409,9 @@ class Driver:
         detail = {"blocked_downstream": blocked} if blocked else {}
         self._emit_alert(kind, scope_pond=scope_pond, scope_major=scope_major, severity="error",
                          title=title, message=message, f=f, detail=detail)
-        self._alerted_failures[key] = (kind, scope_pond, scope_major, f)
+        # Remember the episode (for the recovery on clear, and for _check_renotify's re-emission —
+        # title/message ride along so a re-notify repeats the original alert verbatim).
+        self._alerted_failures[key] = (kind, scope_pond, scope_major, f, title, message)
 
     def _emit_recoveries(self) -> None:
         """Emit a `recovery` for any Pond/Spout that was alerted as failed and has since cleared. Called
@@ -1410,7 +1420,7 @@ class Driver:
             ps = self.state.pond_states.get(key)
             if ps is not None and (ps.is_failed or ps.is_killed):
                 continue  # still down (or killed — a kill is intentional, not a recovery)
-            kind, scope_pond, scope_major, _f = self._alerted_failures.pop(key)
+            kind, scope_pond, scope_major, _f, _title, _message = self._alerted_failures.pop(key)
             label = self.meta.get(key, {}).get("name", key)
             self._emit_alert(
                 "recovery", scope_pond=scope_pond, scope_major=scope_major, severity="info",
@@ -1428,6 +1438,7 @@ class Driver:
         ).fetchall()
         if not channels:
             return
+        self._renotify_channels = self._any_renotify()  # computed once per sweep
         for cid, scope_name, ch_major, events, stale_ms in channels:
             from ..alerts import normalise_events
             if "freshness" not in normalise_events(events):
@@ -1444,15 +1455,20 @@ class Driver:
                     continue
                 stale = (now - ps.end_f) > bound
                 token = (cid, key)
-                if stale and token not in self._stale_breached:
+                if stale:
+                    first = token not in self._stale_breached
                     self._stale_breached.add(token)
+                    # Emitted on the transition AND on every later tick while breached: for a channel
+                    # without renotify_ms the dedup fence swallows the repeats (once per episode); with
+                    # it, the bucketed key re-fires once per interval (the re-notify cadence).
                     age = int((now - ps.end_f).total_seconds())
-                    self._emit_alert(
-                        "freshness", scope_pond=name, scope_major=major, severity="warning",
-                        title=f"'{name}' is stale", f=_iso(ps.end_f),
-                        message=f"'{name}' has not been fresh for {age}s (SLA {int(stale_ms / 1000)}s).",
-                        detail={"stale_seconds": age},
-                    )
+                    if first or self._renotify_channels:
+                        self._emit_alert(
+                            "freshness", scope_pond=name, scope_major=major, severity="warning",
+                            title=f"'{name}' is stale", f=_iso(ps.end_f),
+                            message=f"'{name}' has not been fresh for {age}s (SLA {int(stale_ms / 1000)}s).",
+                            detail={"stale_seconds": age},
+                        )
                 elif not stale and token in self._stale_breached:
                     self._stale_breached.discard(token)
                     self._emit_alert(
@@ -1461,6 +1477,26 @@ class Driver:
                         message=f"'{name}' advanced back within its freshness SLA.",
                         match_kinds=("recovery", "freshness"),
                     )
+
+    def _any_renotify(self) -> bool:
+        return self.db.execute(
+            "SELECT 1 FROM alert_channel WHERE enabled = 1 AND renotify_ms IS NOT NULL LIMIT 1"
+        ).fetchone() is not None
+
+    def _check_renotify(self, now: datetime) -> None:
+        """The tick-driven re-notify sweep (alongside _check_freshness): while a **failure episode
+        persists** (the Pond is still failed), re-emit the original alert. Channels without
+        ``renotify_ms`` swallow the repeat at their once-per-episode dedup fence; channels with it
+        re-fire once per interval via the time-bucketed key (see _emit_alert). Freshness re-notify rides
+        _check_freshness's own sweep. No-op without a renotify channel — zero cost on the default path."""
+        if not self._alerted_failures or not self._any_renotify():
+            return
+        for key, (kind, scope_pond, scope_major, f, title, message) in list(self._alerted_failures.items()):
+            ps = self.state.pond_states.get(key)
+            if ps is None or not ps.is_failed or ps.is_killed:
+                continue  # cleared (recovery handles it) or killed (intentional — never re-notified)
+            self._emit_alert(kind, scope_pond=scope_pond, scope_major=scope_major, severity="error",
+                             title=title, message=message, f=f)
 
     # ─── Duck events ──────────────────────────────────────────────────────────
 
@@ -1935,6 +1971,7 @@ class Driver:
             self._check_liveness(now)
             self._tick_process(now)
             self._check_freshness(now)
+            self._check_renotify(now)
 
     def _check_liveness(self, now: datetime) -> None:
         """Fail any Pond whose Duck has died (process gone) or fallen silent (no contact) while a Run

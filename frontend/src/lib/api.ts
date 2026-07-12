@@ -419,6 +419,7 @@ export interface RawAlertChannel {
   scope: string | null; // a pond name, or null for catchment-wide
   events: string; // CSV of kinds, or 'all'
   stale_ms: number | null;
+  renotify_ms?: number | null; // re-notify interval while an episode persists; null = once per episode
   enabled: boolean;
   created_at: string | null;
 }
@@ -446,6 +447,7 @@ export function addAlert(body: {
   scope?: string | null;
   events?: string;
   stale_ms?: number | null;
+  renotify_ms?: number | null;
 }): Promise<void> {
   return postJSON('/alerts', body);
 }
