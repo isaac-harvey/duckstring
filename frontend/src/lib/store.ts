@@ -156,6 +156,7 @@ function transformStatus(payload: StatusPayload): StatusSlice {
       missingSources: p.missing_sources ?? [],
       blockedBy: p.blocked_by ?? [],
       error: p.error,
+      failureKind: p.failure_kind ?? null,
       immediateRetries: p.immediate_retries,
       sourceRetries: p.source_retries,
       spout: p.spout ?? null,

@@ -2338,14 +2338,20 @@ class Driver:
                         or self.state.pond_states[sp].is_killed
                     )
                 ]
-                # The failure message (freshest failed Run), shown when failed.
+                # The failure message (freshest failed Run), shown when failed — plus its sub-reason:
+                # a contract failure carries the stable CONTRACT_PREFIX in its stored message, so the
+                # kind is derivable here (and after a restart) with no extra state.
                 error = None
+                failure_kind = None
                 if ps.is_failed:
+                    from ..schema_contract import CONTRACT_PREFIX
+
                     row = self.db.execute(
                         "SELECT error FROM pond_run WHERE pond_version_id = ? AND status = 'failed' "
                         "ORDER BY f DESC LIMIT 1", (self.meta[key]["version_id"],),
                     ).fetchone()
                     error = row[0] if row else None
+                    failure_kind = "contract" if (error or "").startswith(CONTRACT_PREFIX) else "error"
 
                 trig = self.state.triggers.get(key)
                 trigger = None
@@ -2391,6 +2397,7 @@ class Driver:
                     "missing_sources": self.meta[key].get("missing_sources", []),
                     "blocked_by": blocked_by,
                     "error": error,
+                    "failure_kind": failure_kind,  # "contract" | "error" | null — the failed sub-reason
                     "immediate_retries": self.state.ponds[key].retry_immediately,
                     "source_retries": self.state.ponds[key].retry_on_change,
                     "ripples": ripples,

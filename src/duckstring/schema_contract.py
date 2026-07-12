@@ -26,6 +26,12 @@ class ContractViolation(Exception):
     """A Pond's published output broke its major line's additive contract."""
 
 
+# The stable message prefix a contract failure carries — the machine-readable sub-reason the status API
+# (`failure_kind`) and the UI derive a "Contract violation" from, restart-proof (it lives in the stored
+# error message, not in ephemeral state).
+CONTRACT_PREFIX = "version contract violation: "
+
+
 def extract_schema(con) -> Schema:
     """The output schema of every published table in a Pond's registry connection
     (``{table: {column: type}}``).

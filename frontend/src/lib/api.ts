@@ -92,6 +92,7 @@ export interface RawPond {
   missing_sources: string[]; // declared Sources absent from the Catchment (pond keys "name@major")
   blocked_by: string[]; // required Sources that are down (failed/killed/blocked) — the upstream block
   error: string | null; // failure message of the freshest failed Run, when failed
+  failure_kind?: 'contract' | 'error' | null; // the failed sub-reason (contract = the schema gate refused the publish)
   immediate_retries: number;
   source_retries: number;
   ripples: RawRipple[];

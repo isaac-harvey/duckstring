@@ -94,7 +94,7 @@ def _run_ripple(
 
 def _export_data(con, data_dir, f: datetime | None, contract=None) -> dict | None:
     from ..dataplane import get_data_plane
-    from ..schema_contract import ContractViolation, contract_violations, extract_schema
+    from ..schema_contract import CONTRACT_PREFIX, ContractViolation, contract_violations, extract_schema
 
     # ``con`` is a cursor off the shared instance: the export reads a consistent MVCC snapshot and shares
     # the ripples' configuration, so it neither clashes with their open connections nor conflicts on the
@@ -106,7 +106,9 @@ def _export_data(con, data_dir, f: datetime | None, contract=None) -> dict | Non
         # live tables keep last-good data; the Catchment fails the Pond and blocks downstream.
         violations = contract_violations(schema, contract)
         if violations:
-            raise ContractViolation("; ".join(violations))
+            # The stable prefix is the failure's machine-readable sub-reason: the Catchment's status
+            # derives failure_kind="contract" from it (survives restarts — no extra state to persist).
+            raise ContractViolation(f"{CONTRACT_PREFIX}{'; '.join(violations)}")
         get_data_plane().export(con, data_dir, mode="overwrite", f=f)
         return schema
     finally:

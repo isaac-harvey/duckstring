@@ -87,8 +87,17 @@ function StatusBox({ info, ponds, canControl }: { info: PondInfo; ponds: Record<
   );
 
   if (info.isFailed) {
+    // A contract failure gets its own sub-reason: the Duck refused to publish (last-good data is
+    // intact) because the output broke the major line's additive schema contract — the remedy is a
+    // major bump (or restoring the columns), not a retry.
+    const contract = info.failureKind === 'contract';
     return (
-      <StatusCard color={THEME_DANGER} title="Failed">
+      <StatusCard color={THEME_DANGER} title={contract ? 'Failed · Contract violation' : 'Failed'}>
+        {contract && (
+          <div style={{ color: '#a1a1aa', marginBottom: 6 }}>
+            The publish was refused — last-good data is intact. Breaking schema changes need a major bump.
+          </div>
+        )}
         {info.error ?? 'The most recent Pond Run failed.'}
       </StatusCard>
     );

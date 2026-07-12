@@ -144,3 +144,50 @@ def test_executor_export_gate_aborts_publish_and_preserves_last_good(tmp_path):
     assert schema == {"event": {"id": "INTEGER"}}
     assert (data / "event.parquet").exists()
     ex.shutdown()
+
+
+def test_contract_failure_kind_surfaces_in_status(tmp_path):
+    """The status API derives the `failure_kind` sub-reason from the stored message's stable prefix —
+    "contract" for a Duck-refused publish, "error" for any other failure. Restart-proof (it rides the
+    persisted error text, not ephemeral state)."""
+    from duckstring.schema_contract import CONTRACT_PREFIX
+
+    d = _driver(tmp_path)
+    d.pulse("src@1")
+    f = d.state.pond_states["src@1"].start_f.isoformat()
+    d.on_event("src@1", {"kind": "contract_failed", "f": f,
+                         "error": f"{CONTRACT_PREFIX}column 'event.val' was dropped"})
+    src = next(p for p in d.status()["ponds"] if p["name"] == "src")
+    assert src["is_failed"] and src["failure_kind"] == "contract"
+
+    # ...and it survives a restart (reload rebuilds from SQLite; the kind re-derives from the message).
+    d.reload()
+    src = next(p for p in d.status()["ponds"] if p["name"] == "src")
+    assert src["failure_kind"] == "contract"
+
+
+def test_plain_failure_kind_is_error(tmp_path):
+    d = _driver(tmp_path)
+    d.pulse("src@1")
+    f = d.state.pond_states["src@1"].start_f.isoformat()
+    d.on_event("src@1", {"kind": "pond_failed", "f": f, "error": "boom"})
+    src = next(p for p in d.status()["ponds"] if p["name"] == "src")
+    assert src["is_failed"] and src["failure_kind"] == "error"
+    healthy = [p for p in d.status()["ponds"] if not p["is_failed"]]
+    assert all(p["failure_kind"] is None for p in healthy)
+
+
+def test_executor_gate_message_carries_contract_prefix(tmp_path):
+    from duckstring.duck.executor import RippleExecutor
+    from duckstring.schema_contract import CONTRACT_PREFIX, ContractViolation
+
+    (tmp_path / "ponds" / "src" / "1.0.0").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "ponds" / "src" / "1.0.0" / "pond.toml").write_text('[pond]\nname = "src"\nversion = "1.0.0"\n')
+    ex = RippleExecutor("src", 1, "1.0.0", "ponds/src/1.0.0", tmp_path)
+    cur = ex._cursor()
+    cur.execute("CREATE TABLE event AS SELECT 1 AS id")
+    cur.close()
+    with pytest.raises(ContractViolation) as exc:
+        ex.export(contract={"event": {"id": "INTEGER", "val": "VARCHAR"}})
+    assert str(exc.value).startswith(CONTRACT_PREFIX)
+    ex.shutdown()
