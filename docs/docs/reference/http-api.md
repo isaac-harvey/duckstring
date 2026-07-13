@@ -108,6 +108,29 @@ Field notes:
 - `catchment` — this Catchment's [stable identity](../guides/connecting-catchments.md#identity-and-the-lineage-view) `{id, name}`. `is_draw` marks a [Pond Draw](../guides/connecting-catchments.md) (fed by a duct, not run by a worker).
 - `edges` — the inter-Pond graph as `[source, sink]` pairs; `ripple_edges` the intra-Pond graph as `[parent, child]`.
 
+## Lineage
+
+```
+GET /api/lineage?pond={name}&major={int}&table={name}&columns=false
+```
+
+The [observed table-level lineage](../guides/lineage.md): per Pond, what each Ripple actually read and
+wrote on its latest recorded run — `{"ponds": [{"id", "name", "major", "version", "ripples": [{"ripple",
+"f", "reads": [{"source", "table"}], "writes": [table]}]}]}` (a read with `source: null` is an own
+table). `pond` narrows to one Pond (`major` picks the line, default highest); `table` narrows to the
+Ripples touching that name; `columns=true` adds the deploy-captured column derivations per pond —
+`{table: {column: [{ref, column}] | "constant" | "opaque"}}`.
+
+```
+GET /api/ponds/{name}/trace?table={t}&where={sql}&major={int}
+```
+
+Row-level provenance: resolves the newest `_duckstring_f` among the published rows matching `where`
+(the whole table when omitted; a plain overwrite table resolves to its publish `f`), and answers with
+the producing run (`version`, timings, `status`), the input `window` `(previous_f, f]`, and the
+declared `sources`. `{"matched": 0, "run": null}` when nothing matches; `422` on a bad predicate. The
+predicate runs over the exported snapshot at the `/api/query` trust level (read access).
+
 ## Run history
 
 ```

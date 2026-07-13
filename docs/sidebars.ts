@@ -45,6 +45,7 @@ const sidebars: SidebarsConfig = {
         'guides/dbt',
         'guides/connecting-catchments',
         'guides/querying-data',
+        'guides/lineage',
         'guides/web-ui',
       ],
     },

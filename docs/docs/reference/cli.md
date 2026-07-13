@@ -131,7 +131,7 @@ The value **is** sent to the Catchment over the wire when you set it (an HTTPS P
 
 Deliver failures and staleness to the channels a team already watches. A **channel** is operational config (persisted, survives redeploys), not declared in `pond.toml`. It fires on the events you subscribe it to — `failure` (a Pond Run gave up), `contract` (a breaking schema change), `spout` (an egress delivery failed), `recovery` (a failed Pond/Spout cleared), and `freshness` (a Pond stayed stale past an SLA) — and **root-cause dedup** means one failed Source that blocks twenty downstream Ponds pages you once (about the root, with the blocked names as blast radius), not twenty times. Credentials in the destination URI are `${env:NAME}`/`${secret:NAME}` references, resolved only at send time. Managing channels requires **full access**.
 
-Two destinations work today: a **webhook** (`https://…`/`http://…`, a Slack-incoming-webhook-compatible JSON POST — also any generic receiver) and **email** (`mailto:you@example.com?smtp=host:587&from=alerts@example.com`; SMTP settings from the URI query or the `DUCKSTRING_SMTP_*` environment).
+Two destinations work today: a **webhook** (`https://…`/`http://…`, a Slack-incoming-webhook-compatible JSON POST — also any generic receiver) and **email** (`mailto:you@example.com?smtp=host:587&from=alerts@example.com`; SMTP settings from the URI query or the `DUCKSTRING_SMTP_*` environment). A channel may also subscribe to the machine-consumer kind **`openlineage`** (`--on openlineage` — never part of `all`): each completed Pond Run then posts a standard OpenLineage RunEvent to the destination verbatim, which is how Duckstring [feeds a data catalog](../guides/lineage.md#feeding-a-catalog).
 
 | Command | Description |
 |---|---|
@@ -175,6 +175,21 @@ duckstring status [pond] [-c NAME] [--once]
 ```
 
 Live view of deployed Ponds: state, freshness, staleness, and standing triggers — open until `Ctrl+C`. With a `pond` argument, shows only that Pond and its upstream lineage. `--once` prints a snapshot and exits; `-m`/`-v` narrow a named Pond to one major line.
+
+## `duckstring lineage` / `trace` — lineage & provenance
+
+See [Lineage](../guides/lineage.md).
+
+```bash
+duckstring lineage [pond] [-t TABLE] [--columns] [-m M] [-c NAME]
+duckstring trace {pond}.{table} [--where "id = 42"] [-m M] [-c NAME]
+```
+
+`lineage` prints what each Ripple actually read and wrote on its latest run (observed at the call —
+exact, never inferred); `--columns` adds the deploy-captured column derivations (which source columns
+each output column comes from; `opaque` where unprovable — install `duckstring[lineage]` to resolve
+`.sql()` outputs). `trace` is row-level provenance: which run produced the matching row(s), its version
+and timings, and the input window `(previous_f, f]` each Source was read over.
 
 ## `duckstring get` / `query` — data access
 

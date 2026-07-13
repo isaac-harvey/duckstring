@@ -1,8 +1,22 @@
 # Data lineage: from the declared DAG to column provenance
 
-Status: **proposed (2026-07-13), unbuilt.** Written after the 2026-07 review: most of what the industry
-sells as "lineage" already exists here by construction, so this plan is mostly about *surfacing* recorded
-facts, plus one genuinely new capability (column-level) scoped along a boundary the codebase already draws.
+Status: **built (2026-07-13), all four phases.** Phase 1: the Pond handle records every brokered
+read/write (+ a `record_lineage_write` host hook for builder terminals; dbt models report sources
+observed + manifest parents); shipped on the ripple event, persisted in `ripple_run_lineage` (migration
+019), served at `GET /api/lineage` / `duckstring lineage` / the Sidebar's "Lineage · observed". Phase 2:
+`trickle/lineage.py::column_lineage` walks the capture IR (join-key unification, pipeline in call order,
+agg/acc specs, transitive chained refs); captured at deploy (best-effort, never fails a deploy) into
+`pond_version_column_lineage` (migration 020); `?columns=true` / `--columns`. Phase 3: `kind: sql`
+outputs resolve via sqlglot behind the `duckstring[lineage]` extra (opaque without it / on any parse
+failure). Phase 4: `GET /api/ponds/{name}/trace` + `duckstring trace` (row → producing run + input
+window), and OpenLineage RunEvent emission per completed run to channels subscribed `--on openlineage`
+(excluded from `all`; delivered via the alert outbox; deterministic runId so replays dedup). Tests:
+`tests/test_lineage.py`, `tests/test_column_lineage.py`; docs `guides/lineage.md`.
+
+Deferred, recorded: **dbt model column lineage** (needs each model's *compiled* SQL — running
+`dbt compile` at deploy is a deploy-latency trade-off); **cross-Catchment column lineage** (thread
+through `/api/view` once single-Catchment lineage has users); **per-run lineage retention** rides
+whatever policy `pond_run` eventually gets. The original proposal follows.
 
 ## Positioning — lineage is bookkeeping here, not archaeology
 
