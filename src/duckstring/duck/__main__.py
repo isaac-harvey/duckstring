@@ -56,7 +56,7 @@ def serve(core: DuckCore, executor: RippleExecutor, client: CatchmentClient) -> 
                 name,
                 start_f,
                 core.previous_f_for(start_f),  # the prior run's freshness, exposed as pond.previous_f
-                on_done=lambda n, started, finished: q.put(("done", (n, started, finished))),
+                on_done=lambda n, started, finished, lineage=None: q.put(("done", (n, started, finished, lineage))),
                 on_error=lambda n, exc, started, finished: q.put(("error", (n, exc, started, finished))),
                 sources_changed=core.sources_changed_for(start_f),  # backs pond.sources_changed()
                 skip_sink=(lambda f=start_f: core.mark_skipped(f)),  # backs pond.skip() for this Run
@@ -92,9 +92,10 @@ def serve(core: DuckCore, executor: RippleExecutor, client: CatchmentClient) -> 
                 elif kind == "done":
                     inflight -= 1
                     last_progress = _now()
-                    name, started, finished = data
+                    name, started, finished, lineage = data
                     _launch(core.ripple_completed(
-                        name, _now(), started_at=started, finished_at=finished, export=executor.export
+                        name, _now(), started_at=started, finished_at=finished, export=executor.export,
+                        lineage=lineage,
                     ))
                 elif kind == "error":
                     inflight -= 1

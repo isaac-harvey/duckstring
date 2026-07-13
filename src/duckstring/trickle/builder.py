@@ -1079,6 +1079,11 @@ class TrickleBuilder:
         """Thread the just-materialised output forward as a chainable in-run operand — its delta read back
         from the registry (same coverage rule as the published read_delta). ``changed`` records whether the
         write actually changed the output, surfaced on the returned handle via :meth:`was_changed`."""
+        # Observed-lineage hook (optional host capability, like ``count_table``): a terminal just wrote
+        # ``name`` straight to the registry, so tell the host — trickle/ stays dependency-free.
+        hook = getattr(self.ctx, "record_lineage_write", None)
+        if hook is not None:
+            hook(name)
         threaded = read_registry_delta(self.ctx.con, name, self.ctx.previous_f, self.ctx.f, out_pk)
         nxt = TrickleBuilder(self.ctx, name, _spine_delta=threaded)
         nxt._was_changed = changed

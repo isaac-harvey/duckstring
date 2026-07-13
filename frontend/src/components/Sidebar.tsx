@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-import { fetchAlerts, fetchSecrets, testSpout, type RawAlertChannel } from '@/lib/api';
+import { fetchAlerts, fetchLineage, fetchSecrets, testSpout, type RawAlertChannel, type RawLineageRipple } from '@/lib/api';
 import { useLiveStore, atLeast, formatAge, formatDuration, parseTs, THEME_PULL, THEME_PUSH, THEME_SUCCESS, THEME_DANGER, THEME_BLOCKED, THEME_WAKE, THEME_BRAND } from '@/lib/store';
 import type { FreqUnit, Pond, PondInfo, PondRun } from '@/lib/types';
 import { AlertChannelForm, ChannelRow } from './AlertsMenu';
@@ -352,6 +352,40 @@ function SpoutEditor({ sourceId, canControl }: { sourceId: string; canControl: b
 // The notification channels scoped to this Pond (full access only) — list (with per-channel Test +
 // remove) + an add form pinned to this Pond's name. Catchment-wide channels are managed under the
 // "Alerts" button by Collapse-all; this section is the per-Pond view of the same alert_channel store.
+// The observed table-level lineage of the selected Pond (plans/lineage.md Phase 1): what each Ripple
+// actually read (per source) and wrote on its latest recorded run — recorded at the call, never inferred.
+function LineageSection({ pond }: { pond: Pond }) {
+  const major = useLiveStore((s) => s.pondInfo[pond.id]?.major);
+  const [ripples, setRipples] = useState<RawLineageRipple[] | null>(null);
+
+  // Load once on mount — keyed by pond id in the parent, so a pond switch remounts fresh.
+  useEffect(() => {
+    fetchLineage(pond.name, major)
+      .then((ps) => setRipples(ps.find((p) => p.id === pond.id)?.ripples ?? []))
+      .catch(() => setRipples([]));
+  }, [pond.id, pond.name, major]);
+
+  if (!ripples || ripples.length === 0) return null; // nothing recorded yet — say nothing, not "unknown"
+  return (
+    <Section>
+      <Label>Lineage · observed</Label>
+      {ripples.map((r) => (
+        <div key={r.ripple} style={{ fontSize: 11, marginBottom: 6, lineHeight: 1.6 }}>
+          <div style={{ color: '#e4e4e7' }}>{r.ripple}</div>
+          {r.reads.map((rd) => (
+            <div key={`${rd.source ?? ''}.${rd.table}`} style={{ color: '#71717a', paddingLeft: 10 }}>
+              ← {rd.source ? `${rd.source}.${rd.table}` : <span>{rd.table} <span style={{ color: '#52525b' }}>(own)</span></span>}
+            </div>
+          ))}
+          {r.writes.map((w) => (
+            <div key={w} style={{ color: THEME_SUCCESS, paddingLeft: 10 }}>→ {w}</div>
+          ))}
+        </div>
+      ))}
+    </Section>
+  );
+}
+
 function AlertEditor({ pond, canControl }: { pond: Pond; canControl: boolean }) {
   const [channels, setChannels] = useState<RawAlertChannel[]>([]);
   const [open, setOpen] = useState(false);
@@ -719,6 +753,9 @@ export function Sidebar({ mobile = false }: { mobile?: boolean }) {
           {!selectedPond.isDraw && <SpoutEditor sourceId={selectedPond.id} canControl={canControl} />}
 
           {/* Failure & freshness alert channels scoped to this Pond. Keyed by id so a pond switch remounts. */}
+          {!selectedPond.isSpout && !selectedPond.isDraw && (
+            <LineageSection key={`lin-${selectedPond.id}`} pond={selectedPond} />
+          )}
           <AlertEditor key={selectedPond.id} pond={selectedPond} canControl={canControl} />
 
           <Section>

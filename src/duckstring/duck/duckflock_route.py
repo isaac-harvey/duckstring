@@ -32,10 +32,14 @@ SCRATCH_DIR = "duckflock_scratch"
 
 def route_ripple(ex, config: DuckflockConfig, func, f, previous_f, *,
                  sources_changed: bool = True, skip_sink=None, refresh: bool = False,
-                 quote_fn=None, run_fn=None) -> Outcome:
+                 quote_fn=None, run_fn=None) -> tuple[Outcome, dict | None]:
     """Route one ripple ``func`` through the DuckFlock backend for executor ``ex``. Runs the ripple
     (locally or remotely) to completion; the classic fallback inside :func:`execute` means this call
-    completes the ripple whatever DuckFlock does. Raises only what the ripple itself raises."""
+    completes the ripple whatever DuckFlock does. Raises only what the ripple itself raises.
+
+    Returns ``(outcome, lineage)`` — the ripple's observed reads/writes (plans/lineage.md): recorded by
+    the Pond handle when it executed locally; derived from the captured plan when it ran remotely
+    (catalog source refs → reads, statement outputs → writes — the same facts, known statically)."""
     from ..core import Pond
     from ..dataplane import hydrate_registry
     from ..trickle.io import load_sidecar
@@ -87,6 +91,18 @@ def route_ripple(ex, config: DuckflockConfig, func, f, previous_f, *,
             import shutil
 
             shutil.rmtree(scratch, ignore_errors=True)
-        return out
+            return out, _plan_lineage(out.plan)
+        return out, pond.take_lineage()  # ran locally (classic or quoted-local) → the handle recorded it
     finally:
         con.close()
+
+
+def _plan_lineage(plan: dict) -> dict:
+    """A remotely-executed ripple's lineage from its captured plan — the catalog's dotted source refs
+    are the reads, the statement outputs the writes (own-output chained refs are internal, not reads)."""
+    writes = sorted({s["output"]["name"] for s in plan.get("statements", [])})
+    reads = sorted(
+        ([ref.split(".", 1)[0], ref.split(".", 1)[1]] for ref in plan.get("catalog", {}) if "." in ref),
+        key=lambda p: (p[0], p[1]),
+    )
+    return {"reads": reads, "writes": writes}

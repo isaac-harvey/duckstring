@@ -75,19 +75,21 @@ def _run_ripple(
     source_majors: dict[str, int], f: datetime | None, previous_f: datetime | None,
     data_root: str | None = None, sources_changed: bool = True, skip_sink=None,
     staging_dir=None, own_data_dir=None,
-) -> None:
+) -> dict:
     from ..core import Pond
 
     # ``con`` is a cursor off the executor's single shared registry instance (see RippleExecutor).
     # Ripples run concurrently on pool threads, each with its own cursor — they share the one instance,
     # so they coexist without the "file handle conflict" two separate connect()s to the same file raise.
+    pond = Pond(
+        name=pond_name, version=version, con=con, root=Path(root_str),
+        source_majors=source_majors, f=f, previous_f=previous_f, data_root=data_root,
+        sources_changed=sources_changed, skip_sink=skip_sink,
+        staging_dir=staging_dir, own_data_dir=own_data_dir,
+    )
     try:
-        func(Pond(
-            name=pond_name, version=version, con=con, root=Path(root_str),
-            source_majors=source_majors, f=f, previous_f=previous_f, data_root=data_root,
-            sources_changed=sources_changed, skip_sink=skip_sink,
-            staging_dir=staging_dir, own_data_dir=own_data_dir,
-        ))
+        func(pond)
+        return pond.take_lineage()  # the observed reads/writes this Ripple made (plans/lineage.md)
     finally:
         con.close()
 
@@ -170,10 +172,11 @@ class RippleExecutor:
                sources_changed: bool = True, skip_sink=None):
         """Load and run ``ripple_name`` at freshness ``f`` (exposed to the ripple as ``pond.f``, with
         the prior run's freshness as ``pond.previous_f``); call ``on_done(name, started_at,
-        finished_at)`` on success and ``on_error(name, exc, started_at, finished_at)`` on failure
+        finished_at, lineage)`` on success — ``lineage`` is the Ripple's observed reads/writes
+        (plans/lineage.md) — and ``on_error(name, exc, started_at, finished_at)`` on failure
         (timings wall-clock UTC, for the run-history duration; both fire on a pool thread).
         ``sources_changed``/``skip_sink`` back ``pond.sources_changed()`` / ``pond.skip()``."""
-        timing: dict[str, datetime] = {}
+        timing: dict = {}
 
         def _task():
             from ..duckflock_backend import DuckflockConfig
@@ -188,13 +191,13 @@ class RippleExecutor:
                 # result back into the registry, so the rest of the run is path-identical.
                 from .duckflock_route import route_ripple
 
-                route_ripple(
+                _out, timing["lineage"] = route_ripple(
                     self, dfl, func, f, previous_f,
                     sources_changed=sources_changed, skip_sink=skip_sink,
                     refresh=self._refresh_pending,
                 )
                 return
-            _run_ripple(
+            timing["lineage"] = _run_ripple(
                 func, self.pond_name, self.version, self._cursor(), str(self.root),
                 self.source_majors, f, previous_f, self.data_root,
                 sources_changed=sources_changed, skip_sink=skip_sink,
@@ -210,7 +213,7 @@ class RippleExecutor:
             if exc:
                 on_error(ripple_name, exc, started, finished)
             else:
-                on_done(ripple_name, started, finished)
+                on_done(ripple_name, started, finished, timing.get("lineage"))
 
         fut.add_done_callback(_cb)
         return fut

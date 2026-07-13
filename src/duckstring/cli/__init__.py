@@ -7,6 +7,7 @@ from . import bulk as bulk_cmd
 from . import catchment as catchment_cmd
 from . import duck as duck_cmd
 from . import duct as duct_cmd
+from . import lineage as lineage_cmd
 from . import pond as pond_cmd
 from . import puddle as puddle_cmd
 from . import secret as secret_cmd
@@ -82,6 +83,7 @@ pond_cmd.app.command("deploy")(deploy)
 pond_cmd.app.command("remove")(remove_pond)
 app.command("do")(bulk_cmd.do)
 app.command("status")(status)
+app.command("lineage")(lineage_cmd.show)
 app.command("get")(get)
 app.command("query")(query)
 app.command("objects")(objects)

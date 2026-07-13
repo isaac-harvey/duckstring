@@ -319,12 +319,14 @@ def test_route_ripple_remote_two_epochs_matches_classic(tmp_path):
     quote = lambda p, c: {"route": "duckflock"}  # noqa: E731
     run = _fake_remote_submit(tmp_path)
 
-    out1 = route_ripple(ex, cfg, _run_python, ts(1), NEVER, quote_fn=quote, run_fn=run)
+    out1, lin1 = route_ripple(ex, cfg, _run_python, ts(1), NEVER, quote_fn=quote, run_fn=run)
     assert out1.route == "duckflock" and not out1.executed_locally
+    # a remote run's lineage derives from the captured plan (catalog refs -> reads, outputs -> writes)
+    assert lin1 == {"reads": [["src", "t"]], "writes": ["out"]}
     ex.export(f=ts(1))  # the normal run-end publish ships the hydrated result
 
     _publish_source(tmp_path, "SELECT * FROM (VALUES (1,'a'),(2,'B'),(3,'c')) t(id,v)", ts(2))
-    out2 = route_ripple(ex, cfg, _run_python, ts(2), ts(1), quote_fn=quote, run_fn=run)
+    out2, _lin2 = route_ripple(ex, cfg, _run_python, ts(2), ts(1), quote_fn=quote, run_fn=run)
     assert out2.route == "duckflock"
     ex.export(f=ts(2))
 
@@ -366,12 +368,14 @@ def test_route_ripple_remote_failure_runs_classic_on_registry(tmp_path):
 
     _publish_source(tmp_path, "SELECT 1 AS id, 'a' AS v", ts(1))
     ex = _executor(tmp_path)
-    out = route_ripple(
+    out, lin = route_ripple(
         ex, DuckflockConfig(bin="duckflock"), _run_python, ts(1), NEVER,
         quote_fn=lambda p, c: {"route": "duckflock"},
         run_fn=lambda p, c: (_ for _ in ()).throw(ConnectionError("down")),
     )
     assert out.route == "duckflock->classic" and out.executed_locally
+    # a locally-completed fallback records OBSERVED lineage via the handle
+    assert lin == {"reads": [["src", "t"]], "writes": ["out"]}
     ex.export(f=ts(1))
     con = duckdb.connect()
     con.execute("SET TimeZone='UTC'")
@@ -428,7 +432,9 @@ def test_executor_submit_routes_when_enabled(tmp_path, monkeypatch):
         calls.append(cfg.bin)
         func_con = e._cursor()
         try:
-            func(Pond("o", "1.0.0", func_con, root=tmp_path, source_majors={"src": 1}, f=f, previous_f=pf))
+            pond = Pond("o", "1.0.0", func_con, root=tmp_path, source_majors={"src": 1}, f=f, previous_f=pf)
+            func(pond)
+            return None, pond.take_lineage()  # route_ripple's (outcome, lineage) contract
         finally:
             func_con.close()
 

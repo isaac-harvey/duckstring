@@ -461,6 +461,31 @@ export interface RawAlertDelivery {
   sent_at: string | null;
 }
 
+// ─── Observed table-level lineage (plans/lineage.md Phase 1) ─────────────────
+
+export interface RawLineageRipple {
+  ripple: string;
+  f: string; // the latest recorded run
+  reads: { source: string | null; table: string }[]; // source null = an own table
+  writes: string[];
+}
+
+export interface RawLineagePond {
+  id: string;
+  name: string;
+  major: number;
+  version: string;
+  ripples: RawLineageRipple[];
+}
+
+export function fetchLineage(pond?: string, major?: number): Promise<RawLineagePond[]> {
+  const params = new URLSearchParams();
+  if (pond !== undefined) params.set('pond', pond);
+  if (major !== undefined) params.set('major', String(major));
+  const q = params.toString();
+  return getJSON<{ ponds: RawLineagePond[] }>(`/lineage${q ? `?${q}` : ''}`).then((d) => d.ponds);
+}
+
 export function fetchAlerts(): Promise<RawAlertChannel[]> {
   return getJSON<{ channels: RawAlertChannel[] }>('/alerts').then((d) => d.channels);
 }

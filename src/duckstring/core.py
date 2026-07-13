@@ -386,6 +386,32 @@ class Pond:
         # ``(previous_f, f]`` a ripple can read from a Source for hand-rolled incremental logic.
         # ``NEVER`` on the first run (so that bracket reads everything). Trickle will automate this.
         self.previous_f = NEVER if previous_f is None else previous_f
+        # Observed table-level lineage (plans/lineage.md Phase 1): every read/write this handle brokers,
+        # recorded as it happens — exact, never inferred. Reads are (source_pond|None, table); writes are
+        # this Pond's own output names. Drained per Ripple Run by the executor (:meth:`take_lineage`) and
+        # shipped on the ripple event; a plain dict/sets so recording costs nothing measurable.
+        self._lineage: dict[str, set] = {"reads": set(), "writes": set()}
+
+    # ─── observed lineage (plans/lineage.md) ───────────────────────────────────
+
+    def _record_read(self, source: str | None, table: str) -> None:
+        self._lineage["reads"].add((source, table))
+
+    def record_lineage_write(self, name: str) -> None:
+        """Record ``name`` as an output this run wrote — the optional host hook the Trickle builder's
+        terminals call (its writes go straight to the registry, not through the handle's write methods)."""
+        self._lineage["writes"].add(name)
+
+    def take_lineage(self) -> dict:
+        """Drain the recorded lineage as a JSON-able ``{"reads": [[source|None, table], …], "writes":
+        [name, …]}`` (sorted for stable payloads) and reset — called by the executor per Ripple Run."""
+        out = {
+            "reads": sorted(([s, t] for s, t in self._lineage["reads"]),
+                            key=lambda p: (p[0] or "", p[1])),  # own reads (None) sort first
+            "writes": sorted(self._lineage["writes"]),
+        }
+        self._lineage = {"reads": set(), "writes": set()}
+        return out
 
     def sources_changed(self) -> bool:
         """Did any Source change its output since this Pond last ran? The engine's content-skip verdict
@@ -409,6 +435,7 @@ class Pond:
             self._skip_sink()
 
     def write_table(self, name: str, relation) -> None:
+        self.record_lineage_write(name)
         tmp = f"__tmp_{name}"
 
         def _write() -> None:
@@ -435,6 +462,7 @@ class Pond:
 
         if self._staging_dir is None:
             raise RuntimeError("write_object is only available inside a Pond Run (no staging context)")
+        self.record_lineage_write(name)
         stage_object(Path(self._staging_dir), name, src)
 
     def read_object(self, ref: str) -> bytes:
@@ -444,6 +472,7 @@ class Pond:
         from .objects import read_staged
 
         source, name = self._split_object_ref(ref)
+        self._record_read(source, name)
         if source is None:
             if self._staging_dir is not None:
                 staged = read_staged(Path(self._staging_dir), name)
@@ -460,6 +489,7 @@ class Pond:
         from .objects import staged_object_path
 
         source, name = self._split_object_ref(ref)
+        self._record_read(source, name)
         if source is None:
             if self._staging_dir is not None:
                 sp = staged_object_path(Path(self._staging_dir), name)
@@ -520,6 +550,7 @@ class Pond:
                 from .dataplane import get_data_plane
                 from .trickle_io import _strip_system
 
+                self._record_read(source_pond, table)
                 data_dir = self._source_data_dir(source_pond)
                 dp = get_data_plane()
                 dp.prepare(self.con)  # ready the connection to read the Source's published format
@@ -539,7 +570,9 @@ class Pond:
                 except Exception:
                     pass  # name taken by one of this Pond's own tables — the relation still works
                 return rel
+            self._record_read(None, table)
             return self._own_current(table)
+        self._record_read(None, ref)
         return self._own_current(ref)
 
     def _own_current(self, name: str):
@@ -562,6 +595,7 @@ class Pond:
             if source_pond != self.name:
                 from .dataplane import get_data_plane
 
+                self._record_read(source_pond, table)
                 data_dir = self._source_data_dir(source_pond)
                 dp = get_data_plane()
                 dp.prepare(self.con)
@@ -594,6 +628,7 @@ class Pond:
         ``timedelta``) / ``retain_n`` (a count) opt into bounding the kept history."""
         from . import trickle_io as trickle
 
+        self.record_lineage_write(name)
         return trickle.append_table(
             self.con, name, relation, self.f, self._resolve_pk(pk),
             fail_on_conflict=fail_on_conflict, retain_t=retain_t, retain_n=retain_n,
@@ -613,6 +648,7 @@ class Pond:
         pass a no-change run (see :meth:`skip`, plans/no-change-skip.md)."""
         from . import trickle_io as trickle
 
+        self.record_lineage_write(name)
         return trickle.merge_table(
             self.con, name, relation, self.f, self._resolve_pk(pk),
             retain_t=retain_t, retain_n=retain_n, compact_threshold=compact_threshold,
@@ -627,6 +663,7 @@ class Pond:
         :meth:`merge_table`). Returns whether the change was non-empty (the ``pond.skip()`` signal)."""
         from . import trickle_io as trickle
 
+        self.record_lineage_write(name)
         return trickle.apply_zset(
             self.con, name, zset, self.f, self._resolve_pk(pk),
             retain_t=retain_t, retain_n=retain_n, compact_threshold=compact_threshold,
@@ -644,6 +681,7 @@ class Pond:
         if "." not in ref:
             raise ValueError(f"read_delta needs a 'source.table' reference, got '{ref}'")
         source_pond, table = ref.split(".", 1)
+        self._record_read(source_pond, table)
         data_dir = self._source_data_dir(source_pond)
         dp = get_data_plane()
         dp.prepare(self.con)

@@ -83,6 +83,20 @@ def _redact_tracebacks(runs: list[dict]) -> None:
             ripple["traceback"] = None
 
 
+@router.get("/lineage", dependencies=[auth.read])
+def lineage_graph(
+    request: Request,
+    pond: str | None = None,
+    major: int | None = None,
+    table: str | None = None,
+):
+    """The **observed table-level lineage** (plans/lineage.md Phase 1): the tables each Ripple actually
+    read and wrote on its latest recorded run — exact (recorded at the read/write call), never inferred.
+    ``pond`` narrows to one Pond (``major`` picks the line, default highest); ``table`` narrows to the
+    Ripples touching that table name. Reads with ``source: null`` are the Pond's own tables."""
+    return request.app.state.driver.lineage(pond=pond, major=major, table=table)
+
+
 @router.get("/runs", dependencies=[auth.read])
 def runs(
     request: Request,

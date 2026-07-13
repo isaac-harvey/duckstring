@@ -551,6 +551,7 @@ class Driver:
             if clear_history:
                 self.db.execute("DELETE FROM ripple_run WHERE pond_version_id=?", (meta["version_id"],))
                 self.db.execute("DELETE FROM pond_run WHERE pond_version_id=?", (meta["version_id"],))
+                self.db.execute("DELETE FROM ripple_run_lineage WHERE pond_version_id=?", (meta["version_id"],))
             self.db.commit()
             # 3. Rewind the in-memory engine state (keep demand: has_pull/pull_m/targets/standing_wake).
             if ps is not None:
@@ -619,6 +620,7 @@ class Driver:
             if clear_history:
                 self.db.execute("DELETE FROM ripple_run")
                 self.db.execute("DELETE FROM pond_run")
+                self.db.execute("DELETE FROM ripple_run_lineage")
             self.db.commit()
             # 4. Rebuild the engine from the scrubbed DB — a fresh-deploy engine (spouts/triggers re-armed).
             self.reload()
@@ -695,6 +697,7 @@ class Driver:
                     self.db.execute(f"DELETE FROM ripple_run WHERE pond_version_id IN ({ph})", vids)
                     self.db.execute(f"DELETE FROM pond_run WHERE pond_version_id IN ({ph})", vids)
                     self.db.execute(f"DELETE FROM pond_version_schema WHERE pond_version_id IN ({ph})", vids)
+                    self.db.execute(f"DELETE FROM ripple_run_lineage WHERE pond_version_id IN ({ph})", vids)
                     self.db.execute(
                         f"DELETE FROM ripple_to_ripple WHERE sink_id IN "
                         f"(SELECT id FROM ripple WHERE pond_version_id IN ({ph}))", vids)
@@ -798,6 +801,7 @@ class Driver:
             version_id = self.meta[pond]["version_id"]
             self.db.execute("DELETE FROM ripple_run WHERE pond_version_id = ?", (version_id,))
             self.db.execute("DELETE FROM pond_run WHERE pond_version_id = ?", (version_id,))
+            self.db.execute("DELETE FROM ripple_run_lineage WHERE pond_version_id = ?", (version_id,))
             self.db.commit()
             self.state_version += 1
 
@@ -1589,6 +1593,8 @@ class Driver:
                         retry=payload.get("retry", 0),
                         error=payload.get("error"), traceback=payload.get("traceback"),
                     )
+                    if payload.get("lineage"):
+                        self._record_lineage(pond, rname, f, payload.get("retry", 0), payload["lineage"])
                     self._process(now)
             elif kind == "failed":
                 # The Pond Run gave up at this Ripple's freshness: fail the Pond (and block downstream).
@@ -1946,6 +1952,7 @@ class Driver:
         pond_id, pv_id = prow[0], prow[1]
         db.execute("DELETE FROM ripple_run WHERE pond_version_id = ?", (pv_id,))
         db.execute("DELETE FROM pond_run WHERE pond_version_id = ?", (pv_id,))
+        db.execute("DELETE FROM ripple_run_lineage WHERE pond_version_id = ?", (pv_id,))
         for tbl in ("pond_state", "pond_target", "pond_open", "pond_trigger", "pond_retry", "pond_window"):
             db.execute(f"DELETE FROM {tbl} WHERE pond_id = ?", (pond_id,))
         db.execute("DELETE FROM pond WHERE id = ?", (pond_id,))
@@ -2010,6 +2017,7 @@ class Driver:
         (pn_id,) = db.execute("SELECT pond_name_id FROM pond WHERE id = ?", (pond_id,)).fetchone()
         db.execute("DELETE FROM ripple_run WHERE pond_version_id = ?", (pv_id,))
         db.execute("DELETE FROM pond_run WHERE pond_version_id = ?", (pv_id,))
+        db.execute("DELETE FROM ripple_run_lineage WHERE pond_version_id = ?", (pv_id,))
         for tbl in ("pond_state", "pond_target", "pond_open", "pond_trigger", "pond_retry",
                     "pond_window", "pond_spout", "pond_duck", "pond_to_pond"):
             db.execute(f"DELETE FROM {tbl} WHERE pond_id = ?", (pond_id,))
@@ -2230,6 +2238,64 @@ class Driver:
         if version_key(meta["version"]) < version_key(high_water):
             return None  # rollback — governed by min_version, not the forward-only schema gate
         return by_version[high_water]
+
+    def _record_lineage(self, pond: str, ripple: str, f: str, retry: int, lineage: dict) -> None:
+        """Persist a Ripple attempt's observed reads/writes (plans/lineage.md Phase 1). Idempotent on
+        replay (INSERT OR IGNORE over the full row key); wrapped so a lineage write can never fail a run
+        — lineage is observability, not orchestration."""
+        try:
+            vid = self.meta[pond]["version_id"]
+            rows = [(vid, ripple, f, retry, "read", s or "", t) for s, t in lineage.get("reads", [])]
+            rows += [(vid, ripple, f, retry, "write", "", t) for t in lineage.get("writes", [])]
+            self.db.executemany(
+                "INSERT OR IGNORE INTO ripple_run_lineage "
+                "(pond_version_id, ripple, f, retry, direction, source_name, table_name) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)", rows,
+            )
+            self.db.commit()
+        except Exception as exc:  # noqa: BLE001 — never let bookkeeping break a run
+            print(f"[catchment] lineage record failed ({pond}.{ripple}): {exc}", flush=True)
+
+    def lineage(self, pond: str | None = None, major: int | None = None, table: str | None = None) -> dict:
+        """The observed table-level lineage graph (plans/lineage.md Phase 1), from each Ripple's **latest
+        recorded run** on each selected version. ``pond`` narrows to one Pond (its selected version on
+        ``major``, default the highest deployed); ``table`` narrows to edges touching that table name.
+        Returns ``{"ponds": [{"id", "name", "major", "version", "ripples": [{"ripple", "f", "reads":
+        [{"source", "table"}], "writes": [table]}]}]}`` — reads with ``source: null`` are own tables."""
+        with self.lock:
+            keys = [k for k in self.meta if not self.meta[k].get("is_spout") and not self.meta[k].get("is_draw")]
+            if pond is not None:
+                keys = [k for k in keys if self.meta[k]["name"] == pond
+                        and (major is None or self.meta[k]["major"] == major)]
+                if pond is not None and major is None and len(keys) > 1:  # bare name → highest major
+                    keys = [max(keys, key=lambda k: self.meta[k]["major"])]
+            out = []
+            for key in sorted(keys):
+                m = self.meta[key]
+                rows = self.db.execute(
+                    "SELECT l.ripple, l.f, l.direction, l.source_name, l.table_name "
+                    "FROM ripple_run_lineage l "
+                    "WHERE l.pond_version_id = ? AND l.f = ("
+                    "  SELECT MAX(l2.f) FROM ripple_run_lineage l2 "
+                    "  WHERE l2.pond_version_id = l.pond_version_id AND l2.ripple = l.ripple) "
+                    "ORDER BY l.ripple, l.direction, l.source_name, l.table_name",
+                    (m["version_id"],),
+                ).fetchall()
+                ripples: dict[str, dict] = {}
+                for rname, f, direction, source, tname in rows:
+                    r = ripples.setdefault(rname, {"ripple": rname, "f": f, "reads": [], "writes": []})
+                    if direction == "read":
+                        r["reads"].append({"source": source or None, "table": tname})
+                    else:
+                        r["writes"].append(tname)
+                if table is not None:  # narrow to ripples touching this table name
+                    ripples = {n: r for n, r in ripples.items()
+                               if table in r["writes"] or any(rd["table"] == table for rd in r["reads"])}
+                if pond is None and not ripples:
+                    continue  # the catchment-wide view lists only ponds with recorded lineage
+                out.append({"id": key, "name": m["name"], "major": m["major"], "version": m["version"],
+                            "ripples": sorted(ripples.values(), key=lambda r: r["ripple"])})
+            return {"ponds": out}
 
     def _capture_schema(self, pond: str, schema: dict) -> None:
         """Freeze a Pond version's published output schema as its contract (idempotent upsert, keyed on
