@@ -165,6 +165,70 @@ def _existing_topology(db, pv_id) -> dict[str, frozenset]:
     return {nm: frozenset(ps) for nm, ps in parents.items()}
 
 
+def _capture_column_lineage(db, name: str, version: str, ripples: list[dict]) -> None:
+    """Static column lineage at deploy (plans/lineage.md Phase 2): capture each ripple's plan
+    (:mod:`duckstring.trickle.capture`) and walk its column derivations
+    (:mod:`duckstring.trickle.lineage`), storing rows per ``pond_version``. **Best-effort and
+    per-ripple**: a non-capturable ripple (raw ``con`` access, callable metrics, plain
+    ``read_table``+``write_table`` code) simply contributes no rows — exact or absent, never a failed
+    deploy. Source schemas come from the deployed sources' captured contracts
+    (``pond_version_schema``) when available; explicit ``alias.col`` references stay provable without
+    them. Recomputed wholesale each deploy (lineage is a property of the version)."""
+    try:
+        from duckstring.trickle.capture import NonCapturable, capture_plan
+        from duckstring.trickle.lineage import column_lineage
+
+        (pv_id,) = db.execute(
+            "SELECT pv.id FROM pond_version pv JOIN pond_name pn ON pn.id = pv.pond_name_id "
+            "WHERE pn.name = ? AND pv.version = ?", (name, version),
+        ).fetchone()
+
+        def source_catalog(ref: str) -> dict:
+            src, table = ref.split(".", 1)
+            cols = [r[0] for r in db.execute(
+                'SELECT DISTINCT s."column" FROM pond_version_schema s '
+                "JOIN pond_version pv ON pv.id = s.pond_version_id "
+                "JOIN pond_name pn ON pn.id = pv.pond_name_id "
+                'WHERE pn.name = ? AND s."table" = ?', (src, table),
+            ).fetchall()]
+            entry = {"location": "__SRC__", "mode": None, "pk": None, "floor": None, "f": None}
+            if cols:
+                entry["schema"] = {c: "" for c in cols}
+            return entry
+
+        rows: list[tuple] = []
+        for r in ripples:
+            func = r.get("func")
+            if not callable(func):
+                continue  # dbt-mode rows carry model-name strings — Phase 3 (SQL parsing) territory
+            try:
+                body = capture_plan(lambda host, fn=func: fn(host), source_catalog=source_catalog)
+            except NonCapturable:
+                continue
+            except Exception:
+                continue  # a ripple import-time quirk must never fail lineage capture
+            for table, cols in column_lineage(body).items():
+                if cols is None:
+                    rows.append((pv_id, table, "", "opaque", "", ""))
+                    continue
+                for col, prov in cols.items():
+                    if prov is None:
+                        rows.append((pv_id, table, col, "opaque", "", ""))
+                    elif not prov:
+                        rows.append((pv_id, table, col, "constant", "", ""))
+                    else:
+                        rows.extend((pv_id, table, col, "exact", ref, sc) for ref, sc in sorted(prov))
+        with db:
+            db.execute("DELETE FROM pond_version_column_lineage WHERE pond_version_id = ?", (pv_id,))
+            db.executemany(
+                'INSERT OR IGNORE INTO pond_version_column_lineage '
+                '(pond_version_id, "table", "column", kind, src_ref, src_column) VALUES (?, ?, ?, ?, ?, ?)',
+                rows,
+            )
+    except Exception as exc:  # noqa: BLE001 — lineage is observability; a deploy must never fail on it
+        print(f"[catchment] column-lineage capture failed for {name}@{version}: {exc}", flush=True)
+
+
 def _register(db, name, version, kind, source_path, cfg, ripples) -> None:
     major = int(version.split(".")[0])
     deployed_at = datetime.now(timezone.utc).isoformat()
@@ -318,6 +382,7 @@ async def deploy(request: Request):
         _register(db, name, version, kind, source_path, cfg, ripples)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    _capture_column_lineage(db, name, version, ripples)  # best-effort; never fails a deploy
 
     if getattr(request.app.state, "driver", None) is not None:
         request.app.state.driver.reload()

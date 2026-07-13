@@ -699,6 +699,8 @@ class Driver:
                     self.db.execute(f"DELETE FROM pond_version_schema WHERE pond_version_id IN ({ph})", vids)
                     self.db.execute(f"DELETE FROM ripple_run_lineage WHERE pond_version_id IN ({ph})", vids)
                     self.db.execute(
+                        f"DELETE FROM pond_version_column_lineage WHERE pond_version_id IN ({ph})", vids)
+                    self.db.execute(
                         f"DELETE FROM ripple_to_ripple WHERE sink_id IN "
                         f"(SELECT id FROM ripple WHERE pond_version_id IN ({ph}))", vids)
                     self.db.execute(f"DELETE FROM ripple WHERE pond_version_id IN ({ph})", vids)
@@ -2256,7 +2258,8 @@ class Driver:
         except Exception as exc:  # noqa: BLE001 — never let bookkeeping break a run
             print(f"[catchment] lineage record failed ({pond}.{ripple}): {exc}", flush=True)
 
-    def lineage(self, pond: str | None = None, major: int | None = None, table: str | None = None) -> dict:
+    def lineage(self, pond: str | None = None, major: int | None = None, table: str | None = None,
+                columns: bool = False) -> dict:
         """The observed table-level lineage graph (plans/lineage.md Phase 1), from each Ripple's **latest
         recorded run** on each selected version. ``pond`` narrows to one Pond (its selected version on
         ``major``, default the highest deployed); ``table`` narrows to edges touching that table name.
@@ -2291,11 +2294,38 @@ class Driver:
                 if table is not None:  # narrow to ripples touching this table name
                     ripples = {n: r for n, r in ripples.items()
                                if table in r["writes"] or any(rd["table"] == table for rd in r["reads"])}
-                if pond is None and not ripples:
+                entry = {"id": key, "name": m["name"], "major": m["major"], "version": m["version"],
+                         "ripples": sorted(ripples.values(), key=lambda r: r["ripple"])}
+                if columns:
+                    entry["columns"] = self._column_lineage_of(m["version_id"], table)
+                if pond is None and not ripples and not entry.get("columns"):
                     continue  # the catchment-wide view lists only ponds with recorded lineage
-                out.append({"id": key, "name": m["name"], "major": m["major"], "version": m["version"],
-                            "ripples": sorted(ripples.values(), key=lambda r: r["ripple"])})
+                out.append(entry)
             return {"ponds": out}
+
+    def _column_lineage_of(self, version_id: int, table: str | None = None) -> dict:
+        """The deploy-captured static column lineage (plans/lineage.md Phase 2) for one version:
+        ``{table: {column: [{"ref", "column"}] | "constant" | "opaque"} | "opaque"}``. Absent columns
+        were simply not captured (a non-capturable ripple) — absent, never guessed."""
+        rows = self.db.execute(
+            'SELECT "table", "column", kind, src_ref, src_column FROM pond_version_column_lineage '
+            'WHERE pond_version_id = ? ORDER BY "table", "column", src_ref, src_column', (version_id,),
+        ).fetchall()
+        out: dict = {}
+        for tname, col, kind, src_ref, src_col in rows:
+            if table is not None and tname != table:
+                continue
+            if col == "" and kind == "opaque":
+                out[tname] = "opaque"  # the whole table is unprovable (a .sql() output)
+                continue
+            t = out.setdefault(tname, {})
+            if not isinstance(t, dict):
+                continue
+            if kind == "exact":
+                t.setdefault(col, []).append({"ref": src_ref, "column": src_col})
+            else:
+                t[col] = kind  # "constant" | "opaque"
+        return out
 
     def _capture_schema(self, pond: str, schema: dict) -> None:
         """Freeze a Pond version's published output schema as its contract (idempotent upsert, keyed on

@@ -89,12 +89,15 @@ def lineage_graph(
     pond: str | None = None,
     major: int | None = None,
     table: str | None = None,
+    columns: bool = False,
 ):
     """The **observed table-level lineage** (plans/lineage.md Phase 1): the tables each Ripple actually
     read and wrote on its latest recorded run — exact (recorded at the read/write call), never inferred.
     ``pond`` narrows to one Pond (``major`` picks the line, default highest); ``table`` narrows to the
-    Ripples touching that table name. Reads with ``source: null`` are the Pond's own tables."""
-    return request.app.state.driver.lineage(pond=pond, major=major, table=table)
+    Ripples touching that table name. Reads with ``source: null`` are the Pond's own tables.
+    ``columns=true`` adds the deploy-captured **static column lineage** (Phase 2) per pond —
+    ``{table: {column: [{ref, column}] | "constant" | "opaque"}}``."""
+    return request.app.state.driver.lineage(pond=pond, major=major, table=table, columns=columns)
 
 
 @router.get("/runs", dependencies=[auth.read])
