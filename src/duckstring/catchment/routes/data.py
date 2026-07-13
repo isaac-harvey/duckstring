@@ -261,6 +261,56 @@ def list_pond_tables(
     return {"tables": out}
 
 
+@router.get("/ponds/{name}/trace", dependencies=[auth.read])
+def trace_row(
+    name: str, table: str, request: Request, where: Optional[str] = None,
+    major: Optional[int] = None, version: Optional[str] = None,
+):
+    """**Temporal row provenance** (plans/lineage.md Phase 4): which run produced the selected row(s),
+    from which input window. Resolves the newest ``_duckstring_f`` among the rows matching ``where``
+    (every Trickle row carries its producing run's freshness; a plain overwrite table resolves to its
+    last publish), then answers with that run — its version, timings, and the window ``(previous_f, f]``
+    each Source was read over. ``where`` is a SQL predicate over the published table (the same trust
+    level as ``/api/query`` — read-gated, over the exported snapshot, never the live registry)."""
+    import duckdb
+
+    from ...dataplane import get_data_plane
+
+    m = _resolve_major(request, name, major, version)
+    data_dir = _data_dir(request, name, m)
+    dp = get_data_plane()
+    con = duckdb.connect()
+    try:
+        con.execute("SET TimeZone='UTC'")
+        dp.prepare(con)
+        data_dir.duckdb_setup(con)
+        try:
+            sel = dp.read_select(data_dir, table)
+        except FileNotFoundError:
+            raise HTTPException(status_code=404, detail=f"table {table!r} is not published") from None
+        pred = where or "1=1"
+        try:
+            cols = con.sql(f"SELECT * FROM ({sel}) LIMIT 0").columns
+            if "_duckstring_f" in cols:
+                row = con.execute(
+                    f'SELECT max("_duckstring_f"), count(*) FROM ({sel}) WHERE {pred}'
+                ).fetchone()
+                row_f, matched = (row[0].isoformat() if row[0] else None), row[1]
+            else:  # a plain overwrite table — the whole publish is one run
+                matched = con.execute(f"SELECT count(*) FROM ({sel}) WHERE {pred}").fetchone()[0]
+                row_f = (_sidecar(request, name, m).get(table) or {}).get("f")
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=f"bad predicate: {exc}") from None
+    finally:
+        con.close()
+    if not matched or row_f is None:
+        return {"table": table, "matched": int(matched or 0), "row_f": None, "run": None}
+    trace = request.app.state.driver.trace_run(name, m, row_f)
+    return {"table": table, "matched": int(matched), "row_f": row_f, **trace}
+
+
 @router.get("/ponds/{name}/objects", dependencies=[auth.read])
 def list_pond_objects(
     name: str, request: Request, major: Optional[int] = None, version: Optional[str] = None,

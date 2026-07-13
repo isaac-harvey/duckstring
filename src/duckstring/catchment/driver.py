@@ -158,6 +158,12 @@ IRREVERSIBLE_OPS = frozenset({"reset", "wipe", "remove"})
 DUCK_SIZES = ("s", "m", "l", "xl")
 
 
+# OpenLineage identifiers (plans/lineage.md Phase 4) — the standard event/schema URLs.
+_OL_PRODUCER = "https://github.com/duckstring/duckstring"
+_OL_SCHEMA_URL = "https://openlineage.io/spec/2-0-2/OpenLineage.json#/definitions/RunEvent"
+_OL_SCHEMA_FACET = "https://openlineage.io/spec/facets/1-1-1/SchemaDatasetFacet.json"
+
+
 class Driver:
     def __init__(self, db, root, base_url: str | None, launcher, data_root: str | None = None):
         self.db = db
@@ -1648,6 +1654,7 @@ class Driver:
                 # additive gate and min_version enforcement build on).
                 if payload.get("schema"):
                     self._capture_schema(pond, payload["schema"])
+                self._emit_openlineage(pond, f, payload.get("schema"))  # catalog emission (opt-in channels)
                 self._process(now)
                 self._advance_repair(pond, now)  # if this Pond was a repair step, release its children
                 self._signal_egress()  # the Pond published → wake the egress worker for its Spouts
@@ -2326,6 +2333,98 @@ class Driver:
             else:
                 t[col] = kind  # "constant" | "opaque"
         return out
+
+    def trace_run(self, pond_name: str, major: int, row_f: str) -> dict:
+        """Temporal provenance for a row freshness (plans/lineage.md Phase 4): the run that produced it
+        (version, timings, status), its input window ``(previous_f, f]`` (the bracket every Source was
+        read over — ``previous_f`` is the prior *successful* run), and the declared Sources."""
+        with self.lock:
+            row = self.db.execute(
+                "SELECT pr.f, pv.version, pr.started_at, pr.finished_at, pr.status "
+                "FROM pond_run pr JOIN pond_version pv ON pv.id = pr.pond_version_id "
+                "JOIN pond_name pn ON pn.id = pv.pond_name_id "
+                "WHERE pn.name = ? AND pv.major = ? AND pr.f = ? "
+                "ORDER BY pr.finished_at DESC LIMIT 1", (pond_name, major, row_f),
+            ).fetchone()
+            prev = self.db.execute(
+                "SELECT MAX(pr.f) FROM pond_run pr JOIN pond_version pv ON pv.id = pr.pond_version_id "
+                "JOIN pond_name pn ON pn.id = pv.pond_name_id "
+                "WHERE pn.name = ? AND pv.major = ? AND pr.f < ? AND pr.status = 'success'",
+                (pond_name, major, row_f),
+            ).fetchone()
+            key = f"{pond_name}@{major}"
+            sources = sorted(
+                self.meta[sk]["name"] for sk in
+                (self.state.ponds[key].sources if key in self.state.ponds else [])
+                if sk in self.meta
+            )
+            run = None
+            if row is not None:
+                run = {"f": row[0], "version": row[1], "started_at": row[2],
+                       "finished_at": row[3], "status": row[4]}
+            return {"run": run,
+                    "window": {"previous_f": prev[0] if prev else None, "f": row_f},
+                    "sources": sources}
+
+    def _emit_openlineage(self, pond: str, f: str, schema: dict | None) -> None:
+        """Emit a standard OpenLineage RunEvent (COMPLETE) for a finished Pond Run to any channel
+        subscribed to the ``openlineage`` kind (plans/lineage.md Phase 4 — the integrate-don't-compete
+        move: one emitter slots Duckstring into whatever catalog a team already runs). The event body is
+        assembled from facts already in hand — the run identity, the observed table reads/writes
+        (``ripple_run_lineage`` at this ``f``), and the captured output schema as facets — and delivered
+        through the alert outbox (retries, audit, a catalog outage never touches a run). Deliberately
+        NOT in the ``all`` subscription (a Slack channel must not receive raw catalog events); a channel
+        opts in with ``--on openlineage``. Wrapped: emission can never break a run."""
+        try:
+            import uuid
+
+            if not self._openlineage_channels():
+                return  # no subscriber — build nothing
+            m = self.meta[pond]
+            cid = self._catchment_uuid() or "catchment"
+            namespace = f"duckstring://{cid}"
+            rows = self.db.execute(
+                "SELECT DISTINCT direction, source_name, table_name FROM ripple_run_lineage "
+                "WHERE pond_version_id = ? AND f = ?", (m["version_id"], f),
+            ).fetchall()
+            inputs = [{"namespace": namespace, "name": f"{src}.{t}"}
+                      for d, src, t in sorted(rows) if d == "read" and src]
+            out_names = sorted({t for d, src, t in rows if d == "write"} | set((schema or {}).keys()))
+            outputs = []
+            for t in out_names:
+                ds: dict = {"namespace": namespace, "name": f"{m['name']}.{t}"}
+                if schema and t in schema:
+                    ds["facets"] = {"schema": {
+                        "_producer": _OL_PRODUCER, "_schemaURL": _OL_SCHEMA_FACET,
+                        "fields": [{"name": c, "type": ty} for c, ty in schema[t].items()],
+                    }}
+                outputs.append(ds)
+            event = {
+                "eventType": "COMPLETE",
+                "eventTime": _iso(_now()),
+                "producer": _OL_PRODUCER,
+                "schemaURL": _OL_SCHEMA_URL,
+                "run": {"runId": str(uuid.uuid5(uuid.NAMESPACE_URL, f"{cid}:{pond}:{f}"))},
+                "job": {"namespace": namespace, "name": pond},
+                "inputs": inputs,
+                "outputs": outputs,
+            }
+            self._emit_alert(
+                "openlineage", scope_pond=m["name"], scope_major=m["major"], severity="info",
+                title=f"OpenLineage: {pond} run complete", message=f"Run at {f} completed.",
+                f=f, detail={"event": event},
+            )
+        except Exception as exc:  # noqa: BLE001 — lineage emission must never break a run
+            print(f"[catchment] openlineage emit failed ({pond}): {exc}", flush=True)
+
+    def _openlineage_channels(self) -> bool:
+        return self.db.execute(
+            "SELECT 1 FROM alert_channel WHERE enabled = 1 AND events LIKE '%openlineage%' LIMIT 1"
+        ).fetchone() is not None
+
+    def _catchment_uuid(self) -> str | None:
+        row = self.db.execute("SELECT value FROM catchment_meta WHERE key = 'id'").fetchone()
+        return row[0] if row and row[0] else None
 
     def _capture_schema(self, pond: str, schema: dict) -> None:
         """Freeze a Pond version's published output schema as its contract (idempotent upsert, keyed on

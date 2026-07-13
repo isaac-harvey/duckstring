@@ -26,7 +26,10 @@ class WebhookNotifier:
         from ..egress import credentials
 
         url = credentials.resolve(self.dest.raw)  # resolve any ${env:}/${secret:} token — never logged
-        body = {"text": event.summary(), **event.to_payload()}  # `text` for Slack; the rest for generic receivers
+        if event.kind == "openlineage" and event.detail.get("event"):
+            body = event.detail["event"]  # a standard OpenLineage RunEvent — posted verbatim, no wrapper
+        else:
+            body = {"text": event.summary(), **event.to_payload()}  # `text` for Slack; the rest generic
         try:
             resp = httpx.post(url, json=body, timeout=_TIMEOUT)
             resp.raise_for_status()

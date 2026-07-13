@@ -65,3 +65,47 @@ def show(
                     srcs = ", ".join(f"{s['ref']}.{s['column']}" for s in prov)
                     cnode.add(f"{col} ← {srcs}")
         console.print(tree)
+
+
+def trace(
+    ref: str = typer.Argument(..., help="The row's table as {pond}.{table}."),
+    where: Optional[str] = typer.Option(None, "--where", "-w", help="SQL predicate selecting the row(s), "
+                                                                    "e.g. \"order_id = 42\". Omit for the whole table."),
+    major: Optional[int] = typer.Option(None, "--major", "-m", help="Major line (default: highest deployed)."),
+    catchment: Optional[str] = typer.Option(None, "--catchment", "-c", help="Catchment to use (default if omitted)."),
+) -> None:
+    """Temporal provenance: which run produced the selected row(s), from which input window.
+
+    Every Trickle row carries the freshness of the run that wrote it; trace resolves that run's
+    version, timings, and the window ``(previous_f, f]`` each Source was read over::
+
+        duckstring trace revenue.by_product --where "product_id = 7"
+    """
+    from urllib.parse import quote
+
+    from . import _http
+    from .config import resolve_catchment
+
+    if "." not in ref:
+        typer.echo("trace needs a {pond}.{table} reference", err=True)
+        raise typer.Exit(1)
+    pond, table = ref.split(".", 1)
+    _, cfg = resolve_catchment(catchment)
+    query = f"table={quote(table)}"
+    if where:
+        query += f"&where={quote(where)}"
+    if major is not None:
+        query += f"&major={major}"
+    data = _http.get(f"{cfg['url']}/api/ponds/{pond}/trace?{query}", auth=cfg).json()
+
+    if not data.get("matched"):
+        typer.echo("No rows matched.")
+        return
+    run = data.get("run")
+    typer.echo(f"{data['matched']} row(s) · newest produced at f = {data['row_f']}")
+    if run:
+        typer.echo(f"  run: {pond} v{run['version']} · {run['status']} · {run['started_at']} → {run['finished_at']}")
+    w = data.get("window") or {}
+    typer.echo(f"  input window: ({w.get('previous_f') or 'NEVER'}, {w.get('f')}]")
+    if data.get("sources"):
+        typer.echo(f"  sources read over that window: {', '.join(data['sources'])}")
