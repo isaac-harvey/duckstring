@@ -107,7 +107,9 @@ def test_constants_and_sql_and_unknown_schema():
 
     lin = _lineage(run)
     assert lin["m"]["one"] == set()      # a constant: derives from exactly nothing
-    assert lin["agg_sql"] is None        # kind: sql — opaque until Phase 3
+    # kind: sql resolves via sqlglot (the duckstring[lineage] extra, present in dev/CI)
+    assert lin["agg_sql"]["id"] == {("orders.order_line", "id")}
+    assert lin["agg_sql"]["n"] == set()  # count(*) derives from row existence
 
     def run2(host):  # a source with NO schema and no select → the star is unenumerable
         host.trickle("mystery.table", p=1.0).merge("m2", pk="id")
@@ -226,3 +228,64 @@ def test_deploy_capture_never_fails_the_deploy(tmp_path):
     _register(db, "src", "1.0.0", "inlet", "ponds/src/1.0.0", cfg, ripples)
     _capture_column_lineage(db, "src", "1.0.0", ripples)  # must not raise
     assert db.execute("SELECT count(*) FROM pond_version_column_lineage").fetchone()[0] == 0
+
+
+# ── Phase 3: kind:sql column lineage via sqlglot (the duckstring[lineage] extra) ──
+
+
+def test_sql_statement_columns_via_sqlglot():
+    """A .sql() escape over a joined DAG: the query's projections map through the composed input's
+    provenance — a window function's refs union, a GROUP BY passthrough stays exact."""
+    def run(host):
+        (host.trickle("orders.order_line", p=1.0).alias("ol")
+         .join(host.trickle("prices.price", p=1.0).alias("pr"), on={"pid": "id"})
+         .sql("SELECT pid, SUM(qty * unit) AS rev, ROW_NUMBER() OVER (ORDER BY qty) AS rnk "
+              "FROM ol GROUP BY pid, qty")
+         .merge("pid_rev", pk="pid"))
+        return []
+
+    lin = _lineage(run)["pid_rev"]
+    assert lin["pid"] == {("orders.order_line", "pid"), ("prices.price", "id")}  # the unified join key
+    assert lin["rev"] == {("orders.order_line", "qty"), ("prices.price", "unit")}
+    assert lin["rnk"] == {("orders.order_line", "qty")}
+
+
+def test_sql_star_expands_through_the_schema():
+    def run(host):
+        host.trickle("orders.order_line", p=1.0).alias("t") \
+            .sql("SELECT * FROM t WHERE qty > 1").merge("filtered", pk="id")
+        return []
+
+    lin = _lineage(run)["filtered"]
+    assert set(lin) == {"id", "pid", "qty"}
+    assert lin["qty"] == {("orders.order_line", "qty")}
+
+
+def test_sql_unparseable_is_opaque():
+    def run(host):
+        host.trickle("orders.order_line", p=1.0).alias("t") \
+            .sql("TOTALLY (NOT SQL").merge("broken", pk="id")
+        return []
+
+    assert _lineage(run)["broken"] is None  # exact or absent — a failed parse never guesses
+
+
+def test_sql_without_sqlglot_is_opaque(monkeypatch):
+    """Without the lineage extra the kind:sql path stays honest-opaque (the pre-Phase-3 behaviour)."""
+    import builtins
+
+    real_import = builtins.__import__
+
+    def no_sqlglot(name, *a, **k):
+        if name == "sqlglot" or name.startswith("sqlglot."):
+            raise ImportError("not installed")
+        return real_import(name, *a, **k)
+
+    monkeypatch.setattr(builtins, "__import__", no_sqlglot)
+
+    def run(host):
+        host.trickle("orders.order_line", p=1.0).alias("t") \
+            .sql("SELECT id FROM t").merge("m", pk="id")
+        return []
+
+    assert _lineage(run)["m"] is None

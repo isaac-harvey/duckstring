@@ -208,9 +208,57 @@ def _output_columns(stmt: dict, ns: _Namespace) -> dict | None:
     return out
 
 
+def _sql_statement_lineage(stmt: dict, schemas: dict, own: dict) -> dict | None:
+    """Column lineage through a ``kind: sql`` statement (the ``.sql()`` escape hatch), via **sqlglot**
+    when installed (the ``duckstring[lineage]`` extra) — else ``None`` (opaque, exactly as before; the
+    parser only ever *upgrades* precision, absence never degrades below honest-opaque).
+
+    The composed input relation is exposed to the query under the statement's ``alias``; its column
+    provenance is the input DAG's star output (pipeline applied). The query is parsed (DuckDB dialect),
+    qualified against that one-table schema so ``SELECT *`` expands and bare columns bind, and each
+    projection's column references map through the input provenance. A parse/qualify failure → opaque."""
+    try:
+        import sqlglot
+        from sqlglot import exp
+        from sqlglot.optimizer.qualify import qualify
+    except ImportError:
+        return None
+
+    ns = _walk_dag(stmt["input_dag"], schemas, own)
+    _apply_pipeline(ns, stmt.get("pipeline"))
+    input_cols = _output_columns({"pipeline": [op for op in stmt.get("pipeline") or []
+                                               if op["op"] == "select"]}, ns)
+    if input_cols is None:
+        return None  # the input star is unenumerable — the query's bare refs can't bind
+    alias = stmt["alias"]
+    try:
+        tree = sqlglot.parse_one(stmt["query"], dialect="duckdb")
+        tree = qualify(tree, schema={alias: {c: "VARCHAR" for c in input_cols}}, dialect="duckdb")
+    except Exception:
+        return None
+    select = tree if isinstance(tree, exp.Select) else tree.find(exp.Select)
+    if select is None:
+        return None
+    out: dict = {}
+    for proj in select.expressions:
+        name = proj.alias_or_name
+        refs = [c for c in proj.find_all(exp.Column)]
+        provs = []
+        for c in refs:
+            col = c.name
+            if col in input_cols:
+                provs.append(input_cols[col])
+            else:
+                provs.append(None)  # a ref we can't place (a subquery's own alias, etc.) — opaque col
+        out[name] = _union(*provs) if provs else set()  # no column refs = a constant / count(*)
+    return out
+
+
 def _statement_lineage(stmt: dict, schemas: dict, own: dict) -> dict | None:
+    if stmt.get("kind") == "sql":
+        return _sql_statement_lineage(stmt, schemas, own)  # sqlglot-backed (Phase 3); opaque without it
     if stmt.get("kind") != "trickle":
-        return None  # kind: sql — opaque until a real parser takes it (Phase 3)
+        return None
     ns = _walk_dag(stmt["dag"], schemas, own)
     _apply_pipeline(ns, stmt.get("pipeline"))
 

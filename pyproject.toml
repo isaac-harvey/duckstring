@@ -40,12 +40,18 @@ iceberg = []
 dbt = [
   "dbt-duckdb>=1.9",
 ]
+# Column lineage through .sql() escape hatches (plans/lineage.md Phase 3): a real SQL parser, opt-in --
+# without it those outputs are honestly "opaque", never guessed. Pure python, light.
+lineage = [
+  "sqlglot>=23",
+]
 dev = [
   "pytest>=8.0",
   "pytest-timeout>=0.5",
   "ruff>=0.3",
   "mypy>=1.8",
   "dbt-duckdb>=1.9",
+  "sqlglot>=23",
 ]
 
 [tool.setuptools]
