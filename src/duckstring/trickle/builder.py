@@ -693,20 +693,48 @@ class TrickleBuilder:
     def _athena_comprehensive(self, name: str, out_pk, ivm: bool):
         """Consult the Athena backend for this terminal's **comprehensive** recompute. Returns a
         relation to hand to the terminal's own comprehensive machinery, or ``None`` (the local
-        path — the overwhelmingly common case). Dispatch only when the run is comprehensive-bound
-        anyway (bootstrap / ``ivm=False``) or forced: incremental epochs are small by construction
-        and stay local — kind preservation is the offload's economics (plans/athena.md)."""
+        path — the overwhelmingly common case).
+
+        The posture ladder (``@ripple(athena=…)`` over ``DUCKSTRING_ATHENA_MODE``; inert when
+        the runtime has no Athena config — same code runs anywhere):
+
+        - **always** — every eligible terminal recomputes comprehensively on Athena (the
+          known-heavy declaration: no local IVM for this Ripple's outputs).
+        - **upgrade** — only comprehensive-bound runs (bootstrap / ``ivm=False``) are
+          candidates; dispatch up front when *clearly* over the envelope, else run the local
+          recompute **bounded + materialised** and fail up to Athena on OOM. Incremental
+          epochs always stay local — kind preservation is the offload's economics.
+        - **off** — never.
+
+        Every Athena-side failure degrades to the local path; classic is the oracle."""
         if not os.environ.get("DUCKSTRING_ATHENA_WORKGROUP"):
             return None  # the gate, checked before any import cost
-        from .. import athena_backend
+        from .. import athena_backend as ab
 
-        cfg = athena_backend.Config.from_env()
-        comprehensive_bound = not ivm or name not in read_meta(self.ctx.con)
-        if not (comprehensive_bound or cfg.force):
+        cfg = ab.Config.from_env()
+        mode = cfg.resolve_mode(getattr(self.ctx, "athena", None))
+        if mode == "off" or not ab.wants(self):
             return None
-        if not athena_backend.wants(self):
+        if mode == "always":
+            return ab.comprehensive(self, out_pk)
+        # upgrade: comprehensive-bound runs only.
+        if ivm and name in read_meta(self.ctx.con):
             return None
-        return athena_backend.comprehensive(self, out_pk)
+        if ab.clearly_over(self, cfg):
+            return ab.comprehensive(self, out_pk)
+        try:
+            return ab.probe_local(self, cfg)
+        except Exception as exc:
+            import duckdb
+
+            if not isinstance(exc, duckdb.OutOfMemoryException):
+                raise
+            ab.log.warning("athena: local comprehensive hit the memory limit (%s) — failing up",
+                           str(exc)[:200])
+            remote = ab.comprehensive(self, out_pk)
+            if remote is None:  # Athena also failed — surface the real problem, don't loop
+                raise
+            return remote
 
     # ─── compute (the shared ΔO step behind .merge() and .append()) ───────────────
 

@@ -64,25 +64,37 @@ class Config:
     scratch: str | None
     region: str | None
     min_rows: int
-    force: bool
+    mode: str
+    memory_limit: str | None
 
     @classmethod
     def from_env(cls, env=None) -> "Config":
         e = env if env is not None else os.environ
         size = e.get("DUCKSTRING_DUCK_SIZE", "s").lower()
         min_rows = int(e.get("DUCKSTRING_ATHENA_MIN_ROWS", _SIZE_ROWS.get(size, _SIZE_ROWS["s"])))
+        mode = e.get("DUCKSTRING_ATHENA_MODE", "upgrade").lower()
+        if e.get("DUCKSTRING_ATHENA_FORCE", "0") == "1":  # testing/demo override
+            mode = "always"
         return cls(
             workgroup=e.get("DUCKSTRING_ATHENA_WORKGROUP") or None,
             database=e.get("DUCKSTRING_GLUE_DATABASE") or None,
             scratch=(e.get("DUCKSTRING_ATHENA_SCRATCH") or "").rstrip("/") or None,
             region=e.get("DUCKSTRING_ATHENA_REGION") or None,
             min_rows=min_rows,
-            force=e.get("DUCKSTRING_ATHENA_FORCE", "0") == "1",
+            mode=mode if mode in ("always", "upgrade", "off") else "upgrade",
+            memory_limit=e.get("DUCKSTRING_MEMORY_LIMIT") or None,
         )
 
     @property
     def enabled(self) -> bool:
         return bool(self.workgroup and self.database and self.scratch)
+
+    def resolve_mode(self, ripple_mode: str | None) -> str:
+        """The effective posture for one Ripple: its ``@ripple(athena=…)`` declaration wins;
+        absent, the runtime default. ``off`` (either level) or an unconfigured runtime ⇒ off."""
+        if not self.enabled:
+            return "off"
+        return ripple_mode or self.mode
 
 
 # ─── eligibility & estimate ──────────────────────────────────────────────────────
@@ -129,6 +141,27 @@ def _estimate_rows(builder) -> int:
         rel = builder.ctx.read_table(leaf.ref)
         total += rel.count("*").fetchone()[0]
     return total
+
+
+def clearly_over(builder, cfg: Config) -> bool:
+    """The up-front dispatch test (deliberately coarse and conservative): only input sizes, no
+    selectivity guessing — the OOM fail-up is the correctness backstop for everything this
+    misses (plans/athena.md §escalation)."""
+    return _estimate_rows(builder) >= cfg.min_rows
+
+
+def probe_local(builder, cfg: Config):
+    """Run the local comprehensive recompute **bounded and materialised**: cap DuckDB at the
+    Duck's memory limit and land the result in a temp table *before any output write*, so
+    "too big" surfaces here as a catchable ``OutOfMemoryException`` with zero partial-state
+    risk — the caller retries on Athena. Returns the materialised relation."""
+    con = builder.ctx.con
+    if cfg.memory_limit:
+        con.execute(f"SET memory_limit = '{cfg.memory_limit}'")
+    name = f"_ds_athena_probe_{uuid.uuid4().hex[:8]}"
+    rel = builder._full_join()
+    con.execute(f"CREATE TEMP TABLE {name} AS {rel.sql_query()}")
+    return con.table(name)
 
 
 # ─── SQL compile (v0) ────────────────────────────────────────────────────────────
@@ -183,15 +216,11 @@ def _compile_select(builder, cfg: Config, src_tables: dict[int, str]) -> str:
 
 def comprehensive(builder, out_pk) -> "object | None":
     """Run this terminal's comprehensive recompute on Athena. Returns a DuckDB relation over
-    the result (hand it to ``merge_table``/``append_zset``), or ``None`` on refusal/failure
-    (caller runs the local path). Never raises for an Athena-side problem."""
+    the result (hand it to ``merge_table``/``append_zset``), or ``None`` on failure (caller
+    runs the local path). The dispatch *decision* (mode/threshold/OOM) is the terminal
+    hook's; this is pure execution. Never raises for an Athena-side problem."""
     cfg = Config.from_env()
     try:
-        if not cfg.force:
-            rows = _estimate_rows(builder)
-            if rows < cfg.min_rows:
-                log.info("athena: %d source rows < envelope %d — local", rows, cfg.min_rows)
-                return None
         return _run(builder, cfg)
     except Exception as exc:  # noqa: BLE001 — the fallback contract
         log.warning("athena: dispatch failed (%s: %s) — running local", type(exc).__name__, str(exc)[:300])

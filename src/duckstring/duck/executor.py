@@ -8,6 +8,7 @@ when it finished".
 
 from __future__ import annotations
 
+import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -86,6 +87,7 @@ def _run_ripple(
         source_majors=source_majors, f=f, previous_f=previous_f, data_root=data_root,
         sources_changed=sources_changed, skip_sink=skip_sink,
         staging_dir=staging_dir, own_data_dir=own_data_dir,
+        athena=getattr(func, "_ds_athena", None),
     )
     try:
         func(pond)
@@ -146,6 +148,15 @@ class RippleExecutor:
         # off it. Separate `connect()`s to the same file in one process raise a "file handle conflict"
         # (a Binder error, not a transient lock) the moment two overlap — single instance avoids it.
         self._registry = duckdb.connect(str(self.registry_path))
+        # A containerised Duck must hit DuckDB's own limit (a catchable OutOfMemoryException,
+        # with disk spill first) rather than the kernel's cgroup OOM-kill: the launcher sets
+        # DUCKSTRING_MEMORY_LIMIT to ~80% of the pod cap. Absent env => DuckDB defaults, no change.
+        mem_limit = os.environ.get("DUCKSTRING_MEMORY_LIMIT")
+        if mem_limit:
+            spill = Path(self.root) / "tmp"
+            spill.mkdir(parents=True, exist_ok=True)
+            self._registry.execute(f"SET memory_limit = '{mem_limit}'")
+            self._registry.execute(f"SET temp_directory = '{spill}'")
         if recover:
             from ..dataplane import hydrate_registry
 
