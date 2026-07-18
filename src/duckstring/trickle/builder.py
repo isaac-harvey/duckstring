@@ -27,6 +27,7 @@ recomputed). An *unchanged* overwrite Ripple is a free stable operand.
 
 from __future__ import annotations
 
+import os
 import re
 
 from .context import SYSTEM_PREFIX
@@ -499,6 +500,10 @@ class TrickleBuilder:
         if self._materialised is not None:  # comprehensive mode (post-.sql) → diff the relation vs prior main
             changed = ctx.merge_table(name, self._materialised, pk=out_pk, retain_t=retain_t, retain_n=retain_n)
             return self._chain(name, out_pk, changed=changed)
+        remote = self._athena_comprehensive(name, out_pk, ivm)  # env-gated; None ⇒ the local path below
+        if remote is not None:
+            changed = ctx.merge_table(name, remote, pk=out_pk, retain_t=retain_t, retain_n=retain_n)
+            return self._chain(name, out_pk, changed=changed)
         kind, rel = self._compute(out_pk, name, ivm=ivm, key_filter=key_filter)
         if kind == "comprehensive":
             changed = ctx.merge_table(name, rel, pk=out_pk, retain_t=retain_t, retain_n=retain_n)
@@ -547,6 +552,13 @@ class TrickleBuilder:
             )
             return self._chain(name, out_pk, changed=changed)
 
+        remote = self._athena_comprehensive(name, out_pk, ivm)  # env-gated; None ⇒ the local path below
+        if remote is not None:
+            changed = trickle.append_zset(
+                ctx.con, name, trickle._as_zset(remote, 1), ctx.f, out_pk,
+                fail_on_conflict=fail_on_conflict, log_drops=log_drops, retain_t=retain_t, retain_n=retain_n,
+            )
+            return self._chain(name, out_pk, changed=changed)
         kind, rel = self._compute(out_pk, name, ivm=ivm, key_filter=key_filter)
         changed = False
         if kind != "empty":
@@ -675,6 +687,26 @@ class TrickleBuilder:
             f'SELECT * FROM {_q(v)} WHERE ({spine_cols}) NOT IN '
             f'(SELECT {out_cols} FROM {_q(name)} WHERE {_q(F_COL)} < {_ts(self.ctx.f)})'
         )
+
+    # ─── the Athena dispatch hook (cloud E1 v0; env-gated, no-op in pure OSS) ────
+
+    def _athena_comprehensive(self, name: str, out_pk, ivm: bool):
+        """Consult the Athena backend for this terminal's **comprehensive** recompute. Returns a
+        relation to hand to the terminal's own comprehensive machinery, or ``None`` (the local
+        path — the overwhelmingly common case). Dispatch only when the run is comprehensive-bound
+        anyway (bootstrap / ``ivm=False``) or forced: incremental epochs are small by construction
+        and stay local — kind preservation is the offload's economics (plans/athena.md)."""
+        if not os.environ.get("DUCKSTRING_ATHENA_WORKGROUP"):
+            return None  # the gate, checked before any import cost
+        from .. import athena_backend
+
+        cfg = athena_backend.Config.from_env()
+        comprehensive_bound = not ivm or name not in read_meta(self.ctx.con)
+        if not (comprehensive_bound or cfg.force):
+            return None
+        if not athena_backend.wants(self):
+            return None
+        return athena_backend.comprehensive(self, out_pk)
 
     # ─── compute (the shared ΔO step behind .merge() and .append()) ───────────────
 
