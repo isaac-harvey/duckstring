@@ -117,16 +117,20 @@ def set_(
 
 
 def _fmt_pool(p: dict) -> str:
-    bits = [f"{p['name']}"]
-    if p.get("instance_type"):
+    provider = p.get("provider") or "fargate"
+    bits = [f"{p['name']}", f"[{provider}]"]
+    if provider == "fargate" and (p.get("cpu") or p.get("memory")):
+        bits.append(f"{p.get('cpu') or '?'}cpu / {p.get('memory') or '?'}MiB")
+    elif p.get("instance_type"):
         bits.append(p["instance_type"])
-    bits.append(f"min {p['min_instances']} / max {p['max_instances']}")
     if p.get("keep_warm"):
         bits.append(f"keep-warm {p['keep_warm']}")
     if p.get("idle_timeout"):
         bits.append(f"idle {p['idle_timeout']}s")
     if p.get("region"):
         bits.append(p["region"])
+    if p.get("managed"):
+        bits.append("(preset)")
     return "   ".join(bits)
 
 
@@ -137,9 +141,6 @@ def pool_ls(catchment: Optional[str] = _CATCHMENT) -> None:
     from .config import resolve_catchment
     _, cfg = resolve_catchment(catchment)
     pools = _http.get(f"{cfg['url']}/api/catchment/duck-pools", auth=cfg).json().get("pools", [])
-    if not pools:
-        typer.echo("No Duck Pools defined. Add one: duckstring duck pool add <name> --instance-type <t>")
-        return
     for p in pools:
         typer.echo(_fmt_pool(p))
 
@@ -148,6 +149,9 @@ def pool_ls(catchment: Optional[str] = _CATCHMENT) -> None:
 def pool_add(
     name: str = typer.Argument(..., help="Pool name (referenced by pond.toml `duck = \"<name>\"`)."),
     catchment: Optional[str] = _CATCHMENT,
+    provider: Optional[str] = typer.Option(None, "--provider", help="fargate (default) | ec2."),
+    cpu: Optional[int] = typer.Option(None, "--cpu", help="Fargate task cpu units (256 = 0.25 vCPU)."),
+    memory: Optional[int] = typer.Option(None, "--memory", help="Fargate task memory (MiB)."),
     instance_type: Optional[str] = typer.Option(None, "--instance-type", "-t", help="EC2 instance type."),
     min_instances: Optional[int] = typer.Option(None, "--min", help="Floor / keep-warm baseline."),
     max_instances: Optional[int] = typer.Option(None, "--max", help="Ceiling."),
@@ -155,11 +159,13 @@ def pool_add(
     idle_timeout: Optional[int] = typer.Option(None, "--idle-timeout", help="Seconds before scale-down."),
     region: Optional[str] = typer.Option(None, "--region", help="AWS region (defaults to the Catchment's)."),
 ) -> None:
-    """Create or update a named Duck Pool. Inert until a remote launcher is configured."""
+    """Create or update a named Duck Pool (provider defaults to Fargate). Inert until the remote
+    launcher is configured. The built-in S/M/L/XL presets need no add."""
     from . import _http
     from .config import resolve_catchment
     _, cfg = resolve_catchment(catchment)
-    body = {"name": name, "instance_type": instance_type, "min_instances": min_instances,
+    body = {"name": name, "provider": provider, "cpu": cpu, "memory": memory,
+            "instance_type": instance_type, "min_instances": min_instances,
             "max_instances": max_instances, "keep_warm": keep_warm, "idle_timeout": idle_timeout,
             "region": region}
     p = _http.post(f"{cfg['url']}/api/catchment/duck-pools", auth=cfg, json=body).json()

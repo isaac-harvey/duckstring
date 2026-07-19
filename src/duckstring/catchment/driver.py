@@ -157,6 +157,24 @@ IRREVERSIBLE_OPS = frozenset({"reset", "wipe", "remove"})
 # size means physically is the launcher's business (the local subprocess ignores it).
 FLOCK_MODES = ("off", "upgrade", "always")
 OOM_POLICIES = ("fail_up", "fail")
+POOL_PROVIDERS = ("fargate", "ec2")
+
+# Built-in preset Duck Pools (plans/cloud-config.md §4b): Fargate task sizes, always available so a
+# `pond.toml duck = "M"` works with zero pool setup — and DSC ships the SAME names backed by its own
+# serverless pools, so a project transfers seamlessly (only the backend differs). Names are reserved.
+PRESET_POOLS = {
+    "S": {"cpu": 512, "memory": 2048},
+    "M": {"cpu": 1024, "memory": 4096},
+    "L": {"cpu": 2048, "memory": 8192},
+    "XL": {"cpu": 4096, "memory": 16384},
+}
+
+
+def _preset_pool(name: str) -> dict:
+    p = PRESET_POOLS[name]
+    return {"name": name, "provider": "fargate", "instance_type": None, "cpu": p["cpu"],
+            "memory": p["memory"], "min_instances": 0, "max_instances": 1, "idle_timeout": None,
+            "keep_warm": 0, "region": None, "managed": True}
 
 
 def _duck_override_row(row) -> dict:
@@ -265,7 +283,7 @@ class Driver:
             self.meta = {}
             self._incomplete: list[tuple[str, datetime]] = []  # (pond, F) runs to resume
 
-            self.duck_pool_names = {r[0] for r in db.execute("SELECT name FROM duck_pool")}
+            self.duck_pool_names = set(PRESET_POOLS) | {r[0] for r in db.execute("SELECT name FROM duck_pool")}
             name_by_pnid = {r[0]: r[1] for r in db.execute("SELECT id, name FROM pond_name")}
             rows = db.execute("""
                 SELECT pn.name, p.major, p.id, p.pond_version_id, pv.version, pv.source_path, pn.kind,
@@ -1042,23 +1060,35 @@ class Driver:
 
     # ─── Duck Pools (Catchment-level named remote compute; plans/cloud-config.md) ──
 
-    _POOL_FIELDS = ("instance_type", "min_instances", "max_instances", "idle_timeout",
-                    "keep_warm", "region")
+    _POOL_FIELDS = ("provider", "instance_type", "cpu", "memory", "min_instances", "max_instances",
+                    "idle_timeout", "keep_warm", "region")
 
-    def list_pools(self) -> list[dict]:
+    def _user_pools(self) -> list[dict]:
         rows = self.db.execute(
-            "SELECT name, instance_type, min_instances, max_instances, idle_timeout, keep_warm, region "
-            "FROM duck_pool ORDER BY name"
+            "SELECT name, provider, instance_type, cpu, memory, min_instances, max_instances, "
+            "idle_timeout, keep_warm, region FROM duck_pool ORDER BY name"
         ).fetchall()
         cols = ("name", *self._POOL_FIELDS)
-        return [dict(zip(cols, r, strict=True)) for r in rows]
+        pools = [dict(zip(cols, r, strict=True)) for r in rows]
+        for p in pools:
+            p["provider"] = p["provider"] or "fargate"  # NULL → the default provider
+            p["managed"] = False
+        return pools
+
+    def list_pools(self) -> list[dict]:
+        """The presets (built-in Fargate S/M/L/XL, `managed`) followed by user-defined pools."""
+        return [_preset_pool(n) for n in PRESET_POOLS] + self._user_pools()
 
     def add_pool(self, name: str, **fields) -> dict:
-        """Create or update a named Duck Pool (infra config; the EC2 launcher reads it). Validated
-        loosely — a pool is inert until a remote launcher is configured."""
+        """Create or update a user Duck Pool. Provider defaults to fargate; a preset name is reserved."""
         if not name or not name.strip():
             raise ValueError("a pool name is required")
+        if name in PRESET_POOLS:
+            raise ValueError(f"'{name}' is a built-in preset pool — pick another name")
         vals = {k: fields.get(k) for k in self._POOL_FIELDS}
+        vals["provider"] = vals["provider"] or "fargate"
+        if vals["provider"] not in POOL_PROVIDERS:
+            raise ValueError(f"provider must be one of {', '.join(POOL_PROVIDERS)}")
         for k in ("min_instances", "max_instances", "keep_warm"):
             if vals[k] is not None and int(vals[k]) < 0:
                 raise ValueError(f"{k} must be >= 0")
@@ -1067,11 +1097,12 @@ class Driver:
             raise ValueError("min_instances must be <= max_instances")
         with self.lock:
             self.db.execute(
-                "INSERT INTO duck_pool (name, instance_type, min_instances, max_instances, "
-                "idle_timeout, keep_warm, region) VALUES (:name, :instance_type, "
-                "COALESCE(:min_instances, 0), COALESCE(:max_instances, 1), :idle_timeout, "
-                "COALESCE(:keep_warm, 0), :region) "
-                "ON CONFLICT(name) DO UPDATE SET instance_type = excluded.instance_type, "
+                "INSERT INTO duck_pool (name, provider, instance_type, cpu, memory, min_instances, "
+                "max_instances, idle_timeout, keep_warm, region) VALUES (:name, :provider, "
+                ":instance_type, :cpu, :memory, COALESCE(:min_instances, 0), COALESCE(:max_instances, 1), "
+                ":idle_timeout, COALESCE(:keep_warm, 0), :region) "
+                "ON CONFLICT(name) DO UPDATE SET provider = excluded.provider, "
+                "instance_type = excluded.instance_type, cpu = excluded.cpu, memory = excluded.memory, "
                 "min_instances = excluded.min_instances, max_instances = excluded.max_instances, "
                 "idle_timeout = excluded.idle_timeout, keep_warm = excluded.keep_warm, "
                 "region = excluded.region",
@@ -1083,14 +1114,18 @@ class Driver:
         return self.get_pool(name)
 
     def get_pool(self, name: str) -> dict | None:
-        for p in self.list_pools():
+        if name in PRESET_POOLS:
+            return _preset_pool(name)
+        for p in self._user_pools():
             if p["name"] == name:
                 return p
         return None
 
     def remove_pool(self, name: str) -> None:
-        """Drop a pool. Ponds pinned to it fall back to the Catchment Duck (the same unknown-pool
-        rule as a portable pond.toml), so removal never strands a Pond."""
+        """Drop a user pool. Ponds pinned to it fall back to the Catchment Duck (the same unknown-pool
+        rule as a portable pond.toml), so removal never strands a Pond. Presets can't be removed."""
+        if name in PRESET_POOLS:
+            raise ValueError(f"'{name}' is a built-in preset pool and can't be removed")
         with self.lock:
             self.db.execute("DELETE FROM duck_pool WHERE name = ?", (name,))
             self.db.commit()

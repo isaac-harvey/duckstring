@@ -120,7 +120,10 @@ def put_settings(request: Request, body: _SettingsBody):
 
 class _PoolBody(BaseModel):
     name: str
-    instance_type: str | None = None
+    provider: str | None = None       # 'fargate' (default) | 'ec2'
+    instance_type: str | None = None  # EC2 pools
+    cpu: int | None = None            # Fargate task cpu units (256 = 0.25 vCPU)
+    memory: int | None = None         # Fargate task memory (MiB)
     min_instances: int | None = None
     max_instances: int | None = None
     idle_timeout: int | None = None   # seconds before scale-down
@@ -140,9 +143,9 @@ def upsert_duck_pool(request: Request, body: _PoolBody):
     """Create or update a named Duck Pool (it provisions billable infra, so full-gated)."""
     try:
         return request.app.state.driver.add_pool(
-            body.name, instance_type=body.instance_type, min_instances=body.min_instances,
-            max_instances=body.max_instances, idle_timeout=body.idle_timeout,
-            keep_warm=body.keep_warm, region=body.region)
+            body.name, provider=body.provider, instance_type=body.instance_type, cpu=body.cpu,
+            memory=body.memory, min_instances=body.min_instances, max_instances=body.max_instances,
+            idle_timeout=body.idle_timeout, keep_warm=body.keep_warm, region=body.region)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from None
 
