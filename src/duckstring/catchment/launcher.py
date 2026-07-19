@@ -107,6 +107,68 @@ class SubprocessLauncher:
             self.terminate(key)
 
 
+class DispatchingLauncher:
+    """Routes each Pond's Duck to a backend by its ``duck_target`` (plans/cloud-config.md): the
+    Catchment's own box (``local`` — the subprocess backend) or a remote backend (EC2 pool / dedicated
+    box). This is what makes "a local Catchment running cloud Ducks" the same code path as a hosted one:
+    ``catchment``-targeted Ponds always run on the Catchment's box, everything else on ``remote``. With
+    no ``remote`` backend configured (cloud not enabled), remote targets degrade to local — so a
+    ``duck = "heavy"`` pond.toml still runs anywhere."""
+
+    manages_processes = True  # liveness routes through is_running() → the owning backend
+
+    def __init__(self, local, remote=None):
+        self.local = local
+        self.remote = remote
+        self._owner: dict[str, object] = {}  # pond_key → the backend that spawned it
+
+    @property
+    def base_url(self):
+        return self.local.base_url
+
+    def _backend_for(self, duck: dict | None):
+        if self.remote is not None and duck and duck.get("remote"):
+            return self.remote
+        return self.local
+
+    def set_base_url(self, url: str) -> None:
+        self.local.set_base_url(url)
+        if self.remote is not None:
+            self.remote.set_base_url(url)
+
+    def is_running(self, pond_key: str) -> bool:
+        owner = self._owner.get(pond_key)
+        if owner is not None:
+            return owner.is_running(pond_key)
+        # Not yet routed (e.g. a pending spawn before base_url is known) — ask both; either owning it counts.
+        if self.local.is_running(pond_key):
+            return True
+        return self.remote is not None and self.remote.is_running(pond_key)
+
+    def ensure(self, pond_key: str, version: str, source_path: str, duck: dict | None = None) -> None:
+        backend = self._backend_for(duck)
+        # If a Pond's target changed lines between runs, tear down the stale backend's Duck first.
+        stale = self._owner.get(pond_key)
+        if stale is not None and stale is not backend:
+            stale.terminate(pond_key)
+        self._owner[pond_key] = backend
+        backend.ensure(pond_key, version, source_path, duck=duck)
+
+    def terminate(self, pond_key: str, wait: bool = False) -> None:
+        owner = self._owner.pop(pond_key, None)
+        if owner is not None:
+            owner.terminate(pond_key, wait=wait)
+        else:  # unknown ownership (restart) — terminate on both, harmless if absent
+            self.local.terminate(pond_key, wait=wait)
+            if self.remote is not None:
+                self.remote.terminate(pond_key, wait=wait)
+
+    def shutdown_all(self) -> None:
+        self.local.shutdown_all()
+        if self.remote is not None:
+            self.remote.shutdown_all()
+
+
 class NoopLauncher:
     """A launcher that never spawns anything — for tests/contexts that exercise the engine and
     persistence without running real Duck processes. Accepts the standard launcher constructor

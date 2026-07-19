@@ -1032,9 +1032,14 @@ class Driver:
         target = o["duck_target"] or decl.get("duck_target") or d["duck_target"]
         if target not in ("catchment", "dedicated") and target not in self.duck_pool_names:
             target = "catchment"  # an undefined pool → run locally (portable pond.toml)
+        # Embed the resolved pool spec so the dispatching launcher can act without DB access; `remote`
+        # is the routing signal (anything but the Catchment's own box).
+        pool = self.get_pool(target) if target not in ("catchment", "dedicated") else None
         return {
             "size": o["size"] or d["size"],
             "duck_target": target,
+            "remote": target != "catchment",
+            "pool": pool,
             "dedicated_instance_type": o["dedicated_instance_type"],
             "dedicated_auto_stop": o["dedicated_auto_stop"],
             "flock_mode": pick("flock_mode"),

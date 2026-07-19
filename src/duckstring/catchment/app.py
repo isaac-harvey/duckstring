@@ -43,12 +43,32 @@ async def _lifespan(app: FastAPI):
         # until the dial-back middleware learns the address from the first request.
         # DUCKSTRING_DUCK_LAUNCHER=module:Class (prereqs D6) swaps the implementation — same
         # constructor contract, same interface; the Duck still dials back over the duck channel.
-        launcher_cls = SubprocessLauncher
         if os.environ.get("DUCKSTRING_DUCK_LAUNCHER"):
+            # A fully-custom launcher (D6) takes over entirely — same constructor contract as before.
             launcher_cls = load_launcher_class(os.environ["DUCKSTRING_DUCK_LAUNCHER"])
-        launcher = launcher_cls(
-            app.state.root, base_url, token=app.state.duck_token, data_root=app.state.data_root
-        )
+            launcher = launcher_cls(
+                app.state.root, base_url, token=app.state.duck_token, data_root=app.state.data_root
+            )
+        else:
+            # The dispatching launcher: `catchment`-targeted Ponds on this box (subprocess), pool/
+            # dedicated ones on EC2 — the same code whether the Catchment is local or hosted. The EC2
+            # backend is only built when cloud is enabled (remote data root + AWS creds); otherwise
+            # remote targets degrade to local (plans/cloud-config.md).
+            from . import cloud
+            from .launcher import DispatchingLauncher
+
+            local = SubprocessLauncher(
+                app.state.root, base_url, token=app.state.duck_token, data_root=app.state.data_root
+            )
+            remote = None
+            if cloud.is_remote(app.state.data_root) and cloud.aws_configured(app.state.secret_store):
+                from .ec2_launcher import Ec2Launcher
+
+                remote = Ec2Launcher(
+                    app.state.root, base_url, token=app.state.duck_token,
+                    data_root=app.state.data_root,
+                )
+            launcher = DispatchingLauncher(local, remote)
     driver = Driver(app.state.db, app.state.root, base_url, launcher, data_root=app.state.data_root)
     app.state.driver = driver
     app.state.launcher = launcher
