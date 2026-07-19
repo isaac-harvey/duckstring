@@ -306,6 +306,24 @@ path is offline-tested with fakes); a security-group scoped to the Duck instance
 on the exposed endpoint, are the remaining hardening. DSC manages all of this for you. Tests:
 `tests/test_relay.py`.
 
+## Validated on real AWS (2026-07-20) + follow-ups
+
+A cloud-enabled **local** Catchment ran a Fargate Duck end-to-end (laptop Catchment → `M` pool →
+ARM64 task from the ECR image → Duck dialed back over a cloudflared tunnel → fetched its artifact →
+published 15 MB to S3 via the Iceberg plane → idle task auto-terminated). Bugs found + fixed in the
+run: (1) `create_app` didn't thread `DUCKSTRING_CATCHMENT_PUBLIC_URL` into `RemoteDialback` (a cloud
+Duck dialed the local bind → connection-refused) — fixed + `tests/test_dialback.py`; (2) the container
+image didn't install the `[aws]` extra, so the Duck lacked `s3fs` — the `Dockerfile` now installs
+`duckstring[aws]`.
+
+**Open follow-up (real gap): reap a self-stopped remote task's record.** `FargateLauncher`/`Ec2Launcher`
+`is_running` returns True while a task/instance *record* exists; when a task **stops on its own** (the
+Duck errors and exits) the record lingers, so `is_running` stays True and a `force`/on-change retry is
+**skipped** (the launcher thinks a Duck is still up). Workaround: `control kill` (reaps the record via
+`terminate`) then `force`. Proper fix: on a run **failure** (silent-Duck / error), the Catchment should
+`launcher.terminate(pond)` to reap the record so a retry re-dispatches — mirroring the idle-completion
+path that already terminates cleanly. Touches the liveness/retry path, so deliberately deferred.
+
 ## Deferred / Cloud-only
 
 - The **Exaflock** engine (Cloud; the moat) — registered like any Flock engine.

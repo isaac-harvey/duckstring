@@ -18,9 +18,10 @@ ENV PYTHONUNBUFFERED=1 \
     DUCKSTRING_STATE_ROOT=/var/lib/duckstring
 
 # The prebuilt wheel (bundles the schema + web UI). Installed rather than `pip install duckstring` so the
-# image always matches the release being built, not whatever PyPI has.
+# image always matches the release being built, not whatever PyPI has. The [aws] extra (s3fs + boto3) is
+# included: a Duck launched on EC2/Fargate always reads/writes the data plane on S3.
 COPY dist/*.whl /tmp/wheels/
-RUN pip install /tmp/wheels/*.whl && rm -rf /tmp/wheels
+RUN whl=$(ls /tmp/wheels/*.whl) && pip install "${whl}[aws]" && rm -rf /tmp/wheels
 
 # A non-root runtime user with a writable hot-state root (data lives in the object store, not here).
 RUN useradd --create-home --uid 10001 duck \

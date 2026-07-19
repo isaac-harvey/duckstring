@@ -79,7 +79,9 @@ async def _lifespan(app: FastAPI):
                         relay = candidate
                 # One shared dial-back (URL + relay) across the remote backends. Fargate is the default;
                 # EC2 rides alongside for escape-hatch pools. Both are inert until a matching pool spawns.
-                dialback = RemoteDialback(base_url, relay=relay)
+                # An explicit DUCKSTRING_CATCHMENT_PUBLIC_URL is the reachable dial-back address (a tunnel /
+                # a hosted Catchment's URL) — it wins over both the relay and the local bind.
+                dialback = RemoteDialback(base_url, relay=relay, public_url=has_public)
                 kw = dict(token=app.state.duck_token, data_root=app.state.data_root, dialback=dialback)
                 remotes = {
                     "fargate": FargateLauncher(app.state.root, base_url, **kw),
