@@ -156,6 +156,24 @@ IRREVERSIBLE_OPS = frozenset({"reset", "wipe", "remove"})
 # The Duck preset-size vocabulary (prereqs D5). Presets only — never raw instance shapes; what a
 # size means physically is the launcher's business (the local subprocess ignores it).
 DUCK_SIZES = ("s", "m", "l", "xl")
+FLOCK_MODES = ("off", "upgrade", "always")
+OOM_POLICIES = ("fail_up", "fail")
+
+
+def _duck_override_row(row) -> dict:
+    """A pond_duck row → the nullable override dict (plans/cloud-config.md). The legacy ``flock`` bool
+    is folded into ``flock_mode`` only when the newer column is unset (True⇒upgrade, False⇒off)."""
+    keys = ("size", "flock", "duck_target", "dedicated_instance_type", "dedicated_auto_stop",
+            "flock_mode", "flock_engine", "oom_policy")
+    if row is None:
+        o = {k: None for k in keys}
+    else:
+        o = dict(zip(keys, row, strict=True))
+        o["flock"] = None if o["flock"] is None else bool(o["flock"])
+        o["dedicated_auto_stop"] = None if o["dedicated_auto_stop"] is None else bool(o["dedicated_auto_stop"])
+    if o["flock_mode"] is None and o["flock"] is not None:
+        o["flock_mode"] = "upgrade" if o["flock"] else "off"
+    return o
 
 
 # OpenLineage identifiers (plans/lineage.md Phase 4) — the standard event/schema URLs.
@@ -204,9 +222,12 @@ class Driver:
         self._alerted_failures: dict[str, tuple] = {}  # key → (kind, scope_pond, scope_major, f, title, message)
         self._renotify_channels = False  # any enabled channel with a re-notify interval (refreshed per sweep)
         self._stale_breached: set[tuple[int, str]] = set()
-        # Per-Pond Duck config overrides (prereqs D5), key → {"size": str|None, "flock": bool|None};
-        # None = inherit the Catchment default (env). Loaded from pond_duck in reload().
-        self.duck_overrides: dict[str, dict] = {}
+        # Per-Pond compute config (plans/cloud-config.md). The effective value coalesces:
+        # override (pond_duck) ?? declared (pond_version, from pond.toml) ?? Catchment default (env).
+        # A NULL override field inherits; loaded from pond_duck / pond_version in reload().
+        self.duck_overrides: dict[str, dict] = {}   # key → nullable override columns
+        self.duck_declared: dict[str, dict] = {}    # key → declared columns off the selected pond_version
+        self.duck_pool_names: set[str] = set()      # defined Duck Pools (for the unknown-pool→catchment fallback)
         # Monotonic counter bumped on every state change — the UI long-polls /api/status against it, so
         # the display updates the instant the engine state moves rather than on a fixed timer.
         self.state_version = 0
@@ -249,6 +270,7 @@ class Driver:
             self.meta = {}
             self._incomplete: list[tuple[str, datetime]] = []  # (pond, F) runs to resume
 
+            self.duck_pool_names = {r[0] for r in db.execute("SELECT name FROM duck_pool")}
             name_by_pnid = {r[0]: r[1] for r in db.execute("SELECT id, name FROM pond_name")}
             rows = db.execute("""
                 SELECT pn.name, p.major, p.id, p.pond_version_id, pv.version, pv.source_path, pn.kind,
@@ -292,12 +314,18 @@ class Driver:
                 ).fetchone()
                 imm, onc = retry if retry else (0, 0)
                 duck_row = db.execute(
-                    "SELECT size, flock FROM pond_duck WHERE pond_id = ?", (pond_id,)
+                    "SELECT size, flock, duck_target, dedicated_instance_type, dedicated_auto_stop, "
+                    "flock_mode, flock_engine, oom_policy FROM pond_duck WHERE pond_id = ?", (pond_id,)
                 ).fetchone()
-                self.duck_overrides[key] = (
-                    {"size": duck_row[0], "flock": (None if duck_row[1] is None else bool(duck_row[1]))}
-                    if duck_row else {"size": None, "flock": None}
-                )
+                self.duck_overrides[key] = _duck_override_row(duck_row)
+                declared = db.execute(
+                    "SELECT duck_pool, flock_mode, flock_engine, oom_policy FROM pond_version WHERE id = ?",
+                    (pv_id,),
+                ).fetchone()
+                self.duck_declared[key] = {
+                    "duck_target": declared[0], "flock_mode": declared[1],
+                    "flock_engine": declared[2], "oom_policy": declared[3],
+                } if declared else {}
                 # always_run is a Pond property ORed up from its Ripples: any always_run Ripple means
                 # the Pond runs every time (never engine-passed). See plans/no-change-skip.md.
                 always_run = bool(db.execute(
@@ -933,47 +961,87 @@ class Driver:
 
     @staticmethod
     def duck_defaults() -> dict:
-        """The Catchment-wide Duck defaults, from env (`DUCKSTRING_DUCK_SIZE` / `DUCKSTRING_DUCK_FLOCK`).
-        Inert for the classic subprocess Duck (size is advisory; flock only matters with a co-resident
-        DuckFlock driver), sizing for remote launchers."""
+        """The Catchment-wide compute defaults, from env. Inert for the classic subprocess Duck (size
+        is advisory, the Flock is off with no engine configured), sizing/posture for remote launchers."""
+        mode = (os.environ.get("DUCKSTRING_FLOCK_MODE") or "off").lower()
         return {
             "size": os.environ.get("DUCKSTRING_DUCK_SIZE", "s").lower(),
-            "flock": os.environ.get("DUCKSTRING_DUCK_FLOCK", "on").lower() not in ("off", "0", "false"),
+            "duck_target": "catchment",
+            "flock_mode": mode if mode in FLOCK_MODES else "off",
+            "flock_engine": os.environ.get("DUCKSTRING_FLOCK_ENGINE") or None,
+            "oom_policy": (os.environ.get("DUCKSTRING_FLOCK_OOM_POLICY") or "fail_up").lower(),
         }
 
-    def set_duck(self, pond: str, size: str | None = None, flock: bool | None = None,
-                 clear: bool = False) -> None:
-        """Set (or with ``clear`` drop) a Pond's Duck config override (persisted to pond_duck; owned by
-        the operator, like retry budgets). Unset fields keep their current override; ``clear`` reverts
-        the Pond to the Catchment defaults."""
-        if size is not None and size not in DUCK_SIZES:
+    _DUCK_OVERRIDE_FIELDS = ("size", "duck_target", "dedicated_instance_type", "dedicated_auto_stop",
+                             "flock_mode", "flock_engine", "oom_policy")
+
+    def set_duck(self, pond: str, clear: bool = False, **fields) -> None:
+        """Set (or with ``clear`` drop) a Pond's compute override (persisted to pond_duck; operator-owned,
+        like retry budgets). Only the fields passed are changed; the rest keep their current override.
+        ``clear`` reverts the Pond to its DECLARED config (pond.toml), else the Catchment default."""
+        fields = {k: v for k, v in fields.items() if k in self._DUCK_OVERRIDE_FIELDS}
+        if fields.get("size") is not None and fields["size"] not in DUCK_SIZES:
             raise ValueError(f"size must be one of {', '.join(DUCK_SIZES)}")
+        if fields.get("flock_mode") is not None and fields["flock_mode"] not in FLOCK_MODES:
+            raise ValueError(f"flock_mode must be one of {', '.join(FLOCK_MODES)}")
+        if fields.get("oom_policy") is not None and fields["oom_policy"] not in OOM_POLICIES:
+            raise ValueError(f"oom_policy must be one of {', '.join(OOM_POLICIES)}")
         with self.lock:
             pond_id = self.meta[pond]["pond_id"]
             if clear:
                 self.db.execute("DELETE FROM pond_duck WHERE pond_id = ?", (pond_id,))
-                self.duck_overrides[pond] = {"size": None, "flock": None}
+                self.duck_overrides[pond] = _duck_override_row(None)
             else:
-                cur = self.duck_overrides.get(pond, {"size": None, "flock": None})
-                new = {"size": size if size is not None else cur["size"],
-                       "flock": flock if flock is not None else cur["flock"]}
+                cur = self.duck_overrides.get(pond) or _duck_override_row(None)
+                new = dict(cur)
+                new.update(fields)
                 self.db.execute(
-                    "INSERT INTO pond_duck (pond_id, size, flock) VALUES (?, ?, ?) "
-                    "ON CONFLICT(pond_id) DO UPDATE SET size = excluded.size, flock = excluded.flock",
-                    (pond_id, new["size"], None if new["flock"] is None else int(new["flock"])),
+                    "INSERT INTO pond_duck (pond_id, size, duck_target, dedicated_instance_type, "
+                    "dedicated_auto_stop, flock_mode, flock_engine, oom_policy) "
+                    "VALUES (:id, :size, :duck_target, :dedicated_instance_type, :dedicated_auto_stop, "
+                    ":flock_mode, :flock_engine, :oom_policy) "
+                    "ON CONFLICT(pond_id) DO UPDATE SET size = excluded.size, "
+                    "duck_target = excluded.duck_target, "
+                    "dedicated_instance_type = excluded.dedicated_instance_type, "
+                    "dedicated_auto_stop = excluded.dedicated_auto_stop, flock_mode = excluded.flock_mode, "
+                    "flock_engine = excluded.flock_engine, oom_policy = excluded.oom_policy",
+                    {"id": pond_id, "size": new["size"], "duck_target": new["duck_target"],
+                     "dedicated_instance_type": new["dedicated_instance_type"],
+                     "dedicated_auto_stop": (None if new["dedicated_auto_stop"] is None
+                                             else int(new["dedicated_auto_stop"])),
+                     "flock_mode": new["flock_mode"], "flock_engine": new["flock_engine"],
+                     "oom_policy": new["oom_policy"]},
                 )
                 self.duck_overrides[pond] = new
             self.db.commit()
             self.state_version += 1  # the config shows in /api/status
 
     def duck_config(self, pond: str) -> dict:
-        """The Pond's effective Duck config: the override where set, else the Catchment default."""
-        o = self.duck_overrides.get(pond, {"size": None, "flock": None})
+        """The Pond's EFFECTIVE compute config = override ?? declared ?? Catchment default (coalesce;
+        plans/cloud-config.md). An effective ``duck_target`` naming a pool this Catchment doesn't have
+        falls back to ``catchment`` (pond.toml stays portable)."""
+        o = self.duck_overrides.get(pond) or _duck_override_row(None)
+        decl = self.duck_declared.get(pond, {})
         d = self.duck_defaults()
+
+        def pick(field):
+            return o.get(field) if o.get(field) is not None else (
+                decl.get(field) if decl.get(field) is not None else d.get(field))
+
+        # duck_target: override wins; else the declared pool name; else the Catchment default.
+        target = o["duck_target"] or decl.get("duck_target") or d["duck_target"]
+        if target not in ("catchment", "dedicated") and target not in self.duck_pool_names:
+            target = "catchment"  # an undefined pool → run locally (portable pond.toml)
         return {
             "size": o["size"] or d["size"],
-            "flock": d["flock"] if o["flock"] is None else o["flock"],
-            "override": {"size": o["size"], "flock": o["flock"]},
+            "duck_target": target,
+            "dedicated_instance_type": o["dedicated_instance_type"],
+            "dedicated_auto_stop": o["dedicated_auto_stop"],
+            "flock_mode": pick("flock_mode"),
+            "flock_engine": pick("flock_engine"),
+            "oom_policy": pick("oom_policy"),
+            "declared": decl,
+            "override": {k: o[k] for k in self._DUCK_OVERRIDE_FIELDS},
             "defaults": d,
         }
 
@@ -2693,8 +2761,8 @@ class Driver:
                     "failure_kind": failure_kind,  # "contract" | "error" | null — the failed sub-reason
                     "immediate_retries": self.state.ponds[key].retry_immediately,
                     "source_retries": self.state.ponds[key].retry_on_change,
-                    # The Duck config (prereqs D5): effective size/flock + whether it's an override.
-                    # Draws/Spouts are not run by a Duck, so they carry none.
+                    # The effective compute config (target/size + Flock posture) + its declared/override
+                    # provenance. Draws/Spouts are not run by a Duck, so they carry none.
                     "duck": (None if self.meta[key].get("is_draw") or self.meta[key].get("is_spout")
                              else self.duck_config(key)),
                     "ripples": ripples,

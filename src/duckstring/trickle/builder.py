@@ -27,7 +27,6 @@ recomputed). An *unchanged* overwrite Ripple is a free stable operand.
 
 from __future__ import annotations
 
-import os
 import re
 
 from .context import SYSTEM_PREFIX
@@ -705,7 +704,7 @@ class TrickleBuilder:
         comprehensive_bound = (not ivm) or (name not in read_meta(self.ctx.con))
         return flock.comprehensive(
             self, out_pk,
-            ripple_mode=getattr(self.ctx, "flock", None),
+            pond_mode=getattr(self.ctx, "flock", None),
             comprehensive_bound=comprehensive_bound,
         )
 

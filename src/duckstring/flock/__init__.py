@@ -3,16 +3,18 @@
 Work that fits the Duck runs in the Duck; a ``pond.trickle(...)`` terminal whose comprehensive
 recompute would exceed the Duck's envelope is dispatched to a **serverless engine — the Flock**,
 which runs the heavy read side (scan/join/filter/project); the Duck keeps the merge/diff/publish
-semantics locally. The engine is **pluggable**: Athena today (the default), DuckFlock later —
-the builder hook, the ``@ripple(flock=…)`` posture, and this policy layer are all engine-agnostic.
+semantics locally. The engine is **pluggable**: Athena today (the default), EMR Serverless /
+Exaflock later — the builder hook, the per-Pond posture, and this policy layer are all
+engine-agnostic.
 
 **No metering here.** OSS dispatches and runs; it never bills. An engine's *cloud* deployment
 accounts for its own usage out of band (for Athena: per-tenant workgroup → CloudWatch
 bytes-scanned). The engine protocol has no cost surface — dispatch returns a result relation or
 ``None``, nothing more.
 
-Posture ladder (``@ripple(flock=…)`` over ``DUCKSTRING_FLOCK_MODE``, default ``upgrade``; inert
-without a configured engine, so the same code runs anywhere):
+Posture ladder (a **Pond-level** setting — ``pond.toml [flock] mode`` coalesced with an operator
+override, threaded to the Duck as ``DUCKSTRING_FLOCK_MODE``; inert without a configured engine, so
+the same code runs anywhere — plans/cloud-config.md):
 
 - **always** — every eligible terminal recomputes on the Flock (the known-heavy declaration).
 - **upgrade** — comprehensive-bound runs only: dispatch up front when *clearly* over the
@@ -22,7 +24,9 @@ without a configured engine, so the same code runs anywhere):
 Config (env):
 
 - ``DUCKSTRING_FLOCK_ENGINE``  — engine name (default ``athena``); unknown/unconfigured ⇒ off.
-- ``DUCKSTRING_FLOCK_MODE``    — runtime default posture (``upgrade``).
+- ``DUCKSTRING_FLOCK_MODE``    — the Pond's resolved posture (off|upgrade|always; set by the Duck from
+  its effective config — plans/cloud-config.md; a bare env default of ``off`` otherwise).
+- ``DUCKSTRING_FLOCK_OOM_POLICY``— ``fail_up`` (default; offload on OOM) | ``fail`` (hard cap).
 - ``DUCKSTRING_FLOCK_MIN_ROWS``— explicit envelope override (rows summed over source leaves).
 - ``DUCKSTRING_FLOCK_FORCE=1`` — force ``always`` (testing/demo).
 - ``DUCKSTRING_DUCK_SIZE`` / ``DUCKSTRING_MEMORY_LIMIT`` — Duck-level (envelope preset; the
@@ -82,6 +86,12 @@ def _min_rows(env=None) -> int:
     return int(e.get("DUCKSTRING_FLOCK_MIN_ROWS", _SIZE_ROWS.get(size, _SIZE_ROWS["s"])))
 
 
+def _oom_policy(env=None) -> str:
+    e = env if env is not None else os.environ
+    policy = (e.get("DUCKSTRING_FLOCK_OOM_POLICY") or "fail_up").lower()
+    return policy if policy in ("fail_up", "fail") else "fail_up"
+
+
 def _runtime_mode(env=None) -> str:
     e = env if env is not None else os.environ
     if e.get("DUCKSTRING_FLOCK_FORCE", "0") == "1":
@@ -90,10 +100,10 @@ def _runtime_mode(env=None) -> str:
     return mode if mode in ("always", "upgrade", "off") else "upgrade"
 
 
-def resolve_mode(ripple_mode: str | None, env=None) -> str:
-    """The effective posture for one Ripple: its ``@ripple(flock=…)`` declaration wins; absent,
-    the runtime default."""
-    return ripple_mode or _runtime_mode(env)
+def resolve_mode(pond_mode: str | None, env=None) -> str:
+    """The effective posture for this run: the Pond's resolved posture (threaded through the Duck)
+    wins; absent, the runtime default env."""
+    return pond_mode or _runtime_mode(env)
 
 
 def _probe_local(builder):
@@ -108,15 +118,16 @@ def _probe_local(builder):
     return con.table(name)
 
 
-def comprehensive(builder, out_pk, *, ripple_mode: str | None, comprehensive_bound: bool):
+def comprehensive(builder, out_pk, *, pond_mode: str | None, comprehensive_bound: bool):
     """Decide + run this terminal's comprehensive recompute on the Flock. Returns a result
     relation for the terminal's own comprehensive machinery, or ``None`` (run local — the common
-    case). ``comprehensive_bound`` is the caller's verdict that this run recomputes wholesale
-    anyway (bootstrap / ``ivm=False``); incremental epochs pass ``False`` and never dispatch."""
+    case). ``pond_mode`` is the Pond's resolved posture; ``comprehensive_bound`` is the caller's
+    verdict that this run recomputes wholesale anyway (bootstrap / ``ivm=False``); incremental epochs
+    pass ``False`` and never dispatch."""
     engine = get_engine()
     if engine is None:
         return None
-    mode = resolve_mode(ripple_mode)
+    mode = resolve_mode(pond_mode)
     if mode == "off":
         return None
     reason = engine.eligible(builder)
@@ -136,6 +147,10 @@ def comprehensive(builder, out_pk, *, ripple_mode: str | None, comprehensive_bou
         import duckdb
 
         if not isinstance(exc, duckdb.OutOfMemoryException):
+            raise
+        # oom_policy=fail is the hard cap: surface the OOM as a Pond failure, don't offload.
+        if _oom_policy() == "fail":
+            log.warning("flock: local comprehensive hit the memory limit and oom_policy=fail — not offloading")
             raise
         log.warning("flock: local comprehensive hit the memory limit (%s) — failing up", str(exc)[:200])
         remote = engine.dispatch(builder, out_pk)

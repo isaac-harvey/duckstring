@@ -87,7 +87,9 @@ def _run_ripple(
         source_majors=source_majors, f=f, previous_f=previous_f, data_root=data_root,
         sources_changed=sources_changed, skip_sink=skip_sink,
         staging_dir=staging_dir, own_data_dir=own_data_dir,
-        flock=getattr(func, "_ds_flock", None),
+        # Flock is a Pond-level posture now (not per-Ripple): the Duck's config env carries the
+        # resolved mode. flock.comprehensive still applies engine-eligibility + the OOM fail-up.
+        flock=os.environ.get("DUCKSTRING_FLOCK_MODE"),
     )
     try:
         func(pond)

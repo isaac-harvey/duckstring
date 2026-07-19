@@ -1,7 +1,7 @@
-"""The Flock dispatch surface: the ``@ripple(flock=…)`` declaration, mode resolution
-(ripple > runtime default > unconfigured ⇒ off), engine selection, and the upgrade posture's
-OOM fail-up (bounded, materialised local probe → engine dispatch). The engine is faked — no
-AWS in the suite; the real Athena engine is exercised by the cloud e2e."""
+"""The Flock dispatch surface: the Pond-level posture (Pond mode > runtime default > unconfigured
+⇒ off), engine selection, the upgrade posture's OOM fail-up (bounded, materialised local probe →
+engine dispatch), and the fail policy (hard cap). The engine is faked — no AWS in the suite; the
+real Athena engine is exercised by the cloud e2e."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ import duckdb
 import pytest
 
 from duckstring import flock
-from duckstring.core import Pond, collect_ripples, ripple
+from duckstring.core import Pond
 
 UTC = timezone.utc
 
@@ -45,28 +45,6 @@ class FakeEngine:
         return self.result_fn(builder) if self.result_fn else None
 
 
-# ─── declaration ────────────────────────────────────────────────────────────────
-
-
-def test_ripple_flock_declaration_is_stamped_and_registered():
-    @ripple(flock="always")
-    def heavy(pond): ...
-
-    @ripple
-    def plain(pond): ...
-
-    regs = {r["name"]: r for r in collect_ripples()}
-    assert heavy._ds_flock == "always"
-    assert regs["heavy"]["flock"] == "always"
-    assert plain._ds_flock is None and regs["plain"]["flock"] is None
-
-
-def test_ripple_flock_rejects_unknown_mode():
-    with pytest.raises(ValueError, match="flock='sometimes'"):
-        @ripple(flock="sometimes")
-        def bad(pond): ...
-
-
 # ─── engine selection + mode resolution ─────────────────────────────────────────
 
 
@@ -84,7 +62,7 @@ def test_unknown_engine_is_off():
     assert flock.get_engine({**FLOCK_ENV, "DUCKSTRING_FLOCK_ENGINE": "nope"}) is None
 
 
-def test_ripple_declaration_beats_runtime_default():
+def test_pond_posture_beats_runtime_default():
     assert flock.resolve_mode("always", {"DUCKSTRING_FLOCK_MODE": "off"}) == "always"
     assert flock.resolve_mode("off", {"DUCKSTRING_FLOCK_MODE": "always"}) == "off"
     assert flock.resolve_mode(None, {"DUCKSTRING_FLOCK_MODE": "always"}) == "always"
@@ -169,7 +147,7 @@ def test_incremental_epoch_never_dispatches(tmp_path, monkeypatch):
     monkeypatch.setattr(flock, "get_engine", lambda env=None: engine)
     # comprehensive_bound=False (an incremental epoch) must bail before any engine call.
     b = pond.trickle("src").select("s0.id, s0.v")
-    assert flock.comprehensive(b, ("id",), ripple_mode=None, comprehensive_bound=False) is None
+    assert flock.comprehensive(b, ("id",), pond_mode=None, comprehensive_bound=False) is None
     assert not engine.dispatched
 
 
@@ -183,4 +161,24 @@ def test_off_declaration_disables_even_when_runtime_says_always(tmp_path, monkey
     monkeypatch.setattr(flock, "get_engine", lambda env=None: engine)
 
     pond.trickle("src").select("s0.id, s0.v").merge("out", pk="id")
+    assert not engine.dispatched
+
+
+def test_oom_policy_fail_is_a_hard_cap(tmp_path, monkeypatch):
+    for k, v in FLOCK_ENV.items():
+        monkeypatch.setenv(k, v)
+    monkeypatch.setenv("DUCKSTRING_FLOCK_MIN_ROWS", "10000000")  # never clearly-over → local probe
+    monkeypatch.setenv("DUCKSTRING_FLOCK_OOM_POLICY", "fail")
+    pond = _pond(tmp_path)
+    _mark_source(pond)
+    engine = FakeEngine(rows=1000, result_fn=lambda b: b.ctx.read_table("src").project("id, v"))
+    monkeypatch.setattr(flock, "get_engine", lambda env=None: engine)
+
+    def oom_probe(builder):
+        raise duckdb.OutOfMemoryException("boom: memory limit")
+
+    monkeypatch.setattr(flock, "_probe_local", oom_probe)
+    # oom_policy=fail: the OOM surfaces (a Pond failure), the engine is NOT offloaded to.
+    with pytest.raises(duckdb.OutOfMemoryException):
+        pond.trickle("src").select("s0.id, s0.v").merge("out", pk="id")
     assert not engine.dispatched

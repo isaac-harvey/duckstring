@@ -110,7 +110,6 @@ class AthenaEngine:
         athena = session.client("athena")
         _duckdb_s3_secret(con, session)
 
-        t0 = time.monotonic()
         # 1. Stage each leaf's current state as parquet + a temporary Glue external table.
         builder._prepare_leaves()
         src_tables: dict[int, str] = {}
@@ -120,7 +119,7 @@ class AthenaEngine:
             prefix = f"{self.scratch}/stage/{job}/src{i}"
             con.execute(f"COPY ({rel.sql_query()}) TO '{prefix}/data.parquet' (FORMAT PARQUET)")
             tbl = f"dsjob_{job}_src{i}"
-            cols = ", ".join(f"`{c}` {_athena_type(str(t))}" for c, t in zip(rel.columns, rel.types))
+            cols = ", ".join(f"`{c}` {_athena_type(str(t))}" for c, t in zip(rel.columns, rel.types, strict=True))
             self._query(athena, f"CREATE EXTERNAL TABLE {self.database}.{tbl} ({cols}) "
                                 f"STORED AS PARQUET LOCATION '{prefix}/'")
             src_tables[id(leaf)] = f"{self.database}.{tbl}"
@@ -178,7 +177,7 @@ def _compile_select(builder, src_tables: dict[int, str]) -> str:
 
     builder._prepare_leaves()
     leaves = builder._leaves()
-    alias = {id(l): builder._alias_for(l) for l in leaves}
+    alias = {id(lf): builder._alias_for(lf) for lf in leaves}
 
     def leaf_owning(col: str, upto: int):
         for i in range(upto):
@@ -200,8 +199,8 @@ def _compile_select(builder, src_tables: dict[int, str]) -> str:
         left_sql, left_n = from_clause(node.left)
         right = node.right  # a _Source by the left-deep guard
         on = " AND ".join(
-            f"{qualify('left', l, right, left_n)} = {qualify('right', r, right, left_n)}"
-            for l, r in node.on_pairs
+            f"{qualify('left', lc, right, left_n)} = {qualify('right', rc, right, left_n)}"
+            for lc, rc in node.on_pairs
         )
         return f"{left_sql} {_JOIN_SQL[node.how]} {src_tables[id(right)]} AS {alias[id(right)]} ON {on}", left_n + 1
 

@@ -348,9 +348,17 @@ def get_budget(name: str, request: Request, major: int | None = None, version: s
 
 
 class _DuckBody(BaseModel):
-    size: str | None = None    # 's' | 'm' | 'l' | 'xl'; None = keep the current override
-    flock: bool | None = None  # None = keep the current override
-    clear: bool = False        # drop the override entirely (revert to the Catchment defaults)
+    # Each field: None = keep the current override; ``clear`` drops the whole override (reverts to the
+    # DECLARED pond.toml config, else the Catchment default). Effective config coalesces override ??
+    # declared ?? default (plans/cloud-config.md).
+    size: str | None = None                     # 's' | 'm' | 'l' | 'xl'
+    duck_target: str | None = None              # 'catchment' | a Duck Pool name | 'dedicated'
+    dedicated_instance_type: str | None = None  # for duck_target='dedicated'
+    dedicated_auto_stop: bool | None = None     # terminate the dedicated box on Pond-run completion
+    flock_mode: str | None = None               # 'off' | 'upgrade' | 'always'
+    flock_engine: str | None = None             # 'athena' | …
+    oom_policy: str | None = None               # 'fail_up' | 'fail'
+    clear: bool = False
 
 
 @router.post("/ponds/{name}/duck", dependencies=[auth.full])
@@ -358,11 +366,16 @@ def set_duck(
     name: str, body: _DuckBody, request: Request,
     major: int | None = None, version: str | None = None,
 ):
-    """Set the Pond's Duck config override (preset size / Flock escalation). Operational config,
-    operator-owned — never pond.toml."""
+    """Set the Pond's compute override (Duck target/size + Flock posture). Operator-owned; coalesces
+    over the pond.toml-declared config, and persists across redeploys."""
     key = _resolve(request, name, major, version)
     try:
-        _driver(request).set_duck(key, size=body.size, flock=body.flock, clear=body.clear)
+        _driver(request).set_duck(
+            key, clear=body.clear, size=body.size, duck_target=body.duck_target,
+            dedicated_instance_type=body.dedicated_instance_type,
+            dedicated_auto_stop=body.dedicated_auto_stop, flock_mode=body.flock_mode,
+            flock_engine=body.flock_engine, oom_policy=body.oom_policy,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from None
     return {"ok": True}
@@ -370,7 +383,7 @@ def set_duck(
 
 @router.get("/ponds/{name}/duck", dependencies=[auth.read])
 def get_duck(name: str, request: Request, major: int | None = None, version: str | None = None):
-    """The Pond's effective Duck config (override where set, else the Catchment default)."""
+    """The Pond's effective compute config (override ?? declared ?? Catchment default)."""
     return _driver(request).duck_config(_resolve(request, name, major, version))
 
 

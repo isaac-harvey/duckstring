@@ -22,10 +22,7 @@ def retry_on_lock(fn, attempts: int = 12, base: float = 0.05):
             time.sleep(min(base * (2**i), 0.5))
 
 
-_FLOCK_MODES = (None, "always", "upgrade", "off")
-
-
-def ripple(func=None, *, parents=None, name=None, always_run=False, flock=None):
+def ripple(func=None, *, parents=None, name=None, always_run=False):
     """Decorator that registers a function as a Ripple — a named unit of code in a Pond. A Ripple has no
     tabular expectations: it may write zero, one, or many tables (in call order — sequential within the
     Ripple; split across Ripples for parallelism), or none at all. ``parents`` are the *within-Pond*
@@ -36,17 +33,9 @@ def ripple(func=None, *, parents=None, name=None, always_run=False, flock=None):
     (:meth:`Pond.read_delta` / :meth:`Pond.trickle`) and publish history-preserving **Trickle** tables
     (:meth:`Pond.append_table` / :meth:`Pond.merge_table`) — the mode is chosen per write.
 
-    ``flock`` designates the Ripple's posture for the **Flock** — duckstring's over-envelope
-    compute tier (a serverless engine; Athena by default). A **hint, inert unless the runtime
-    has a Flock engine configured**, so the same code runs anywhere:
-
-    - ``"always"`` — this chunk is known-heavy: eligible terminals recompute on the Flock (no
-      local IVM for this Ripple's outputs).
-    - ``"upgrade"`` — local first; dispatch when clearly over the Duck's envelope, or when the
-      local comprehensive recompute hits DuckDB's memory limit (the OOM fail-up).
-    - ``"off"`` — never dispatch, whatever the runtime default says.
-    - ``None`` (default) — follow the runtime default (``DUCKSTRING_FLOCK_MODE``, itself
-      defaulting to ``upgrade`` when a Flock engine is configured).
+    The **Flock** posture (over-envelope offload) is a **Pond-level** setting, declared in
+    ``pond.toml [flock]`` (``mode``/``engine``/``oom_policy``) and coalesced with an operator
+    override — not a per-Ripple concern. To isolate a known-heavy chunk, split it into its own Pond.
 
     Usage:
         @ripple
@@ -54,24 +43,17 @@ def ripple(func=None, *, parents=None, name=None, always_run=False, flock=None):
 
         @ripple(parents=[load])
         def clean(pond): ...
-
-        @ripple(flock="always")
-        def heavy_rollup(pond): ...
     """
-    if flock not in _FLOCK_MODES:
-        raise ValueError(f"@ripple(flock={flock!r}): one of {_FLOCK_MODES[1:]} (or omit)")
     if func is not None:
         # Called as @ripple without arguments
-        func._ds_flock = flock
         _RIPPLES.append({"func": func, "name": name or func.__name__, "parents": parents or [],
-                         "always_run": always_run, "flock": flock})
+                         "always_run": always_run})
         return func
 
     # Called as @ripple(...) with arguments
     def decorator(f):
-        f._ds_flock = flock
         _RIPPLES.append({"func": f, "name": name or f.__name__, "parents": parents or [],
-                         "always_run": always_run, "flock": flock})
+                         "always_run": always_run})
         return f
 
     return decorator
@@ -391,7 +373,8 @@ class Pond:
         self._staging_dir = staging_dir
         self._own_data_dir = own_data_dir
         self._object_scratch = None
-        # The Ripple's Flock posture (@ripple(flock=...)); the trickle terminals read it.
+        # The Pond's resolved Flock posture (off|upgrade|always) — from the Pond's config, threaded in
+        # by the runtime (the Duck sets it from its config env); the trickle terminals read it.
         self.flock = flock
         self.name = name
         self.version = version

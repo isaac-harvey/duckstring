@@ -84,7 +84,8 @@ def _check_version_contracts(db, pn_id: int, name: str, version: str, cfg: dict)
 def _pond_config(toml_path: Path) -> dict:
     """Extract the deploy-relevant config from pond.toml: sources, retries, kind, dbt_project. (Windows
     are operational config managed via `duckstring trigger window`, not declared at deploy time.)"""
-    cfg = {"sources": {}, "immediate_retries": 0, "source_retries": 0, "kind": None, "dbt_project": None}
+    cfg = {"sources": {}, "immediate_retries": 0, "source_retries": 0, "kind": None, "dbt_project": None,
+           "duck_pool": None, "flock_mode": None, "flock_engine": None, "oom_policy": None}
     if not toml_path.exists():
         return cfg
     info = _read_toml(toml_path.read_text(encoding="utf-8"))
@@ -94,7 +95,23 @@ def _pond_config(toml_path: Path) -> dict:
     cfg["source_retries"] = pond.get("source_retries", 0)
     cfg["kind"] = pond.get("type")
     cfg["dbt_project"] = pond.get("dbt_project")
+    # DECLARED compute (a compute *hint*, so it belongs in pond.toml — plans/cloud-config.md). The Duck
+    # target is a POOL NAME (or 'catchment'), never raw instance specs (those are environment-specific,
+    # operator-only). These ride the immutable pond_version and are re-read every redeploy; an operator
+    # override in pond_duck coalesces over them. Validated loosely here (a pool name is Catchment-local
+    # and may not exist yet — resolution falls back to the Catchment Duck, keeping pond.toml portable).
+    cfg["duck_pool"] = pond.get("duck")  # pool name | 'catchment' | None
+    flock = info.get("flock", {})
+    cfg["flock_mode"] = _validate_choice(flock.get("mode"), ("off", "upgrade", "always"), "[flock] mode")
+    cfg["flock_engine"] = flock.get("engine")
+    cfg["oom_policy"] = _validate_choice(flock.get("oom_policy"), ("fail_up", "fail"), "[flock] oom_policy")
     return cfg
+
+
+def _validate_choice(value, choices, label):
+    if value is not None and value not in choices:
+        raise ValueError(f"pond.toml {label}: expected one of {', '.join(choices)}, got {value!r}")
+    return value
 
 
 def _discover_ripples(source_dir: Path) -> list[dict]:
@@ -260,14 +277,20 @@ def _register(db, name, version, kind, source_path, cfg, ripples) -> None:
                     db.execute("DELETE FROM ripple WHERE pond_version_id = ?", (pv_id,))
             db.execute(
                 "UPDATE pond_version SET source_path = ?, major = ?, immediate_retries = ?, "
-                "source_retries = ?, deployed_at = ? WHERE id = ?",
-                (source_path, major, cfg["immediate_retries"], cfg["source_retries"], deployed_at, pv_id),
+                "source_retries = ?, deployed_at = ?, duck_pool = ?, flock_mode = ?, flock_engine = ?, "
+                "oom_policy = ? WHERE id = ?",
+                (source_path, major, cfg["immediate_retries"], cfg["source_retries"], deployed_at,
+                 cfg.get("duck_pool"), cfg.get("flock_mode"), cfg.get("flock_engine"),
+                 cfg.get("oom_policy"), pv_id),
             )
         else:
             db.execute(
                 "INSERT INTO pond_version (pond_name_id, version, major, source_path, "
-                "immediate_retries, source_retries, deployed_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (pn_id, version, major, source_path, cfg["immediate_retries"], cfg["source_retries"], deployed_at),
+                "immediate_retries, source_retries, deployed_at, duck_pool, flock_mode, flock_engine, "
+                "oom_policy) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (pn_id, version, major, source_path, cfg["immediate_retries"], cfg["source_retries"],
+                 deployed_at, cfg.get("duck_pool"), cfg.get("flock_mode"), cfg.get("flock_engine"),
+                 cfg.get("oom_policy")),
             )
             (pv_id,) = db.execute(
                 "SELECT id FROM pond_version WHERE pond_name_id = ? AND version = ?", (pn_id, version)
