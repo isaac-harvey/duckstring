@@ -500,7 +500,7 @@ class TrickleBuilder:
         if self._materialised is not None:  # comprehensive mode (post-.sql) → diff the relation vs prior main
             changed = ctx.merge_table(name, self._materialised, pk=out_pk, retain_t=retain_t, retain_n=retain_n)
             return self._chain(name, out_pk, changed=changed)
-        remote = self._athena_comprehensive(name, out_pk, ivm)  # env-gated; None ⇒ the local path below
+        remote = self._flock_comprehensive(name, out_pk, ivm)  # env-gated; None ⇒ the local path below
         if remote is not None:
             changed = ctx.merge_table(name, remote, pk=out_pk, retain_t=retain_t, retain_n=retain_n)
             return self._chain(name, out_pk, changed=changed)
@@ -552,7 +552,7 @@ class TrickleBuilder:
             )
             return self._chain(name, out_pk, changed=changed)
 
-        remote = self._athena_comprehensive(name, out_pk, ivm)  # env-gated; None ⇒ the local path below
+        remote = self._flock_comprehensive(name, out_pk, ivm)  # env-gated; None ⇒ the local path below
         if remote is not None:
             changed = trickle.append_zset(
                 ctx.con, name, trickle._as_zset(remote, 1), ctx.f, out_pk,
@@ -688,53 +688,26 @@ class TrickleBuilder:
             f'(SELECT {out_cols} FROM {_q(name)} WHERE {_q(F_COL)} < {_ts(self.ctx.f)})'
         )
 
-    # ─── the Athena dispatch hook (cloud E1 v0; env-gated, no-op in pure OSS) ────
+    # ─── the Flock dispatch hook (over-envelope tier; env-gated, no-op in pure OSS) ──
 
-    def _athena_comprehensive(self, name: str, out_pk, ivm: bool):
-        """Consult the Athena backend for this terminal's **comprehensive** recompute. Returns a
-        relation to hand to the terminal's own comprehensive machinery, or ``None`` (the local
-        path — the overwhelmingly common case).
+    def _flock_comprehensive(self, name: str, out_pk, ivm: bool):
+        """Consult the **Flock** (duckstring's over-envelope compute tier — a serverless engine,
+        Athena by default) for this terminal's comprehensive recompute. Returns a relation to
+        hand to the terminal's own comprehensive machinery, or ``None`` (the local path — the
+        overwhelmingly common case). The mode ladder + OOM fail-up live in :mod:`duckstring.flock`;
+        this hook only supplies the Ripple's posture and whether the run is comprehensive-bound
+        (incremental epochs never dispatch — kind preservation). Env-gated: no engine configured
+        ⇒ pure OSS, everything local."""
+        from .. import flock
 
-        The posture ladder (``@ripple(athena=…)`` over ``DUCKSTRING_ATHENA_MODE``; inert when
-        the runtime has no Athena config — same code runs anywhere):
-
-        - **always** — every eligible terminal recomputes comprehensively on Athena (the
-          known-heavy declaration: no local IVM for this Ripple's outputs).
-        - **upgrade** — only comprehensive-bound runs (bootstrap / ``ivm=False``) are
-          candidates; dispatch up front when *clearly* over the envelope, else run the local
-          recompute **bounded + materialised** and fail up to Athena on OOM. Incremental
-          epochs always stay local — kind preservation is the offload's economics.
-        - **off** — never.
-
-        Every Athena-side failure degrades to the local path; classic is the oracle."""
-        if not os.environ.get("DUCKSTRING_ATHENA_WORKGROUP"):
-            return None  # the gate, checked before any import cost
-        from .. import athena_backend as ab
-
-        cfg = ab.Config.from_env()
-        mode = cfg.resolve_mode(getattr(self.ctx, "athena", None))
-        if mode == "off" or not ab.wants(self):
+        if not flock.enabled():
             return None
-        if mode == "always":
-            return ab.comprehensive(self, out_pk)
-        # upgrade: comprehensive-bound runs only.
-        if ivm and name in read_meta(self.ctx.con):
-            return None
-        if ab.clearly_over(self, cfg):
-            return ab.comprehensive(self, out_pk)
-        try:
-            return ab.probe_local(self, cfg)
-        except Exception as exc:
-            import duckdb
-
-            if not isinstance(exc, duckdb.OutOfMemoryException):
-                raise
-            ab.log.warning("athena: local comprehensive hit the memory limit (%s) — failing up",
-                           str(exc)[:200])
-            remote = ab.comprehensive(self, out_pk)
-            if remote is None:  # Athena also failed — surface the real problem, don't loop
-                raise
-            return remote
+        comprehensive_bound = (not ivm) or (name not in read_meta(self.ctx.con))
+        return flock.comprehensive(
+            self, out_pk,
+            ripple_mode=getattr(self.ctx, "flock", None),
+            comprehensive_bound=comprehensive_bound,
+        )
 
     # ─── compute (the shared ΔO step behind .merge() and .append()) ───────────────
 

@@ -87,7 +87,7 @@ def _run_ripple(
         source_majors=source_majors, f=f, previous_f=previous_f, data_root=data_root,
         sources_changed=sources_changed, skip_sink=skip_sink,
         staging_dir=staging_dir, own_data_dir=own_data_dir,
-        athena=getattr(func, "_ds_athena", None),
+        flock=getattr(func, "_ds_flock", None),
     )
     try:
         func(pond)
