@@ -20,7 +20,6 @@ app.add_typer(pool_app, name="pool")
 _CATCHMENT = typer.Option(None, "--catchment", "-c", help="Catchment to use (uses default if omitted).")
 _MAJOR = typer.Option(None, "--major", "-m", help="Major version to target (default: latest).")
 
-_SIZES = ("s", "m", "l", "xl")
 _MODES = ("off", "upgrade", "always")
 _POLICIES = ("fail_up", "fail")
 
@@ -37,7 +36,6 @@ def _src(cfg: dict, field: str) -> str:
 def _fmt(cfg: dict) -> str:
     parts = [
         f"duck: {cfg['duck_target']} ({_src(cfg, 'duck_target')})",
-        f"size: {cfg['size']}{'' if cfg.get('override', {}).get('size') else ' (default)'}",
         f"flock: {cfg['flock_mode']} ({_src(cfg, 'flock_mode')})",
     ]
     if cfg["flock_mode"] != "off":
@@ -72,8 +70,7 @@ def show(
         defaults = p["duck"].get("defaults") or defaults
         typer.echo(f"{p['id']}: {_fmt(p['duck'])}")
     if defaults:
-        typer.echo(f"defaults: duck {defaults['duck_target']}, size {defaults['size']}, "
-                   f"flock {defaults['flock_mode']}")
+        typer.echo(f"defaults: duck {defaults['duck_target']}, flock {defaults['flock_mode']}")
 
 
 @app.command("set")
@@ -82,7 +79,6 @@ def set_(
     catchment: Optional[str] = _CATCHMENT,
     major: Optional[int] = _MAJOR,
     duck: Optional[str] = typer.Option(None, "--duck", help="Duck target: 'catchment' | a pool name | 'dedicated'."),
-    size: Optional[str] = typer.Option(None, "--size", "-s", help="Preset size: s | m | l | xl."),
     flock: Optional[str] = typer.Option(None, "--flock", help="Flock posture: off | upgrade | always."),
     engine: Optional[str] = typer.Option(None, "--engine", help="Flock engine (e.g. athena)."),
     oom: Optional[str] = typer.Option(None, "--oom", help="OOM policy: fail_up | fail."),
@@ -95,18 +91,18 @@ def set_(
     coalesces over the pond.toml-declared config and survives redeploys."""
     from . import _http
     from .config import resolve_catchment
-    fields = {"size": size, "duck_target": duck, "flock_mode": flock, "flock_engine": engine,
+    fields = {"duck_target": duck, "flock_mode": flock, "flock_engine": engine,
               "oom_policy": oom, "dedicated_instance_type": instance_type, "dedicated_auto_stop": auto_stop}
     if not clear and all(v is None for v in fields.values()):
         typer.echo("Error: nothing to set — pass a flag, or --clear.", err=True)
         raise typer.Exit(1)
-    for name_, val, allowed in (("--size", size, _SIZES), ("--flock", flock, _MODES), ("--oom", oom, _POLICIES)):
+    for name_, val, allowed in (("--flock", flock, _MODES), ("--oom", oom, _POLICIES)):
         if val is not None and val.lower() not in allowed:
             typer.echo(f"Error: {name_} must be one of {', '.join(allowed)}.", err=True)
             raise typer.Exit(1)
     _, cfg = resolve_catchment(catchment)
     params = _http.pond_params(major, None)
-    body = {k: (v.lower() if isinstance(v, str) and k in ("size", "flock_mode", "oom_policy") else v)
+    body = {k: (v.lower() if isinstance(v, str) and k in ("flock_mode", "oom_policy") else v)
             for k, v in fields.items()}
     body["clear"] = clear
     _http.post(f"{cfg['url']}/api/ponds/{pond}/duck", auth=cfg, params=params, json=body)

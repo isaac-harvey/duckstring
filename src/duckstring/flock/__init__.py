@@ -29,8 +29,9 @@ Config (env):
 - ``DUCKSTRING_FLOCK_OOM_POLICY``— ``fail_up`` (default; offload on OOM) | ``fail`` (hard cap).
 - ``DUCKSTRING_FLOCK_MIN_ROWS``— explicit envelope override (rows summed over source leaves).
 - ``DUCKSTRING_FLOCK_FORCE=1`` — force ``always`` (testing/demo).
-- ``DUCKSTRING_DUCK_SIZE`` / ``DUCKSTRING_MEMORY_LIMIT`` — Duck-level (envelope preset; the
-  DuckDB memory cap the OOM fail-up depends on).
+- ``DUCKSTRING_MEMORY_LIMIT`` — the Duck's DuckDB memory cap (the OOM fail-up depends on it); the
+  "clearly over the envelope" row threshold is DERIVED from it (no abstract size preset — the box's
+  real memory is the envelope). Absent ⇒ a conservative default.
 - engine-specific config lives under the engine's own namespace (Athena:
   ``DUCKSTRING_FLOCK_ATHENA_{WORKGROUP,DATABASE,SCRATCH,REGION}``).
 """
@@ -39,6 +40,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import uuid
 from typing import Protocol
 
@@ -46,9 +48,12 @@ log = logging.getLogger("duckstring.flock")
 
 FLOCK_MODES = (None, "always", "upgrade", "off")
 
-# Duck preset → comprehensive-recompute row envelope (sum over source leaves). Deliberately
-# conservative demo numbers; the size-aware estimate off sidecar stats is the E1-proper follow-up.
-_SIZE_ROWS = {"s": 1_000_000, "m": 4_000_000, "l": 16_000_000, "xl": 64_000_000}
+# The comprehensive-recompute row envelope (sum over source leaves) is derived from the Duck's real
+# memory cap: ~this many rows per GiB the box can absorb before a local recompute is clearly doomed.
+# Deliberately conservative; the sidecar-stats-aware estimate is the E1-proper follow-up. The OOM
+# fail-up (the memory cap) is the real safety net — this only pre-empts an obviously-doomed local try.
+_ROWS_PER_GIB = 500_000
+_DEFAULT_MIN_ROWS = 4_000_000  # when the memory cap is unknown (a stock local Duck)
 
 
 class FlockEngine(Protocol):
@@ -80,10 +85,26 @@ def enabled(env=None) -> bool:
     return get_engine(env) is not None
 
 
+def _mem_limit_gib(raw: str | None) -> float | None:
+    """Parse a DuckDB memory-limit string (``8GB``/``512MB``/``16GiB``/a bare byte count) → GiB."""
+    if not raw or not raw.strip():
+        return None
+    m = re.match(r"\s*([0-9.]+)\s*([kmgt]i?b|b)?\s*$", raw.lower())
+    if not m:
+        return None
+    factor = {"b": 1 / 2**30, "kb": 1 / 2**20, "kib": 1 / 2**20, "mb": 1 / 2**10, "mib": 1 / 2**10,
+              "gb": 1, "gib": 1, "tb": 1024, "tib": 1024}.get(m.group(2) or "b", 1)
+    return float(m.group(1)) * factor
+
+
 def _min_rows(env=None) -> int:
+    """The "clearly over the envelope, dispatch up front" row threshold. Explicit override wins; else
+    derived from the Duck's real memory cap; else a conservative default (no abstract size preset)."""
     e = env if env is not None else os.environ
-    size = e.get("DUCKSTRING_DUCK_SIZE", "s").lower()
-    return int(e.get("DUCKSTRING_FLOCK_MIN_ROWS", _SIZE_ROWS.get(size, _SIZE_ROWS["s"])))
+    if e.get("DUCKSTRING_FLOCK_MIN_ROWS"):
+        return int(e["DUCKSTRING_FLOCK_MIN_ROWS"])
+    gib = _mem_limit_gib(e.get("DUCKSTRING_MEMORY_LIMIT"))
+    return int(gib * _ROWS_PER_GIB) if gib else _DEFAULT_MIN_ROWS
 
 
 def _oom_policy(env=None) -> str:

@@ -182,3 +182,12 @@ def test_oom_policy_fail_is_a_hard_cap(tmp_path, monkeypatch):
     with pytest.raises(duckdb.OutOfMemoryException):
         pond.trickle("src").select("s0.id, s0.v").merge("out", pk="id")
     assert not engine.dispatched
+
+
+def test_min_rows_derives_from_memory_cap_not_size():
+    # No abstract size preset anymore: the "clearly over" threshold comes from the real memory cap,
+    # an explicit override wins, and a stock Duck (no cap) gets the conservative default.
+    assert flock._min_rows({"DUCKSTRING_FLOCK_MIN_ROWS": "123"}) == 123
+    assert flock._min_rows({"DUCKSTRING_MEMORY_LIMIT": "8GB"}) == 8 * flock._ROWS_PER_GIB
+    assert flock._min_rows({"DUCKSTRING_MEMORY_LIMIT": "512MB"}) == flock._ROWS_PER_GIB // 2
+    assert flock._min_rows({}) == flock._DEFAULT_MIN_ROWS

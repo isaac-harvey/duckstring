@@ -75,19 +75,8 @@ export function DuckSection({ pondId, duck }: { pondId: string; duck: DuckConfig
         </div>
       )}
 
-      {/* Size: only meaningful for the Catchment box / a dedicated box (a pool defines its own size). */}
-      {(target === 'catchment' || target === 'dedicated') && (
-        <div style={row}>
-          <span style={lbl}>Size</span>
-          {(['s', 'm', 'l', 'xl'] as const).map((sz) => (
-            <button key={sz} style={chip(duck.size === sz)} onClick={() => setDuck(pondId, { size: sz })}>
-              {sz.toUpperCase()}
-            </button>
-          ))}
-        </div>
-      )}
-
-      {/* Dedicated: its own instance type + auto-stop on run completion. */}
+      {/* Dedicated: its own instance type + auto-stop on run completion. The Catchment box is whatever
+          the host is; a pool defines its own instance type — so there is no abstract size control. */}
       {target === 'dedicated' && (
         <div style={row}>
           <span style={lbl}>Box</span>

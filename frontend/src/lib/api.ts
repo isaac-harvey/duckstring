@@ -129,9 +129,9 @@ export interface DuckPool {
   region: string | null;
 }
 
-// A Pond's effective compute config = override ?? declared ?? Catchment default (coalesce).
+// A Pond's effective compute config = override ?? declared ?? Catchment default (coalesce). Sizing is
+// concrete (a pool / dedicated instance type) — there is no abstract size field.
 export interface DuckConfig {
-  size: string;
   duck_target: string; // 'catchment' | a pool name | 'dedicated'
   remote: boolean;
   pool: DuckPool | null;
@@ -147,7 +147,6 @@ export interface DuckConfig {
     oom_policy?: string | null;
   };
   override: {
-    size: string | null;
     duck_target: string | null;
     dedicated_instance_type: string | null;
     dedicated_auto_stop: boolean | null;
@@ -155,7 +154,7 @@ export interface DuckConfig {
     flock_engine: string | null;
     oom_policy: string | null;
   };
-  defaults: { size: string; duck_target: string; flock_mode: string; flock_engine: string | null; oom_policy: string };
+  defaults: { duck_target: string; flock_mode: string; flock_engine: string | null; oom_policy: string };
 }
 
 // The cloud-enable gate — remote data root + AWS creds (plans/cloud-config.md). Surfaced on /api/status
@@ -390,7 +389,6 @@ export function setBudget(pond: string, immediateRetries: number, sourceRetries:
 // Compute override (Duck target/size + Flock posture). Only the fields passed change; clear=true drops
 // the whole override (reverts to the pond.toml-declared config, else the Catchment default).
 export interface DuckOverrideBody {
-  size?: string | null;
   duck_target?: string | null;
   dedicated_instance_type?: string | null;
   dedicated_auto_stop?: boolean | null;

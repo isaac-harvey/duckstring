@@ -52,8 +52,7 @@ def _client(driver):
 
 
 def _clear_env(monkeypatch):
-    for k in ("DUCKSTRING_DUCK_SIZE", "DUCKSTRING_FLOCK_MODE", "DUCKSTRING_FLOCK_ENGINE",
-              "DUCKSTRING_FLOCK_OOM_POLICY"):
+    for k in ("DUCKSTRING_FLOCK_MODE", "DUCKSTRING_FLOCK_ENGINE", "DUCKSTRING_FLOCK_OOM_POLICY"):
         monkeypatch.delenv(k, raising=False)
 
 
@@ -61,14 +60,13 @@ def test_duck_defaults_come_from_env(tmp_path, monkeypatch):
     _clear_env(monkeypatch)
     d = _driver(tmp_path)
     cfg = d.duck_config("src@1")
-    assert cfg["size"] == "s" and cfg["duck_target"] == "catchment"
+    assert cfg["duck_target"] == "catchment"
     assert cfg["flock_mode"] == "off" and cfg["oom_policy"] == "fail_up"
     assert all(v is None for v in cfg["override"].values())
 
-    monkeypatch.setenv("DUCKSTRING_DUCK_SIZE", "m")
     monkeypatch.setenv("DUCKSTRING_FLOCK_MODE", "upgrade")
     cfg = d.duck_config("src@1")
-    assert cfg["size"] == "m" and cfg["flock_mode"] == "upgrade"
+    assert cfg["flock_mode"] == "upgrade"
 
 
 def test_declared_config_flows_from_pond_toml(tmp_path, monkeypatch):
@@ -104,22 +102,20 @@ def test_override_coalesces_over_declared(tmp_path, monkeypatch):
 def test_set_duck_overrides_and_clears(tmp_path, monkeypatch):
     _clear_env(monkeypatch)
     d = _driver(tmp_path)
-    d.set_duck("src@1", size="l")
-    assert d.duck_config("src@1")["size"] == "l"
-    assert d.duck_config("src@1")["flock_mode"] == "off"  # untouched → default
-    d.set_duck("src@1", flock_mode="always")  # partial update keeps the size override
+    d.set_duck("src@1", flock_mode="upgrade")
+    assert d.duck_config("src@1")["flock_mode"] == "upgrade"
+    assert d.duck_config("src@1")["oom_policy"] == "fail_up"  # untouched → default
+    d.set_duck("src@1", oom_policy="fail")  # partial update keeps the flock_mode override
     cfg = d.duck_config("src@1")
-    assert cfg["size"] == "l" and cfg["flock_mode"] == "always"
+    assert cfg["flock_mode"] == "upgrade" and cfg["oom_policy"] == "fail"
     d.set_duck("src@1", clear=True)
     cfg = d.duck_config("src@1")
-    assert cfg["size"] == "s" and cfg["flock_mode"] == "off"
+    assert cfg["flock_mode"] == "off" and cfg["oom_policy"] == "fail_up"
     assert all(v is None for v in cfg["override"].values())
 
 
 def test_set_duck_rejects_unknown_values(tmp_path):
     d = _driver(tmp_path)
-    with pytest.raises(ValueError):
-        d.set_duck("src@1", size="xxl")
     with pytest.raises(ValueError):
         d.set_duck("src@1", flock_mode="sometimes")
     with pytest.raises(ValueError):
@@ -128,10 +124,10 @@ def test_set_duck_rejects_unknown_values(tmp_path):
 
 def test_duck_override_survives_reload(tmp_path):
     d = _driver(tmp_path)
-    d.set_duck("src@1", size="xl", flock_mode="always")
+    d.set_duck("src@1", duck_target="dedicated", flock_mode="always")
     d.reload()
     cfg = d.duck_config("src@1")
-    assert cfg["override"]["size"] == "xl" and cfg["override"]["flock_mode"] == "always"
+    assert cfg["override"]["duck_target"] == "dedicated" and cfg["override"]["flock_mode"] == "always"
 
 
 def test_launcher_receives_effective_config_on_dispatch(tmp_path, monkeypatch):
@@ -144,9 +140,9 @@ def test_launcher_receives_effective_config_on_dispatch(tmp_path, monkeypatch):
             seen[pond_key] = duck
 
     d = _driver(tmp_path, launcher=SpyLauncher())
-    d.set_duck("src@1", size="m", flock_mode="upgrade")
+    d.set_duck("src@1", flock_mode="upgrade")
     d.tap("src@1")
-    assert seen["src@1"]["size"] == "m" and seen["src@1"]["flock_mode"] == "upgrade"
+    assert seen["src@1"]["duck_target"] == "catchment" and seen["src@1"]["flock_mode"] == "upgrade"
 
 
 def test_status_and_routes_roundtrip(tmp_path, monkeypatch):
@@ -155,24 +151,25 @@ def test_status_and_routes_roundtrip(tmp_path, monkeypatch):
     client = _client(d)
 
     got = client.get("/api/ponds/src/duck").json()
-    assert got["size"] == "s" and got["flock_mode"] == "off"
+    assert got["duck_target"] == "catchment" and got["flock_mode"] == "off"
 
     assert client.post("/api/ponds/src/duck",
-                       json={"size": "l", "flock_mode": "always"}).status_code == 200
+                       json={"flock_mode": "always"}).status_code == 200
     got = client.get("/api/ponds/src/duck").json()
-    assert got["size"] == "l" and got["flock_mode"] == "always"
+    assert got["flock_mode"] == "always"
 
     pond = next(p for p in client.get("/api/status").json()["ponds"] if p["name"] == "src")
-    assert pond["duck"]["size"] == "l" and pond["duck"]["flock_mode"] == "always"
+    assert pond["duck"]["flock_mode"] == "always"
 
-    assert client.post("/api/ponds/src/duck", json={"size": "huge"}).status_code == 422
+    assert client.post("/api/ponds/src/duck", json={"flock_mode": "huge"}).status_code == 422
     assert client.post("/api/ponds/src/duck", json={"clear": True}).status_code == 200
-    assert client.get("/api/ponds/src/duck").json()["size"] == "s"
+    assert client.get("/api/ponds/src/duck").json()["flock_mode"] == "off"
 
 
 def test_subprocess_launcher_passes_duck_env(tmp_path, monkeypatch):
     import duckstring.catchment.launcher as launcher_mod
 
+    monkeypatch.delenv("DUCKSTRING_DUCK_SIZE", raising=False)
     captured = {}
 
     class _FakeProc:
@@ -186,8 +183,8 @@ def test_subprocess_launcher_passes_duck_env(tmp_path, monkeypatch):
     monkeypatch.setattr(launcher_mod.subprocess, "Popen", fake_popen)
     launcher = launcher_mod.SubprocessLauncher(tmp_path, "http://127.0.0.1:1", token="t")
     launcher.ensure("p@1", "1.0.0", "ponds/p/1.0.0",
-                    duck={"size": "m", "flock_mode": "upgrade", "oom_policy": "fail"})
-    assert captured["env"]["DUCKSTRING_DUCK_SIZE"] == "m"
+                    duck={"flock_mode": "upgrade", "oom_policy": "fail"})
+    assert "DUCKSTRING_DUCK_SIZE" not in captured["env"]  # the abstract size env is retired
     assert captured["env"]["DUCKSTRING_FLOCK_MODE"] == "upgrade"
     assert captured["env"]["DUCKSTRING_FLOCK_OOM_POLICY"] == "fail"
 

@@ -63,13 +63,12 @@ class SubprocessLauncher:
         if self.is_running(pond_key):
             return
         name, major = split_pond_key(pond_key)
-        # The Duck's effective compute config rides as env (plans/cloud-config.md): size is advisory
-        # locally (the subprocess is whatever the host is); the Flock trio is the Pond's over-envelope
-        # offload posture (mode/engine/oom_policy), inert locally with no engine configured. duck_target
-        # (catchment/pool/dedicated) is read by a remote launcher, not the local subprocess.
+        # The Duck's effective compute config rides as env (plans/cloud-config.md): the Flock trio is
+        # the Pond's over-envelope offload posture (mode/engine/oom_policy), inert locally with no engine
+        # configured. duck_target (catchment/pool/dedicated) is read by a remote launcher, not here (the
+        # local subprocess is whatever the host is — no abstract size to set).
         env = dict(os.environ)
         if duck:
-            env["DUCKSTRING_DUCK_SIZE"] = duck.get("size") or "s"
             env["DUCKSTRING_FLOCK_MODE"] = duck.get("flock_mode") or "off"
             if duck.get("flock_engine"):
                 env["DUCKSTRING_FLOCK_ENGINE"] = duck["flock_engine"]

@@ -41,5 +41,4 @@ ALTER TABLE pond_duck ADD COLUMN dedicated_auto_stop     INTEGER;   -- terminate
 ALTER TABLE pond_duck ADD COLUMN flock_mode              TEXT;
 ALTER TABLE pond_duck ADD COLUMN flock_engine            TEXT;
 ALTER TABLE pond_duck ADD COLUMN oom_policy              TEXT;
--- The legacy pond_duck.size (advisory preset) is kept. The legacy pond_duck.flock (bool on/off) is
--- superseded by flock_mode; on read, a legacy True ⇒ 'upgrade', False ⇒ 'off' when flock_mode is NULL.
+-- (022 retires the legacy pond_duck.size + flock columns — sizing is concrete via instance types now.)

@@ -155,24 +155,19 @@ IRREVERSIBLE_OPS = frozenset({"reset", "wipe", "remove"})
 
 # The Duck preset-size vocabulary (prereqs D5). Presets only — never raw instance shapes; what a
 # size means physically is the launcher's business (the local subprocess ignores it).
-DUCK_SIZES = ("s", "m", "l", "xl")
 FLOCK_MODES = ("off", "upgrade", "always")
 OOM_POLICIES = ("fail_up", "fail")
 
 
 def _duck_override_row(row) -> dict:
-    """A pond_duck row → the nullable override dict (plans/cloud-config.md). The legacy ``flock`` bool
-    is folded into ``flock_mode`` only when the newer column is unset (True⇒upgrade, False⇒off)."""
-    keys = ("size", "flock", "duck_target", "dedicated_instance_type", "dedicated_auto_stop",
+    """A pond_duck row → the nullable override dict (plans/cloud-config.md). Sizing is concrete now
+    (a pool / dedicated instance type), so there is no abstract size field."""
+    keys = ("duck_target", "dedicated_instance_type", "dedicated_auto_stop",
             "flock_mode", "flock_engine", "oom_policy")
     if row is None:
-        o = {k: None for k in keys}
-    else:
-        o = dict(zip(keys, row, strict=True))
-        o["flock"] = None if o["flock"] is None else bool(o["flock"])
-        o["dedicated_auto_stop"] = None if o["dedicated_auto_stop"] is None else bool(o["dedicated_auto_stop"])
-    if o["flock_mode"] is None and o["flock"] is not None:
-        o["flock_mode"] = "upgrade" if o["flock"] else "off"
+        return {k: None for k in keys}
+    o = dict(zip(keys, row, strict=True))
+    o["dedicated_auto_stop"] = None if o["dedicated_auto_stop"] is None else bool(o["dedicated_auto_stop"])
     return o
 
 
@@ -314,7 +309,7 @@ class Driver:
                 ).fetchone()
                 imm, onc = retry if retry else (0, 0)
                 duck_row = db.execute(
-                    "SELECT size, flock, duck_target, dedicated_instance_type, dedicated_auto_stop, "
+                    "SELECT duck_target, dedicated_instance_type, dedicated_auto_stop, "
                     "flock_mode, flock_engine, oom_policy FROM pond_duck WHERE pond_id = ?", (pond_id,)
                 ).fetchone()
                 self.duck_overrides[key] = _duck_override_row(duck_row)
@@ -961,18 +956,17 @@ class Driver:
 
     @staticmethod
     def duck_defaults() -> dict:
-        """The Catchment-wide compute defaults, from env. Inert for the classic subprocess Duck (size
-        is advisory, the Flock is off with no engine configured), sizing/posture for remote launchers."""
+        """The Catchment-wide compute defaults, from env. Inert for the classic subprocess Duck (the
+        Flock is off with no engine configured); the Flock posture matters for remote launchers."""
         mode = (os.environ.get("DUCKSTRING_FLOCK_MODE") or "off").lower()
         return {
-            "size": os.environ.get("DUCKSTRING_DUCK_SIZE", "s").lower(),
             "duck_target": "catchment",
             "flock_mode": mode if mode in FLOCK_MODES else "off",
             "flock_engine": os.environ.get("DUCKSTRING_FLOCK_ENGINE") or None,
             "oom_policy": (os.environ.get("DUCKSTRING_FLOCK_OOM_POLICY") or "fail_up").lower(),
         }
 
-    _DUCK_OVERRIDE_FIELDS = ("size", "duck_target", "dedicated_instance_type", "dedicated_auto_stop",
+    _DUCK_OVERRIDE_FIELDS = ("duck_target", "dedicated_instance_type", "dedicated_auto_stop",
                              "flock_mode", "flock_engine", "oom_policy")
 
     def set_duck(self, pond: str, clear: bool = False, **fields) -> None:
@@ -980,8 +974,6 @@ class Driver:
         like retry budgets). Only the fields passed are changed; the rest keep their current override.
         ``clear`` reverts the Pond to its DECLARED config (pond.toml), else the Catchment default."""
         fields = {k: v for k, v in fields.items() if k in self._DUCK_OVERRIDE_FIELDS}
-        if fields.get("size") is not None and fields["size"] not in DUCK_SIZES:
-            raise ValueError(f"size must be one of {', '.join(DUCK_SIZES)}")
         if fields.get("flock_mode") is not None and fields["flock_mode"] not in FLOCK_MODES:
             raise ValueError(f"flock_mode must be one of {', '.join(FLOCK_MODES)}")
         if fields.get("oom_policy") is not None and fields["oom_policy"] not in OOM_POLICIES:
@@ -996,16 +988,15 @@ class Driver:
                 new = dict(cur)
                 new.update(fields)
                 self.db.execute(
-                    "INSERT INTO pond_duck (pond_id, size, duck_target, dedicated_instance_type, "
+                    "INSERT INTO pond_duck (pond_id, duck_target, dedicated_instance_type, "
                     "dedicated_auto_stop, flock_mode, flock_engine, oom_policy) "
-                    "VALUES (:id, :size, :duck_target, :dedicated_instance_type, :dedicated_auto_stop, "
+                    "VALUES (:id, :duck_target, :dedicated_instance_type, :dedicated_auto_stop, "
                     ":flock_mode, :flock_engine, :oom_policy) "
-                    "ON CONFLICT(pond_id) DO UPDATE SET size = excluded.size, "
-                    "duck_target = excluded.duck_target, "
+                    "ON CONFLICT(pond_id) DO UPDATE SET duck_target = excluded.duck_target, "
                     "dedicated_instance_type = excluded.dedicated_instance_type, "
                     "dedicated_auto_stop = excluded.dedicated_auto_stop, flock_mode = excluded.flock_mode, "
                     "flock_engine = excluded.flock_engine, oom_policy = excluded.oom_policy",
-                    {"id": pond_id, "size": new["size"], "duck_target": new["duck_target"],
+                    {"id": pond_id, "duck_target": new["duck_target"],
                      "dedicated_instance_type": new["dedicated_instance_type"],
                      "dedicated_auto_stop": (None if new["dedicated_auto_stop"] is None
                                              else int(new["dedicated_auto_stop"])),
@@ -1036,7 +1027,6 @@ class Driver:
         # is the routing signal (anything but the Catchment's own box).
         pool = self.get_pool(target) if target not in ("catchment", "dedicated") else None
         return {
-            "size": o["size"] or d["size"],
             "duck_target": target,
             "remote": target != "catchment",
             "pool": pool,

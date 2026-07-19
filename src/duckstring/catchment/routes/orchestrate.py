@@ -356,7 +356,6 @@ class _DuckBody(BaseModel):
     # Each field: None = keep the current override; ``clear`` drops the whole override (reverts to the
     # DECLARED pond.toml config, else the Catchment default). Effective config coalesces override ??
     # declared ?? default (plans/cloud-config.md).
-    size: str | None = None                     # 's' | 'm' | 'l' | 'xl'
     duck_target: str | None = None              # 'catchment' | a Duck Pool name | 'dedicated'
     dedicated_instance_type: str | None = None  # for duck_target='dedicated'
     dedicated_auto_stop: bool | None = None     # terminate the dedicated box on Pond-run completion
@@ -376,7 +375,7 @@ def set_duck(
     key = _resolve(request, name, major, version)
     try:
         _driver(request).set_duck(
-            key, clear=body.clear, size=body.size, duck_target=body.duck_target,
+            key, clear=body.clear, duck_target=body.duck_target,
             dedicated_instance_type=body.dedicated_instance_type,
             dedicated_auto_stop=body.dedicated_auto_stop, flock_mode=body.flock_mode,
             flock_engine=body.flock_engine, oom_policy=body.oom_policy,
