@@ -20,6 +20,14 @@ pytestmark = pytest.mark.timeout(5)
 _RIPPLES = [{"func": "f1", "name": "r1", "parents": []}]
 
 
+@pytest.fixture(autouse=True)
+def _no_ambient_aws(monkeypatch):
+    """Neutralise the botocore credential-chain fallback so the gate is deterministic regardless of the
+    machine's ambient AWS creds (a dev laptop with `aws configure` would otherwise read as configured)."""
+    cloud._chain_has_credentials.cache_clear()
+    monkeypatch.setattr(cloud, "_chain_has_credentials", lambda: False)
+
+
 def _cfg():
     return {"sources": {}, "immediate_retries": 0, "source_retries": 0, "kind": "inlet"}
 
@@ -64,6 +72,15 @@ def test_cloud_gate_needs_remote_root_and_creds(monkeypatch):
 
 def test_env_creds_count_as_configured(monkeypatch):
     monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIA…")
+    assert cloud.aws_configured(_FakeSecrets([])) is True
+
+
+def test_botocore_chain_counts_as_configured(monkeypatch):
+    # A plain `aws configure` (default profile, no env vars, no AWS_* secret) still enables cloud via
+    # the botocore credential chain — the false-negative found against real AWS.
+    for k in ("AWS_ACCESS_KEY_ID", "AWS_PROFILE", "AWS_ROLE_ARN", "AWS_WEB_IDENTITY_TOKEN_FILE"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setattr(cloud, "_chain_has_credentials", lambda: True)
     assert cloud.aws_configured(_FakeSecrets([])) is True
 
 

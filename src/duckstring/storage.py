@@ -334,14 +334,18 @@ class ObjectStorage(Storage):
 
             from .egress import credentials
 
-            opts = {}
-            for k, v in self.params.items():
-                if k in ("region",) or k.startswith("client_kwargs") or k in (
-                    "key", "key_id", "secret", "token", "account_name", "account_key", "anon",
-                ):
-                    opts[_FSSPEC_OPT.get(k, k)] = credentials.resolve(v)
             scheme = urlsplit(self.base).scheme
-            self._fs = fsspec.filesystem(_FSSPEC_PROTOCOL.get(scheme, scheme), **opts)
+            protocol = _FSSPEC_PROTOCOL.get(scheme, scheme)
+            opts: dict = {}
+            for k, v in self.params.items():
+                if k == "region":
+                    # s3fs/aiobotocore takes the region under client_kwargs.region_name, NOT a bare
+                    # ``region=`` kwarg (which raises); other backends derive it, so only pass it to s3.
+                    if protocol == "s3":
+                        opts.setdefault("client_kwargs", {})["region_name"] = credentials.resolve(v)
+                elif k in ("key", "key_id", "secret", "token", "account_name", "account_key", "anon"):
+                    opts[_FSSPEC_OPT.get(k, k)] = credentials.resolve(v)
+            self._fs = fsspec.filesystem(protocol, **opts)
         return self._fs
 
     def _key(self, *parts: str) -> str:

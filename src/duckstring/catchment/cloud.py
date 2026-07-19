@@ -9,6 +9,7 @@ data, so the setter refuses a populated Catchment (a migration is deferred).
 
 from __future__ import annotations
 
+import functools
 import os
 import sqlite3
 
@@ -64,10 +65,22 @@ def aws_configured(secret_store=None) -> bool:
         return True
     if secret_store is not None:
         try:
-            return any(n["name"].startswith("AWS_") for n in secret_store.names())
+            if any(n["name"].startswith("AWS_") for n in secret_store.names()):
+                return True
         except Exception:
-            return False
-    return False
+            pass
+    # Fall back to the botocore credential chain (a `[default]` profile, SSO, an instance role) so a
+    # plain `aws configure` enables cloud — not only explicit env vars. Cached (process-lifetime).
+    return _chain_has_credentials()
+
+
+@functools.lru_cache(maxsize=1)
+def _chain_has_credentials() -> bool:
+    try:
+        import boto3
+        return boto3.Session().get_credentials() is not None
+    except Exception:
+        return False
 
 
 def cloud_status(data_root: str | None, secret_store=None) -> dict:

@@ -180,3 +180,35 @@ def test_trickle_parts_roundtrip_on_separate_data_root(tmp_path):
     rcon.execute("SET TimeZone='UTC'")
     rows = rcon.sql(f"SELECT id, v FROM ({dp.read_select(storage, 'dim')})").fetchall()
     assert rows == [(1, "a")]
+
+
+def test_object_storage_region_goes_to_client_kwargs(monkeypatch):
+    """Regression (found against real S3): a `region` in the URI query must reach s3fs as
+    client_kwargs.region_name, not a bare `region=` kwarg (which aiobotocore rejects). Other backends
+    derive region themselves, so it isn't forwarded to them."""
+    import fsspec
+
+    from duckstring.storage import get_storage
+
+    captured = {}
+
+    def fake_filesystem(protocol, **kwargs):
+        captured["protocol"] = protocol
+        captured["kwargs"] = kwargs
+        return object()
+
+    monkeypatch.setattr(fsspec, "filesystem", fake_filesystem)
+
+    _ = get_storage("s3://bucket/p?region=ap-southeast-2").fs
+    assert captured["protocol"] == "s3"
+    assert captured["kwargs"] == {"client_kwargs": {"region_name": "ap-southeast-2"}}
+    assert "region" not in captured["kwargs"]
+
+    captured.clear()
+    _ = get_storage("gs://bucket/p?region=us-central1").fs
+    assert captured["protocol"] == "gcs" and "region" not in captured["kwargs"]  # not forwarded to gcs
+
+    captured.clear()
+    _ = get_storage("s3://bucket/p?key_id=AK&secret=SK&region=eu-west-1").fs
+    assert captured["kwargs"]["key"] == "AK" and captured["kwargs"]["secret"] == "SK"
+    assert captured["kwargs"]["client_kwargs"] == {"region_name": "eu-west-1"}
