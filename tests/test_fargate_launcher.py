@@ -13,6 +13,13 @@ from duckstring.catchment.launcher import DispatchingLauncher
 pytestmark = pytest.mark.timeout(5)
 
 
+@pytest.fixture(autouse=True)
+def _clean_fargate_env(monkeypatch):
+    for k in ("AWS_REGION", "AWS_DEFAULT_REGION", "DUCKSTRING_FARGATE_CPU_ARCH",
+              "DUCKSTRING_FARGATE_CPU", "DUCKSTRING_FARGATE_MEMORY"):
+        monkeypatch.delenv(k, raising=False)
+
+
 class FakeEcs:
     def __init__(self):
         self.registered, self.ran, self.stopped = [], [], []
@@ -71,6 +78,18 @@ def test_ensure_registers_task_def_and_runs_task(tmp_path):
     tags = {t["key"]: t["value"] for t in run["tags"]}
     assert tags["duckstring:pond"] == "sales@2" and tags["duckstring:pool"] == "M"
     assert lch.is_running("sales@2")
+
+
+def test_task_def_carries_arch_and_region_logs(tmp_path, monkeypatch):
+    monkeypatch.setenv("AWS_REGION", "ap-southeast-2")
+    monkeypatch.setenv("DUCKSTRING_FARGATE_CPU_ARCH", "arm64")
+    ecs = FakeEcs()
+    _fargate(ecs).ensure("a@1", "1", "ponds/a/1", duck=_duck())
+    td = ecs.registered[0]
+    assert td["runtimePlatform"] == {"cpuArchitecture": "ARM64", "operatingSystemFamily": "LINUX"}
+    # A region → CloudWatch logs wired (so the Duck's output is visible), region-scoped.
+    log = td["containerDefinitions"][0]["logConfiguration"]
+    assert log["logDriver"] == "awslogs" and log["options"]["awslogs-region"] == "ap-southeast-2"
 
 
 def test_second_spawn_reuses_the_registered_task_def(tmp_path):

@@ -51,9 +51,11 @@ class FargateLauncher:
         self.assign_public_ip = (assign_public_ip or os.environ.get("DUCKSTRING_FARGATE_ASSIGN_PUBLIC_IP")
                                  or "ENABLED")
         # A pre-registered task-definition family/ARN skips registration; else we register one from the
-        # image on first use.
+        # image on first use. CPU arch (X86_64 default | ARM64 for a native Graviton/Apple-silicon image).
         self.task_definition = task_definition or os.environ.get("DUCKSTRING_FARGATE_TASK_DEF")
-        self.region = region
+        self.cpu_arch = (os.environ.get("DUCKSTRING_FARGATE_CPU_ARCH") or "X86_64").upper()
+        # Region drives the ecs client + the awslogs config (so a Duck's output is visible in CloudWatch).
+        self.region = region or os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
         self._client = ecs_client
         self._registered = None   # the task-def family:revision once ensured
         self._tasks: dict[str, str] = {}   # pond key → task ARN
@@ -104,6 +106,7 @@ class FargateLauncher:
         kwargs = {
             "family": _TASK_FAMILY, "networkMode": "awsvpc",
             "requiresCompatibilities": ["FARGATE"], "cpu": "1024", "memory": "4096",
+            "runtimePlatform": {"cpuArchitecture": self.cpu_arch, "operatingSystemFamily": "LINUX"},
             "containerDefinitions": [container],
         }
         if self.execution_role:
