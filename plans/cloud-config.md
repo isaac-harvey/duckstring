@@ -248,7 +248,7 @@ ceiling/idle/keep-warm, instance-profile IAM, and resource tagging. Pond Ducks (
 and a Catchment-settings panel for S3 + pools. Fix the cloud-preset-sizes section that "doesn't work
 for OSS".
 
-## Least-friction local against cloud Ducks (deferred — the auto-relay)
+## Least-friction local against cloud Ducks (the auto-relay — BUILT)
 
 An EC2 Duck must *reach* the Catchment to dial back; a laptop Catchment behind NAT isn't reachable.
 Local-with-cloud-Ducks is a **test-the-path** mode (nobody runs prod from a laptop), so the shipped
@@ -258,14 +258,21 @@ Inverting the transport (Catchment polls the Ducks) *would* remove the tunnel �
 where inbound-to-laptop doesn't — but it makes the Duck a listening server (ephemeral-TLS pain, a second
 transport strictly worse for the hosted case), so it's rejected.
 
-**The eventual least-friction option (settled 2026-07: eventual, not now):** an **auto-provisioned
-relay** — when a local Catchment enters cloud mode, Duckstring spins one tiny always-reachable EC2
-"twin", the laptop holds an outbound **reverse tunnel** to it (WireGuard/frp/`ssh -R` — *not* a bespoke
-message broker, and *not* a state-replicating second Catchment), and the Ducks dial the relay's public
-address (which forwards to the laptop). The Duck dial-back transport is unchanged. Reuses the
-`Ec2Launcher` machinery via a "relay" instance role; **needs a TTL/lease** (self-terminate if the laptop
-vanishes) and **auth+TLS+security-group** on the exposed endpoint. This is also a natural thing DSC
-manages for you. **Build after the straight dial-back path has run on real AWS.**
+**The auto-provisioned relay (BUILT — `catchment/relay.py`):** when a local Catchment (loopback/private
+bind) with cloud enabled first needs a remote Duck, `RelayManager` spins one tiny always-reachable EC2
+box (`t4g.nano`), the laptop holds an outbound **`ssh -R` reverse tunnel** to it, and the Ducks dial the
+relay's public address (which forwards to the laptop). The Duck dial-back transport is unchanged; it
+forwards bytes, *not* a state-replicating twin. It hooks the `Ec2Launcher`'s existing **pending/drain**
+mechanism: the first remote spawn kicks the relay off in the background (EC2 boot is minutes) and defers;
+when the tunnel is up, `set_remote_base_url` drains the pending Ducks — the same deferral the
+bind-unknown case uses. The relay box runs a **TTL watchdog** in its userdata (self-terminates if the
+forwarded port is idle past the TTL — a crashed/sleeping laptop can't leak it), and `shutdown_all` tears
+tunnel + box down. Gated: only for a local bind, cloud enabled, `DUCKSTRING_RELAY≠off`, no explicit
+`DUCKSTRING_CATCHMENT_PUBLIC_URL`, and the config present (`DUCKSTRING_RELAY_{AMI,KEY_NAME,SSH_KEY,
+SECURITY_GROUP,...}`). **Still to validate on real AWS** (like the EC2 launcher, the ssh/EC2/watchdog
+path is offline-tested with fakes); a security-group scoped to the Duck instances + the laptop, and TLS
+on the exposed endpoint, are the remaining hardening. DSC manages all of this for you. Tests:
+`tests/test_relay.py`.
 
 ## Deferred / Cloud-only
 

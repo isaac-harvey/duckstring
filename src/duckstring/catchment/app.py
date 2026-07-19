@@ -63,10 +63,21 @@ async def _lifespan(app: FastAPI):
             remote = None
             if cloud.is_remote(app.state.data_root) and cloud.aws_configured(app.state.secret_store):
                 from .ec2_launcher import Ec2Launcher
+                from .relay import RelayManager, needs_relay
 
+                # A local Catchment (a laptop behind NAT) can't be dialed back — auto-relay bridges it
+                # (plans/cloud-config.md). Only built when it's actually needed and configured; a public
+                # DUCKSTRING_CATCHMENT_PUBLIC_URL still wins and skips the relay.
+                relay = None
+                has_public = os.environ.get("DUCKSTRING_CATCHMENT_PUBLIC_URL")
+                relay_off = os.environ.get("DUCKSTRING_RELAY", "").lower() in ("off", "0", "false")
+                if not has_public and not relay_off and needs_relay(base_url):
+                    candidate = RelayManager(bind_url=base_url)
+                    if candidate.configured():
+                        relay = candidate
                 remote = Ec2Launcher(
                     app.state.root, base_url, token=app.state.duck_token,
-                    data_root=app.state.data_root,
+                    data_root=app.state.data_root, relay=relay,
                 )
             launcher = DispatchingLauncher(local, remote)
     driver = Driver(app.state.db, app.state.root, base_url, launcher, data_root=app.state.data_root)

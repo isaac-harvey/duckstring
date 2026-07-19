@@ -59,12 +59,18 @@ class Ec2Launcher:
     def __init__(self, root: Path, base_url: str | None, token: str = "", data_root: str | None = None,
                  *, ami: str | None = None, instance_profile: str | None = None,
                  remote_base_url: str | None = None, pip_spec: str | None = None,
-                 region: str | None = None, ec2_client=None):
+                 region: str | None = None, ec2_client=None, relay=None):
         self.root = root
         self.base_url = base_url                 # local bind (dispatcher keeps this in sync)
         # The address an EC2 Duck dials back to — must be reachable from the instance (a hosted
-        # Catchment's public URL; for a local Catchment, a tunnel/VPN address). Falls back to base_url.
-        self.remote_base_url = remote_base_url or os.environ.get("DUCKSTRING_CATCHMENT_PUBLIC_URL") or base_url
+        # Catchment's public URL; for a local Catchment, the auto-relay's address). An explicit
+        # override / env wins; else the auto-relay provides it lazily; else the bind address.
+        self.remote_base_url = remote_base_url or os.environ.get("DUCKSTRING_CATCHMENT_PUBLIC_URL")
+        # The auto-relay (plans/cloud-config.md): for a local Catchment behind NAT, it bridges Duck
+        # dial-backs. When present, remote_base_url comes from it (not the unreachable bind).
+        self.relay = relay
+        if self.remote_base_url is None and relay is None:
+            self.remote_base_url = base_url
         self.token = token
         self.data_root = data_root
         self.ami = ami or os.environ.get("DUCKSTRING_EC2_AMI")
@@ -87,8 +93,20 @@ class Ec2Launcher:
 
     def set_base_url(self, url: str) -> None:
         self.base_url = url
-        if self.remote_base_url is None:
+        # With a relay, the Ducks dial the relay (not this unreachable bind), so learning the bind
+        # doesn't unblock remote spawns — the relay's set_remote_base_url does.
+        if self.remote_base_url is None and self.relay is None:
             self.remote_base_url = url
+        if self.remote_base_url is not None:
+            self._drain_pending()
+
+    def set_remote_base_url(self, url: str) -> None:
+        """The address Ducks dial back to (the relay's public URL, once its tunnel is up). Drains any
+        spawns that were pending on it."""
+        self.remote_base_url = url
+        self._drain_pending()
+
+    def _drain_pending(self) -> None:
         pending, self._pending = self._pending, {}
         for pond_key, (version, source_path, duck) in pending.items():
             self.ensure(pond_key, version, source_path, duck=duck)
@@ -99,6 +117,10 @@ class Ec2Launcher:
 
     def ensure(self, pond_key: str, version: str, source_path: str, duck: dict | None = None) -> None:
         if self.remote_base_url is None:
+            # A local Catchment: bring up the auto-relay (once, in the background — EC2 boot is minutes)
+            # to obtain a reachable dial-back URL; this spawn defers until its tunnel is up.
+            if self.relay is not None and self.relay.configured():
+                self.relay.start_async(self.set_remote_base_url)
             self._pending[pond_key] = (version, source_path, duck)
             return
         if pond_key in self._instances:
@@ -162,3 +184,5 @@ class Ec2Launcher:
         for pond_key in list(self._instances):
             self.terminate(pond_key)
         self._pending.clear()
+        if self.relay is not None:
+            self.relay.stop()  # tear down the tunnel + the relay box
