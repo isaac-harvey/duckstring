@@ -248,6 +248,25 @@ ceiling/idle/keep-warm, instance-profile IAM, and resource tagging. Pond Ducks (
 and a Catchment-settings panel for S3 + pools. Fix the cloud-preset-sizes section that "doesn't work
 for OSS".
 
+## Least-friction local against cloud Ducks (deferred — the auto-relay)
+
+An EC2 Duck must *reach* the Catchment to dial back; a laptop Catchment behind NAT isn't reachable.
+Local-with-cloud-Ducks is a **test-the-path** mode (nobody runs prod from a laptop), so the shipped
+answer is the operator's `DUCKSTRING_CATCHMENT_PUBLIC_URL` (a tunnel / a Tailscale-style mesh address).
+
+Inverting the transport (Catchment polls the Ducks) *would* remove the tunnel — outbound-to-EC2 works
+where inbound-to-laptop doesn't — but it makes the Duck a listening server (ephemeral-TLS pain, a second
+transport strictly worse for the hosted case), so it's rejected.
+
+**The eventual least-friction option (settled 2026-07: eventual, not now):** an **auto-provisioned
+relay** — when a local Catchment enters cloud mode, Duckstring spins one tiny always-reachable EC2
+"twin", the laptop holds an outbound **reverse tunnel** to it (WireGuard/frp/`ssh -R` — *not* a bespoke
+message broker, and *not* a state-replicating second Catchment), and the Ducks dial the relay's public
+address (which forwards to the laptop). The Duck dial-back transport is unchanged. Reuses the
+`Ec2Launcher` machinery via a "relay" instance role; **needs a TTL/lease** (self-terminate if the laptop
+vanishes) and **auth+TLS+security-group** on the exposed endpoint. This is also a natural thing DSC
+manages for you. **Build after the straight dial-back path has run on real AWS.**
+
 ## Deferred / Cloud-only
 
 - The **Exaflock** engine (Cloud; the moat) — registered like any Flock engine.

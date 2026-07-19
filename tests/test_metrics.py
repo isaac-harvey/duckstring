@@ -104,3 +104,28 @@ def test_endpoint_is_open_and_outside_api_audit():
         assert r.status_code == 200
         assert r.headers["content-type"].startswith("text/plain; version=0.0.4")
         assert "duckstring_up 1" in r.text
+
+
+def test_cost_families_target_flock_runtime(tmp_path):
+    """The compute-cost signals (plans/cloud-config.md increment 4): duck target, Flock posture, and
+    cumulative Duck execution seconds."""
+    d = _driver(tmp_path)
+    key = pond_key("sales", 1)
+    d.add_pool("heavy", instance_type="m6i.large")
+    d.set_duck(key, duck_target="heavy", flock_mode="upgrade", flock_engine="athena")
+    # A completed Ripple Run gives a runtime span to sum.
+    (pv_id,) = d.db.execute("SELECT id FROM pond_version LIMIT 1").fetchone()
+    (rip_id,) = d.db.execute("SELECT id FROM ripple WHERE pond_version_id = ?", (pv_id,)).fetchone()
+    d.db.execute("INSERT INTO pond_run (pond_version_id, f, status) "
+                 "VALUES (?, '2026-01-01T00:00:00+00:00', 'success')", (pv_id,))
+    d.db.execute(
+        "INSERT INTO ripple_run (pond_version_id, ripple_id, f, retry, status, started_at, finished_at) "
+        "VALUES (?, ?, '2026-01-01T00:00:00+00:00', 0, 'success', "
+        "'2026-01-01T00:00:00+00:00', '2026-01-01T00:00:12+00:00')",
+        (pv_id, rip_id),
+    )
+    d.db.commit()
+    samples = _parse(render_metrics(d.metrics_snapshot()))
+    assert samples['duckstring_pond_duck_target{pond="sales",major="1",target="heavy"}'] == 1
+    assert samples['duckstring_pond_flock{pond="sales",major="1",mode="upgrade",engine="athena"}'] == 1
+    assert samples['duckstring_pond_run_seconds_total{pond="sales",major="1"}'] == pytest.approx(12, abs=0.1)

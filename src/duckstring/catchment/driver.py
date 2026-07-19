@@ -2853,12 +2853,32 @@ class Driver:
                 m = self.meta[key]
                 ps = self.state.pond_states[key]
                 lag = (now - ps.end_f).total_seconds() if ps.end_f != NEVER else None
-                nodes.append({
+                node = {
                     "name": m["name"], "major": m["major"], "kind": m["kind"],
                     "is_spout": bool(m.get("is_spout")), "is_draw": bool(m.get("is_draw")),
                     "lag_seconds": lag, "runs_completed": ps.runs_completed,
                     "is_failed": ps.is_failed, "is_blocked": ps.is_blocked, "is_killed": ps.is_killed,
-                })
+                }
+                # Compute-cost signal (plans/cloud-config.md increment 4): where the Duck runs + its
+                # Flock posture, so a scrape can attribute cost. Draws/Spouts have no Duck.
+                if not node["is_spout"] and not node["is_draw"]:
+                    dc = self.duck_config(key)
+                    node["duck_target"] = dc["duck_target"]
+                    node["flock_mode"] = dc["flock_mode"]
+                    node["flock_engine"] = dc["flock_engine"] or "none"
+                nodes.append(node)
+            # Cumulative Duck execution seconds per (name, major) — summed Ripple-Run wall-clock spans
+            # (the closest compute-cost proxy without tracking instance uptime). Monotonic across restarts.
+            runtimes = {
+                (r[0], r[1]): r[2] for r in self.db.execute(
+                    "SELECT pn.name, pv.major, "
+                    "SUM((julianday(rr.finished_at) - julianday(rr.started_at)) * 86400) "
+                    "FROM ripple_run rr JOIN pond_version pv ON pv.id = rr.pond_version_id "
+                    "JOIN pond_name pn ON pn.id = pv.pond_name_id "
+                    "WHERE rr.started_at IS NOT NULL AND rr.finished_at IS NOT NULL "
+                    "GROUP BY pn.name, pv.major"
+                ).fetchall() if r[2] is not None
+            }
             # Cumulative failed Pond Runs per (name, major) — a monotonic counter across restarts.
             failures = {
                 (r[0], r[1]): r[2] for r in self.db.execute(
@@ -2871,7 +2891,8 @@ class Driver:
             deliveries = dict(self.db.execute(
                 "SELECT status, COUNT(*) FROM alert_delivery GROUP BY status"
             ).fetchall())
-            return {"nodes": nodes, "failures": failures, "alert_deliveries": deliveries}
+            return {"nodes": nodes, "failures": failures, "alert_deliveries": deliveries,
+                    "runtimes": runtimes}
 
     def view_fragment(self, scope: list[str] | None) -> dict:
         """This Catchment's slice of the recursive lineage view (see plans/cross-catchment-visibility.md):
