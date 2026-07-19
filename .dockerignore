@@ -1,0 +1,4 @@
+# Only the built wheel (dist/) is needed by the image build; keep the context tiny.
+*
+!dist
+!Dockerfile

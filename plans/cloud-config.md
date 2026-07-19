@@ -96,6 +96,38 @@ CRUD: `duckstring duck pool add|ls|rm|show`, `POST/GET/DELETE /api/catchment/duc
 Operator-only (see §6 on why not in `pond.toml`): a Pond may be assigned its own dedicated box with
 `auto_stop` (terminate on Pond-run completion). Held in the per-Pond override (§6), not a pool.
 
+## 4b. Remote compute providers — Fargate (default) + EC2 (escape) — BUILT
+
+A remote backend is chosen **per pool** (`duck_pool.provider ∈ fargate|ec2`, default **fargate**), so a
+Catchment can mix a fast Fargate `default` pool with an EC2 `huge` pool. **Fargate is the default**:
+tens-of-seconds cold start (vs EC2's minutes — the biggest EC2 pain), pay-per-second serverless
+(the thesis: don't pay for idle compute), native **task-role** IAM, and image-based (no AMI + userdata
+`pip install`). **EC2 stays as the escape hatch** for jobs over Fargate's 16 vCPU / 120 GB cap or needing
+GPU/warm-pools — genuinely huge work is the Flock's job anyway.
+
+- **`FargateLauncher`** implements the launcher seam over ECS: `ensure` = `RunTask` (container command
+  override = the Duck args), `terminate` = `StopTask`, `is_running` = a task record. Uses the
+  **container image** (§ image) so there's no bootstrap. A pool carries only its **size** (`cpu`/`memory`
+  — the Fargate task size); the Fargate **infra** (cluster / subnets / security groups / task+execution
+  roles / image / assign-public-ip) is **Catchment-level** env (`DUCKSTRING_FARGATE_*`), like the EC2
+  launcher's AMI — it's one VPC/cluster, not per-pool.
+- **Shared dial-back**: both remote backends need a reachable Catchment URL, and the auto-relay is shared
+  across them (a `RemoteDialback` holds the URL + relay; each backend registers a drain callback, fired
+  once when the relay's tunnel comes up). The `DispatchingLauncher` routes a remote spawn to the backend
+  for its pool's provider (`dedicated` → the Catchment's default provider).
+- **The container image** (`Dockerfile`, GHCR via `release.yml`): `python -m` entrypoint over the
+  installed wheel; a Duck runs `duckstring.duck <args>` as the task command. Ship an official image
+  alongside the PyPI package.
+
+### Preset pools — S/M/L/XL (Fargate, built-in on OSS)
+
+OSS ships **built-in preset pools** `S/M/L/XL` (code-defined, `provider=fargate`, escalating `cpu/memory`)
+that always appear in the pool list (flagged `managed`, not editable/removable) and resolve like any pool
+— so `pond.toml duck = "M"` works out of the box with zero pool setup. This is the **seamless-DSC-transfer
+move**: DSC ships the *same* preset names backed by its own serverless pools, so a `duck = "M"` project
+runs identically on OSS-Fargate and on DSC — only the backend differs, never the config. User pools sit
+alongside the presets; preset names are reserved.
+
 ## 5. Flock per Pond (rip out ripple-level)
 
 Ripple-level `@ripple(flock=…)` is **removed**. The posture moves up to the **Pond**. If a user needs
