@@ -121,12 +121,16 @@ export interface RawPond {
 // presets are just pools; the picker renders whatever /catchment/duck-pools returns.
 export interface DuckPool {
   name: string;
-  instance_type: string | null;
+  provider: string; // 'fargate' (default) | 'ec2'
+  instance_type: string | null; // EC2 pools
+  cpu: number | null; // Fargate task cpu units
+  memory: number | null; // Fargate task memory (MiB)
   min_instances: number;
   max_instances: number;
   idle_timeout: number | null;
   keep_warm: number;
   region: string | null;
+  managed?: boolean; // a built-in preset (S/M/L/XL) — not editable/removable
 }
 
 // A Pond's effective compute config = override ?? declared ?? Catchment default (coalesce). Sizing is
@@ -431,6 +435,9 @@ export function fetchDuckPools(): Promise<DuckPool[]> {
 
 export function addDuckPool(body: {
   name: string;
+  provider?: string | null;
+  cpu?: number | null;
+  memory?: number | null;
   instance_type?: string | null;
   min_instances?: number | null;
   max_instances?: number | null;

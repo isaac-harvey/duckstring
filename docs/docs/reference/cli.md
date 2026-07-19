@@ -166,11 +166,12 @@ duckstring duck show [pond]
 duckstring duck set {pond} [--duck catchment|POOL|dedicated] [--flock off|upgrade|always] \
                            [--engine NAME] [--oom fail_up|fail] [--instance-type T] [--auto-stop] [--clear]
 duckstring duck pool ls
-duckstring duck pool add {name} [--instance-type T] [--min N] [--max N] [--keep-warm N] [--idle-timeout S]
+duckstring duck pool add {name} [--provider fargate|ec2] [--cpu N --memory MiB] [--instance-type T] \
+                                [--min N] [--max N] [--keep-warm N] [--idle-timeout S]
 duckstring duck pool rm {name}
 ```
 
-Where a Pond's worker (Duck) runs and its over-envelope offload posture (the **Flock**). The Duck target is the Catchment's own box (`catchment`), a named **Duck Pool**, or a `dedicated` box; there is no abstract size — sizing is the pool's (or dedicated) instance type. These may be **declared in `pond.toml`** (`[pond] duck`, `[flock] mode`/`engine`/`oom_policy`) and are re-read on every redeploy; an operator override set here **coalesces over the declaration** and survives redeploys (`--clear` reverts to the declared config, else the Catchment default). Inert on a stock local Catchment — the local worker is whatever the host is; pools/dedicated boxes are acted on by a remote launcher once **cloud is enabled** (a remote data root + AWS creds, under Options → Cloud or `duckstring catchment settings`).
+Where a Pond's worker (Duck) runs and its over-envelope offload posture (the **Flock**). The Duck target is the Catchment's own box (`catchment`), a named **Duck Pool**, or a `dedicated` box; there is no abstract size — sizing is the pool's Fargate `cpu`/`memory` (or an EC2 `instance_type`). A pool picks its provider: **`fargate`** (default — fast serverless containers) or **`ec2`** (the escape hatch for big/GPU jobs). Built-in **`S`/`M`/`L`/`XL`** preset pools (Fargate) always exist, so `duck = "M"` works with zero setup — and Duckstring Cloud ships the same names, so a project transfers seamlessly. These may be **declared in `pond.toml`** (`[pond] duck`, `[flock] mode`/`engine`/`oom_policy`) and are re-read on every redeploy; an operator override set here **coalesces over the declaration** and survives redeploys (`--clear` reverts to the declared config, else the Catchment default). Inert on a stock local Catchment — the local worker is whatever the host is; pools/dedicated boxes are acted on by a remote launcher once **cloud is enabled** (a remote data root + AWS creds, under Options → Cloud or `duckstring catchment settings`).
 
 ## `duckstring status` — live monitor
 

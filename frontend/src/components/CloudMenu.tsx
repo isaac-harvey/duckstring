@@ -29,9 +29,10 @@ export function CloudMenu({ onClose }: { onClose: () => void }) {
   const [busy, setBusy] = useState(false);
   // Add-pool form.
   const [pName, setPName] = useState('');
+  const [pProvider, setPProvider] = useState('fargate');
   const [pType, setPType] = useState('');
-  const [pMin, setPMin] = useState('');
-  const [pMax, setPMax] = useState('');
+  const [pCpu, setPCpu] = useState('');
+  const [pMem, setPMem] = useState('');
   const [pErr, setPErr] = useState<string | null>(null);
 
   const load = () => {
@@ -58,11 +59,12 @@ export function CloudMenu({ onClose }: { onClose: () => void }) {
     try {
       await addDuckPool({
         name: pName.trim(),
-        instance_type: pType.trim() || null,
-        min_instances: pMin ? Number(pMin) : null,
-        max_instances: pMax ? Number(pMax) : null,
+        provider: pProvider,
+        instance_type: pProvider === 'ec2' ? pType.trim() || null : null,
+        cpu: pProvider === 'fargate' && pCpu ? Number(pCpu) : null,
+        memory: pProvider === 'fargate' && pMem ? Number(pMem) : null,
       });
-      setPName(''); setPType(''); setPMin(''); setPMax('');
+      setPName(''); setPType(''); setPCpu(''); setPMem('');
       load();
     } catch (e) {
       setPErr(e instanceof Error ? e.message : 'failed');
@@ -106,26 +108,39 @@ export function CloudMenu({ onClose }: { onClose: () => void }) {
         </div>
       )}
 
-      {/* Duck Pools. */}
+      {/* Duck Pools — the built-in S/M/L/XL presets (managed) + user pools. */}
       <div style={heading}>DUCK POOLS</div>
-      {pools.length === 0 && <div style={{ fontSize: 12, color: '#52525b', marginBottom: 6 }}>None.</div>}
-      {pools.map((p) => (
-        <div key={p.name} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
-          <span style={{ fontSize: 12, color: '#a1a1aa' }}>
-            {p.name}
-            <span style={{ color: '#52525b', fontSize: 10 }}> {p.instance_type || '—'} · {p.min_instances}–{p.max_instances}</span>
-          </span>
-          <span role="button" title="Remove" onClick={() => removeDuckPool(p.name).then(load).catch(() => undefined)}
-                style={{ cursor: 'pointer', color: '#52525b', fontSize: 13, lineHeight: 1 }}>✕</span>
-        </div>
-      ))}
+      {pools.map((p) => {
+        const spec = (p.provider || 'fargate') === 'fargate'
+          ? (p.cpu || p.memory ? `${p.cpu ?? '?'}cpu / ${p.memory ?? '?'}MiB` : '—')
+          : (p.instance_type || '—');
+        return (
+          <div key={p.name} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
+            <span style={{ fontSize: 12, color: '#a1a1aa' }}>
+              {p.name}
+              <span style={{ color: '#52525b', fontSize: 10 }}> [{p.provider || 'fargate'}] {spec}{p.managed ? ' · preset' : ''}</span>
+            </span>
+            {!p.managed && (
+              <span role="button" title="Remove" onClick={() => removeDuckPool(p.name).then(load).catch(() => undefined)}
+                    style={{ cursor: 'pointer', color: '#52525b', fontSize: 13, lineHeight: 1 }}>✕</span>
+            )}
+          </div>
+        );
+      })}
       <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 6 }}>
         <input value={pName} onChange={(e) => setPName(e.target.value)} placeholder="pool name (e.g. heavy)" style={smallInput} />
-        <input value={pType} onChange={(e) => setPType(e.target.value)} placeholder="instance type (e.g. m6i.large)" style={smallInput} />
-        <div style={{ display: 'flex', gap: 6 }}>
-          <input value={pMin} onChange={(e) => setPMin(e.target.value)} placeholder="min" inputMode="numeric" style={smallInput} />
-          <input value={pMax} onChange={(e) => setPMax(e.target.value)} placeholder="max" inputMode="numeric" style={smallInput} />
-        </div>
+        <select value={pProvider} onChange={(e) => setPProvider(e.target.value)} style={smallInput}>
+          <option value="fargate">fargate (serverless)</option>
+          <option value="ec2">ec2 (big / GPU)</option>
+        </select>
+        {pProvider === 'fargate' ? (
+          <div style={{ display: 'flex', gap: 6 }}>
+            <input value={pCpu} onChange={(e) => setPCpu(e.target.value)} placeholder="cpu (e.g. 1024)" inputMode="numeric" style={smallInput} />
+            <input value={pMem} onChange={(e) => setPMem(e.target.value)} placeholder="mem MiB (e.g. 4096)" inputMode="numeric" style={smallInput} />
+          </div>
+        ) : (
+          <input value={pType} onChange={(e) => setPType(e.target.value)} placeholder="instance type (e.g. m6i.large)" style={smallInput} />
+        )}
         {pErr && <div style={{ fontSize: 11, color: '#ef4444', wordBreak: 'break-word' }}>{pErr}</div>}
         <button onClick={addPool} disabled={busy || !pName.trim()} style={btn('#22c55e', busy || !pName.trim())}>
           Add pool
