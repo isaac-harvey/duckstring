@@ -64,7 +64,8 @@ class SubprocessLauncher:
             return
         name, major = split_pond_key(pond_key)
         # The Duck config rides as env: size is advisory locally (the subprocess is whatever the host
-        # is), flock gates the co-resident DuckFlock driver's distribution (DuckflockConfig.from_env).
+        # is); DUCKSTRING_DUCK_FLOCK is the pond's over-envelope offload posture (the Flock seam,
+        # engine-pluggable and off locally — no engine configured).
         env = dict(os.environ)
         if duck:
             env["DUCKSTRING_DUCK_SIZE"] = duck.get("size") or "s"

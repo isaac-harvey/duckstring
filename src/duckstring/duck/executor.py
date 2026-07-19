@@ -169,9 +169,6 @@ class RippleExecutor:
         sources = read_pond_toml(root / source_path).get("sources", {})
         self.source_majors = {sname: spec_major(spec) for sname, spec in sources.items()}
         self._pool = ThreadPoolExecutor(max_workers=max_workers)
-        # Set by wipe(), cleared by export(): the in-flight run is a Refresh (wipe-and-rebuild), so a
-        # DuckFlock-routed ripple must carry config.refresh (remote reads treat prior state as absent).
-        self._refresh_pending = False
 
     def _cursor(self):
         """A fresh connection sharing the one registry instance. Cursor creation is serialised; the
@@ -190,24 +187,11 @@ class RippleExecutor:
         timing: dict = {}
 
         def _task():
-            from ..duckflock_backend import DuckflockConfig
-
             timing["started"] = datetime.now(timezone.utc)
             func = _load_ripple(self.source_path, str(self.root), ripple_name)
-            dfl = DuckflockConfig.from_env()
-            if dfl.enabled:
-                # DuckFlock routing (opt-in via DUCKFLOCK_BIN — the co-resident driver): capture →
-                # quote → run locally or offload. route_ripple completes the ripple either way (every
-                # DuckFlock-side failure degrades to classic inside it) and hydrates a remote
-                # result back into the registry, so the rest of the run is path-identical.
-                from .duckflock_route import route_ripple
-
-                _out, timing["lineage"] = route_ripple(
-                    self, dfl, func, f, previous_f,
-                    sources_changed=sources_changed, skip_sink=skip_sink,
-                    refresh=self._refresh_pending,
-                )
-                return
+            # Over-envelope offload happens inside the ripple, at the pond.trickle(...) terminals
+            # (the Flock seam — duckstring.flock, env-gated, engine-pluggable). The executor just
+            # runs the ripple classically; the terminal hook decides local-vs-Flock per output.
             timing["lineage"] = _run_ripple(
                 func, self.pond_name, self.version, self._cursor(), str(self.root),
                 self.source_majors, f, previous_f, self.data_root,
@@ -240,7 +224,6 @@ class RippleExecutor:
         # Objects commit only after the table publish passed the contract gate — a failed run leaves the
         # last-good Object intact (the staged writes are discarded on the next run / wipe).
         commit_objects(self.staging_dir, self.own_data_dir, f)
-        self._refresh_pending = False  # the rebuild published — subsequent runs are normal again
         return schema
 
     def wipe(self) -> None:
@@ -267,7 +250,6 @@ class RippleExecutor:
                 cur.close()
 
         retry_on_lock(_drop)
-        self._refresh_pending = True  # the next run is the rebuild — routed ripples carry config.refresh
         import shutil
 
         shutil.rmtree(self.staging_dir, ignore_errors=True)  # discard any uncommitted staged Objects
