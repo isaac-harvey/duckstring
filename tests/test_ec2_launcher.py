@@ -149,7 +149,7 @@ def test_terminate_kills_the_instance(tmp_path):
 def test_spawn_defers_until_reachable_url(tmp_path):
     ec2 = FakeEc2()
     lch = Ec2Launcher(tmp_path, None, token="t", data_root="s3://b/d", ami="ami-1", ec2_client=ec2)
-    lch.remote_base_url = None
+    assert lch.remote_base_url is None  # a local/unknown bind with no relay → deferred
     lch.ensure("a@1", "1", "ponds/a/1", duck=_duck("heavy", pool={"instance_type": "m6i.large"}))
     assert not ec2.launched and lch.is_running("a@1")  # pending → owned, so liveness won't fail it
     lch.set_base_url("http://cat:7474")

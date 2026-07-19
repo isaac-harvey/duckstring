@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import pytest
 
+from duckstring.catchment.dialback import RemoteDialback
 from duckstring.catchment.ec2_launcher import Ec2Launcher
 from duckstring.catchment.relay import RelayManager, needs_relay
 
@@ -136,26 +137,25 @@ def _duck(target="heavy"):
 def test_remote_spawn_defers_on_relay_then_drains_when_ready(tmp_path):
     ec2 = FakeEc2()
     relay = FakeRelay()
-    # base_url is a local bind; with a relay, remote_base_url stays None until the relay is up.
+    # A local bind + a relay → the shared dial-back URL stays None until the relay's tunnel is up.
+    dialback = RemoteDialback("http://127.0.0.1:7474", relay=relay)
     lch = Ec2Launcher(tmp_path, "http://127.0.0.1:7474", token="t", data_root="s3://b/d",
-                      ami="ami-1", ec2_client=ec2, relay=relay)
+                      ami="ami-1", ec2_client=ec2, dialback=dialback)
     assert lch.remote_base_url is None
 
     lch.ensure("a@1", "1", "ponds/a/1", duck=_duck())
-    assert relay.cb is not None          # the relay was kicked off
+    assert relay.cb is not None          # the relay was kicked off via the dial-back
     assert not ec2.launched              # the spawn deferred (pending)
     assert lch.is_running("a@1")         # pending → owned, so liveness won't fail it
 
-    relay.cb("http://203.0.113.9:7474")  # the tunnel came up → drain
+    relay.cb("http://203.0.113.9:7474")  # the tunnel came up → dial-back resolves → drain
     assert lch.remote_base_url == "http://203.0.113.9:7474"
     assert len(ec2.launched) == 1
-    ud_ok = "http://203.0.113.9:7474"
     import base64
-    assert ud_ok in base64.b64decode(ec2.launched[0]["UserData"]).decode()  # Duck dials the relay
+    assert "http://203.0.113.9:7474" in base64.b64decode(ec2.launched[0]["UserData"]).decode()
 
 
-def test_shutdown_stops_the_relay(tmp_path):
+def test_dialback_stop_tears_down_the_relay():
     relay = FakeRelay()
-    lch = Ec2Launcher(tmp_path, "http://127.0.0.1:7474", ami="ami-1", ec2_client=FakeEc2(), relay=relay)
-    lch.shutdown_all()
+    RemoteDialback("http://127.0.0.1:7474", relay=relay).stop()
     assert relay.stopped

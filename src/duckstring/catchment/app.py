@@ -60,13 +60,15 @@ async def _lifespan(app: FastAPI):
             local = SubprocessLauncher(
                 app.state.root, base_url, token=app.state.duck_token, data_root=app.state.data_root
             )
-            remote = None
+            remotes, dialback = {}, None
             if cloud.is_remote(app.state.data_root) and cloud.aws_configured(app.state.secret_store):
+                from .dialback import RemoteDialback
                 from .ec2_launcher import Ec2Launcher
+                from .fargate_launcher import FargateLauncher
                 from .relay import RelayManager, needs_relay
 
-                # A local Catchment (a laptop behind NAT) can't be dialed back — auto-relay bridges it
-                # (plans/cloud-config.md). Only built when it's actually needed and configured; a public
+                # A local Catchment (a laptop behind NAT) can't be dialed back — the auto-relay bridges it
+                # (plans/cloud-config.md). Built only when needed + configured; a public
                 # DUCKSTRING_CATCHMENT_PUBLIC_URL still wins and skips the relay.
                 relay = None
                 has_public = os.environ.get("DUCKSTRING_CATCHMENT_PUBLIC_URL")
@@ -75,11 +77,15 @@ async def _lifespan(app: FastAPI):
                     candidate = RelayManager(bind_url=base_url)
                     if candidate.configured():
                         relay = candidate
-                remote = Ec2Launcher(
-                    app.state.root, base_url, token=app.state.duck_token,
-                    data_root=app.state.data_root, relay=relay,
-                )
-            launcher = DispatchingLauncher(local, remote)
+                # One shared dial-back (URL + relay) across the remote backends. Fargate is the default;
+                # EC2 rides alongside for escape-hatch pools. Both are inert until a matching pool spawns.
+                dialback = RemoteDialback(base_url, relay=relay)
+                kw = dict(token=app.state.duck_token, data_root=app.state.data_root, dialback=dialback)
+                remotes = {
+                    "fargate": FargateLauncher(app.state.root, base_url, **kw),
+                    "ec2": Ec2Launcher(app.state.root, base_url, **kw),
+                }
+            launcher = DispatchingLauncher(local, remotes, dialback=dialback, default_provider="fargate")
     driver = Driver(app.state.db, app.state.root, base_url, launcher, data_root=app.state.data_root)
     app.state.driver = driver
     app.state.launcher = launcher

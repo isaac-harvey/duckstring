@@ -107,42 +107,65 @@ class SubprocessLauncher:
 
 
 class DispatchingLauncher:
-    """Routes each Pond's Duck to a backend by its ``duck_target`` (plans/cloud-config.md): the
-    Catchment's own box (``local`` — the subprocess backend) or a remote backend (EC2 pool / dedicated
-    box). This is what makes "a local Catchment running cloud Ducks" the same code path as a hosted one:
-    ``catchment``-targeted Ponds always run on the Catchment's box, everything else on ``remote``. With
-    no ``remote`` backend configured (cloud not enabled), remote targets degrade to local — so a
-    ``duck = "heavy"`` pond.toml still runs anywhere."""
+    """Routes each Pond's Duck to a backend by its ``duck_target`` + provider (plans/cloud-config.md):
+    the Catchment's own box (``local`` — the subprocess backend), or a remote backend chosen by the
+    target pool's provider (Fargate by default, EC2 for the escape-hatch pools). This is what makes "a
+    local Catchment running cloud Ducks" the same code path as a hosted one — ``catchment``-targeted
+    Ponds always run on the Catchment's box, everything else remote. With no remote backend (cloud not
+    enabled), remote targets degrade to local, so a ``duck = "M"`` pond.toml still runs anywhere.
+
+    ``remotes`` is a ``{provider: backend}`` map (a single backend is accepted for back-compat and takes
+    every remote spawn). ``dialback`` is the shared reachable-URL/relay holder torn down once here."""
 
     manages_processes = True  # liveness routes through is_running() → the owning backend
 
-    def __init__(self, local, remote=None):
+    def __init__(self, local, remotes=None, *, dialback=None, default_provider: str = "fargate"):
         self.local = local
-        self.remote = remote
+        if remotes is None:
+            self.remotes: dict = {}
+        elif isinstance(remotes, dict):
+            self.remotes = remotes
+        else:
+            self.remotes = {"_any": remotes}  # a single remote backend takes every remote spawn
+        self.dialback = dialback
+        self.default_provider = default_provider
         self._owner: dict[str, object] = {}  # pond_key → the backend that spawned it
 
     @property
     def base_url(self):
         return self.local.base_url
 
+    def _remote_for(self, duck: dict | None):
+        if not self.remotes:
+            return None
+        if "_any" in self.remotes:
+            return self.remotes["_any"]
+        provider = ((duck or {}).get("pool") or {}).get("provider") or self.default_provider
+        return self.remotes.get(provider) or self.remotes.get(self.default_provider)
+
     def _backend_for(self, duck: dict | None):
-        if self.remote is not None and duck and duck.get("remote"):
-            return self.remote
+        if duck and duck.get("remote"):
+            remote = self._remote_for(duck)
+            if remote is not None:
+                return remote
         return self.local
 
     def set_base_url(self, url: str) -> None:
         self.local.set_base_url(url)
-        if self.remote is not None:
-            self.remote.set_base_url(url)
+        if self.dialback is not None:
+            self.dialback.set_base_url(url)  # resolves the shared dial-back → drains the remote backends
+        else:
+            for remote in self.remotes.values():
+                remote.set_base_url(url)
 
     def is_running(self, pond_key: str) -> bool:
         owner = self._owner.get(pond_key)
         if owner is not None:
             return owner.is_running(pond_key)
-        # Not yet routed (e.g. a pending spawn before base_url is known) — ask both; either owning it counts.
+        # Not yet routed (a pending spawn before base_url is known) — ask everyone; any owner counts.
         if self.local.is_running(pond_key):
             return True
-        return self.remote is not None and self.remote.is_running(pond_key)
+        return any(r.is_running(pond_key) for r in self.remotes.values())
 
     def ensure(self, pond_key: str, version: str, source_path: str, duck: dict | None = None) -> None:
         backend = self._backend_for(duck)
@@ -157,15 +180,17 @@ class DispatchingLauncher:
         owner = self._owner.pop(pond_key, None)
         if owner is not None:
             owner.terminate(pond_key, wait=wait)
-        else:  # unknown ownership (restart) — terminate on both, harmless if absent
+        else:  # unknown ownership (restart) — terminate everywhere, harmless if absent
             self.local.terminate(pond_key, wait=wait)
-            if self.remote is not None:
-                self.remote.terminate(pond_key, wait=wait)
+            for remote in self.remotes.values():
+                remote.terminate(pond_key, wait=wait)
 
     def shutdown_all(self) -> None:
         self.local.shutdown_all()
-        if self.remote is not None:
-            self.remote.shutdown_all()
+        for remote in self.remotes.values():
+            remote.shutdown_all()
+        if self.dialback is not None:
+            self.dialback.stop()
 
 
 class NoopLauncher:

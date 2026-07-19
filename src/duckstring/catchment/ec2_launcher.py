@@ -58,19 +58,17 @@ class Ec2Launcher:
 
     def __init__(self, root: Path, base_url: str | None, token: str = "", data_root: str | None = None,
                  *, ami: str | None = None, instance_profile: str | None = None,
-                 remote_base_url: str | None = None, pip_spec: str | None = None,
-                 region: str | None = None, ec2_client=None, relay=None):
+                 dialback=None, pip_spec: str | None = None,
+                 region: str | None = None, ec2_client=None):
+        from .dialback import RemoteDialback
+
         self.root = root
         self.base_url = base_url                 # local bind (dispatcher keeps this in sync)
-        # The address an EC2 Duck dials back to — must be reachable from the instance (a hosted
-        # Catchment's public URL; for a local Catchment, the auto-relay's address). An explicit
-        # override / env wins; else the auto-relay provides it lazily; else the bind address.
-        self.remote_base_url = remote_base_url or os.environ.get("DUCKSTRING_CATCHMENT_PUBLIC_URL")
-        # The auto-relay (plans/cloud-config.md): for a local Catchment behind NAT, it bridges Duck
-        # dial-backs. When present, remote_base_url comes from it (not the unreachable bind).
-        self.relay = relay
-        if self.remote_base_url is None and relay is None:
-            self.remote_base_url = base_url
+        # The reachable Catchment URL a Duck dials back to — shared across remote backends via the
+        # RemoteDialback (which also owns the auto-relay for a local Catchment). Built standalone here
+        # when none is injected (a bare Ec2Launcher, e.g. tests).
+        self.dialback = dialback or RemoteDialback(base_url)
+        self.dialback.register(self._drain_pending)
         self.token = token
         self.data_root = data_root
         self.ami = ami or os.environ.get("DUCKSTRING_EC2_AMI")
@@ -89,22 +87,15 @@ class Ec2Launcher:
             self._client = boto3.client("ec2", **({"region_name": self.region} if self.region else {}))
         return self._client
 
+    @property
+    def remote_base_url(self) -> str | None:
+        return self.dialback.url
+
     # ─── the launcher interface ───────────────────────────────────────────────────
 
     def set_base_url(self, url: str) -> None:
         self.base_url = url
-        # With a relay, the Ducks dial the relay (not this unreachable bind), so learning the bind
-        # doesn't unblock remote spawns — the relay's set_remote_base_url does.
-        if self.remote_base_url is None and self.relay is None:
-            self.remote_base_url = url
-        if self.remote_base_url is not None:
-            self._drain_pending()
-
-    def set_remote_base_url(self, url: str) -> None:
-        """The address Ducks dial back to (the relay's public URL, once its tunnel is up). Drains any
-        spawns that were pending on it."""
-        self.remote_base_url = url
-        self._drain_pending()
+        self.dialback.set_base_url(url)  # resolves the dial-back URL when no relay is needed
 
     def _drain_pending(self) -> None:
         pending, self._pending = self._pending, {}
@@ -117,10 +108,9 @@ class Ec2Launcher:
 
     def ensure(self, pond_key: str, version: str, source_path: str, duck: dict | None = None) -> None:
         if self.remote_base_url is None:
-            # A local Catchment: bring up the auto-relay (once, in the background — EC2 boot is minutes)
-            # to obtain a reachable dial-back URL; this spawn defers until its tunnel is up.
-            if self.relay is not None and self.relay.configured():
-                self.relay.start_async(self.set_remote_base_url)
+            # A local Catchment: ask the shared dial-back to bring up the auto-relay (once, in the
+            # background — EC2 boot is minutes); this spawn defers until a reachable URL resolves.
+            self.dialback.request()
             self._pending[pond_key] = (version, source_path, duck)
             return
         if pond_key in self._instances:
@@ -184,5 +174,4 @@ class Ec2Launcher:
         for pond_key in list(self._instances):
             self.terminate(pond_key)
         self._pending.clear()
-        if self.relay is not None:
-            self.relay.stop()  # tear down the tunnel + the relay box
+        # The shared dial-back (and its relay) is torn down once by the dispatcher, not per backend.
