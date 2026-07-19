@@ -139,6 +139,12 @@ def create_app(
     migrate(con)
     ensure_identity(con, name or os.environ.get("DUCKSTRING_CATCHMENT_NAME"))
 
+    # The data root can be a persisted Catchment setting (attached via the API after the Catchment is
+    # made — plans/cloud-config.md), behind an explicit argument and the env for platform hosting.
+    if not data_root:
+        from .cloud import DATA_ROOT_KEY, get_setting
+        data_root = get_setting(con, DATA_ROOT_KEY)
+
     # Writer lease on an external data root — refuse to start if a *different* live Catchment owns it (two
     # Catchments racing one lake's Iceberg catalog would dangle its pointer). A same-id restart reclaims
     # instantly; only engaged for an external DUCKSTRING_DATA_ROOT, so the local default is untouched.

@@ -70,6 +70,11 @@ async def status(
     # requests (the draw long-polls, cross-Catchment view recursion) aren't blocked behind it.
     payload = await run_in_threadpool(driver.status)
     payload["access_level"] = auth.LEVEL_TO_NAME[principal.level]
+    # The cloud-enable gate (remote data root + AWS creds) — the UI greys out remote-compute options
+    # until both hold (plans/cloud-config.md).
+    from .. import cloud
+    payload["cloud"] = cloud.cloud_status(getattr(request.app.state, "data_root", None),
+                                          getattr(request.app.state, "secret_store", None))
     return payload
 
 

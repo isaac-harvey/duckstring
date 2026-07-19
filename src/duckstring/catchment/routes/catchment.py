@@ -47,6 +47,74 @@ def identity(request: Request):
     return {"id": rows.get("id"), "name": rows.get("name")}
 
 
+# ─── Cloud settings (the data-plane target + the cloud-enable gate) ───────────────
+
+
+@router.get("/catchment/settings", dependencies=[auth.read])
+def get_settings(request: Request):
+    """The Catchment's cloud config: the data-plane target + the cloud-enable gate (remote data root +
+    AWS creds) and its reasons, so the UI can grey out remote-compute options and explain why. Also
+    ``has_data`` — once true the data root is set-once (see PUT)."""
+    from .. import cloud
+
+    app = request.app
+    status = cloud.cloud_status(getattr(app.state, "data_root", None),
+                                getattr(app.state, "secret_store", None))
+    status["has_data"] = cloud.has_published_data(_db(request))
+    return status
+
+
+class _SettingsBody(BaseModel):
+    data_root: str  # an object-store URI (s3://…, gs://…) or a shared path — where the data plane lives
+
+
+@router.put("/catchment/settings", dependencies=[auth.full])
+def put_settings(request: Request, body: _SettingsBody):
+    """Attach (or, while empty, re-point) the data-plane target. **Set-once in practice**: refused
+    once the Catchment has published data (switching would strand it — a migration is deferred), and
+    an already-configured root can't be changed in place. Applied live — future Duck spawns publish to
+    the new root — and persisted, so it survives restarts. Full-gated (it moves where all data lives)."""
+    from ...storage import get_storage
+    from .. import cloud
+    from ..data_lease import acquire_lease
+
+    app = request.app
+    new = (body.data_root or "").strip()
+    if not new:
+        raise HTTPException(status_code=422, detail="data_root must be a non-empty URI or path")
+    current = getattr(app.state, "data_root", None)
+    if new == current:
+        return {**cloud.cloud_status(current, app.state.secret_store), "unchanged": True}
+    if current is not None:
+        raise HTTPException(status_code=409, detail=(
+            "a data root is already configured; changing it needs a data migration (not yet supported)"))
+    if cloud.has_published_data(_db(request)):
+        raise HTTPException(status_code=409, detail=(
+            "the Catchment already has published data — the data root is set-once (attach it before "
+            "deploying, or reset the Catchment first)"))
+    # Take the single-writer lease on the new store (refuses if another live Catchment owns it), then
+    # apply live + persist. get_storage validates the scheme.
+    try:
+        store = get_storage(new)
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"unusable data root: {exc}") from None
+    cid = _db(request).execute("SELECT value FROM catchment_meta WHERE key = 'id'").fetchone()
+    owner_id = cid[0] if cid else "unknown"
+    try:
+        acquire_lease(store, owner_id)
+    except Exception as exc:
+        raise HTTPException(status_code=409, detail=f"data root is in use: {exc}") from None
+    cloud.set_setting(_db(request), cloud.DATA_ROOT_KEY, new)
+    app.state.data_root = new
+    app.state.data_lease = (store, owner_id)
+    driver = app.state.driver
+    driver.data_root = new
+    launcher = getattr(app.state, "launcher", None)
+    if launcher is not None:
+        launcher.data_root = new
+    return cloud.cloud_status(new, app.state.secret_store)
+
+
 class _ResetBody(BaseModel):
     clear_history: bool = False
 
