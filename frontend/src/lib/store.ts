@@ -32,6 +32,8 @@ import {
   setApiKey,
   UnauthorizedError,
   type AccessLevel,
+  type CloudGate,
+  type DuckOverrideBody,
   type StatusPayload,
   type RawPond,
   type RawRipple,
@@ -114,6 +116,7 @@ export function atLeast(level: AccessLevel, required: AccessLevel): boolean {
 interface StatusSlice {
   catchment: { id: string | null; name: string | null } | null;
   accessLevel: AccessLevel;
+  cloud: CloudGate | null; // the cloud-enable gate (remote data root + AWS creds); null until first /status
   ponds: Record<PondId, Pond>;
   ripples: Record<RippleId, Ripple>;
   pondViews: Record<PondId, NodeView>;
@@ -190,6 +193,7 @@ function transformStatus(payload: StatusPayload): StatusSlice {
     // Default to 'full' when absent — keeps an open/unauthed Catchment (and any transitional backend)
     // showing every control, matching pre-ladder behaviour.
     accessLevel: payload.access_level ?? 'full',
+    cloud: payload.cloud ?? null,
     ponds, ripples, pondViews, rippleViews, pondInfo, triggers,
   };
 }
@@ -281,7 +285,7 @@ export interface LiveState extends StatusSlice {
 
   clearFailure(pond: PondId): Promise<void>;
   setBudget(pond: PondId, immediateRetries: number, sourceRetries: number): Promise<void>;
-  setDuck(pond: PondId, body: { size?: string | null; flock?: boolean | null; clear?: boolean }): Promise<void>;
+  setDuck(pond: PondId, body: DuckOverrideBody): Promise<void>;
 
   addWindow(pond: PondId, body: AddWindowBody): Promise<void>;
   removeWindow(pond: PondId, name: string): Promise<void>;
@@ -338,6 +342,7 @@ function closure(seeds: PondId[], adj: Record<string, string[]>): Set<string> {
 export const useLiveStore = create<LiveState>((set, get) => ({
   catchment: null,
   accessLevel: 'full', // until the first /api/status; open Catchments stay 'full'
+  cloud: null,
   ponds: {},
   ripples: {},
   pondViews: {},

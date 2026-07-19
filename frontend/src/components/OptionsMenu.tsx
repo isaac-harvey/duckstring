@@ -6,6 +6,7 @@ import { useIsMobile } from '@/lib/useIsMobile';
 import type { AccessLevel } from '@/lib/api';
 import { SecretsMenu } from './SecretsMenu';
 import { AlertsMenu } from './AlertsMenu';
+import { CloudMenu } from './CloudMenu';
 
 // The caller's API access level as three capabilities — Manage | Demand | Read — each prefixed with a
 // green ✓ when the key grants it, a grey – when not. (Moved off the always-on badge into the menu.)
@@ -83,7 +84,7 @@ export function TopBar() {
   );
 
   const [open, setOpen] = useState(false);
-  const [panel, setPanel] = useState<'secrets' | 'alerts' | null>(null);
+  const [panel, setPanel] = useState<'secrets' | 'alerts' | 'cloud' | null>(null);
   const isMobile = useIsMobile();
 
   const label = catchment?.name || (catchment?.id ? catchment.id.slice(0, 8) : 'Catchment');
@@ -179,6 +180,15 @@ export function TopBar() {
             </button>
           )}
           {isFull && (
+            <button
+              style={{ ...menuItem, color: panel === 'cloud' ? '#e4e4e7' : '#d4d4d8' }}
+              onClick={() => setPanel(panel === 'cloud' ? null : 'cloud')}
+            >
+              <span>Cloud</span>
+              <span style={{ color: '#71717a', fontSize: 11 }}>›</span>
+            </button>
+          )}
+          {isFull && (
             <button style={{ ...menuItem, color: '#d4d4d8' }} onClick={() => { enterSelector(); close(); }}>
               <span>Pond Actions…</span>
             </button>
@@ -186,6 +196,7 @@ export function TopBar() {
 
           {panel === 'secrets' && <Popout onClose={() => setPanel(null)}><SecretsMenu onClose={() => setPanel(null)} /></Popout>}
           {panel === 'alerts' && <Popout onClose={() => setPanel(null)}><AlertsMenu onClose={() => setPanel(null)} /></Popout>}
+          {panel === 'cloud' && <Popout onClose={() => setPanel(null)}><CloudMenu onClose={() => setPanel(null)} /></Popout>}
         </div>
       )}
     </div>

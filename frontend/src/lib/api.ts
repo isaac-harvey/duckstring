@@ -110,10 +110,61 @@ export interface RawPond {
   failure_kind?: 'contract' | 'error' | null; // the failed sub-reason (contract = the schema gate refused the publish)
   immediate_retries: number;
   source_retries: number;
-  // The Duck config (effective size/flock + the raw override); null for Draws/Spouts (no Duck runs them).
-  duck: { size: string; flock: boolean; override: { size: string | null; flock: boolean | null } } | null;
+  // The effective compute config (Duck target/size + Flock posture) with declared/override provenance;
+  // null for Draws/Spouts (no Duck runs them). See plans/cloud-config.md.
+  duck: DuckConfig | null;
   ripples: RawRipple[];
   ripple_edges: [string, string][]; // [sourceName, sinkName] within the Pond
+}
+
+// A named Duck Pool — Catchment-level remote compute (plans/cloud-config.md). On DSC the S/M/L/XL
+// presets are just pools; the picker renders whatever /catchment/duck-pools returns.
+export interface DuckPool {
+  name: string;
+  instance_type: string | null;
+  min_instances: number;
+  max_instances: number;
+  idle_timeout: number | null;
+  keep_warm: number;
+  region: string | null;
+}
+
+// A Pond's effective compute config = override ?? declared ?? Catchment default (coalesce).
+export interface DuckConfig {
+  size: string;
+  duck_target: string; // 'catchment' | a pool name | 'dedicated'
+  remote: boolean;
+  pool: DuckPool | null;
+  dedicated_instance_type: string | null;
+  dedicated_auto_stop: boolean | null;
+  flock_mode: string; // 'off' | 'upgrade' | 'always'
+  flock_engine: string | null;
+  oom_policy: string; // 'fail_up' | 'fail'
+  declared: {
+    duck_target?: string | null;
+    flock_mode?: string | null;
+    flock_engine?: string | null;
+    oom_policy?: string | null;
+  };
+  override: {
+    size: string | null;
+    duck_target: string | null;
+    dedicated_instance_type: string | null;
+    dedicated_auto_stop: boolean | null;
+    flock_mode: string | null;
+    flock_engine: string | null;
+    oom_policy: string | null;
+  };
+  defaults: { size: string; duck_target: string; flock_mode: string; flock_engine: string | null; oom_policy: string };
+}
+
+// The cloud-enable gate — remote data root + AWS creds (plans/cloud-config.md). Surfaced on /api/status
+// so the UI greys out remote-compute options until both hold.
+export interface CloudGate {
+  data_root: string | null;
+  data_root_remote: boolean;
+  aws_configured: boolean;
+  cloud_enabled: boolean;
 }
 
 // The caller's access level — a total order read ⊂ demand ⊂ full. The UI gates its controls on it.
@@ -123,6 +174,7 @@ export interface StatusPayload {
   catchment: { id: string | null; name: string | null } | null; // this Catchment's stable identity
   version: number; // change token for the /api/status long-poll (pass back as ?since=)
   access_level: AccessLevel; // the caller's level (always 'full' when the Catchment is open/unauthed)
+  cloud?: CloudGate; // the cloud-enable gate + reasons (remote data root + AWS creds)
   ponds: RawPond[];
   edges: [string, string][]; // [sourceId, sinkId] — pond keys ("name@major")
 }
@@ -335,12 +387,69 @@ export function setBudget(pond: string, immediateRetries: number, sourceRetries:
   });
 }
 
-// Duck config (preset size + Flock escalation). clear=true drops the override (Catchment defaults).
-export function setDuck(
-  pond: string,
-  body: { size?: string | null; flock?: boolean | null; clear?: boolean },
-): Promise<void> {
+// Compute override (Duck target/size + Flock posture). Only the fields passed change; clear=true drops
+// the whole override (reverts to the pond.toml-declared config, else the Catchment default).
+export interface DuckOverrideBody {
+  size?: string | null;
+  duck_target?: string | null;
+  dedicated_instance_type?: string | null;
+  dedicated_auto_stop?: boolean | null;
+  flock_mode?: string | null;
+  flock_engine?: string | null;
+  oom_policy?: string | null;
+  clear?: boolean;
+}
+
+export function setDuck(pond: string, body: DuckOverrideBody): Promise<void> {
   return postJSON(pondPath(pond, 'duck'), body);
+}
+
+// ─── Cloud config (Catchment-level: the data-plane target + Duck Pools) ───────
+
+export interface CloudSettings extends CloudGate {
+  has_data: boolean; // once true the data root is set-once (switching would strand data)
+}
+
+export function fetchCloudSettings(): Promise<CloudSettings> {
+  return getJSON<CloudSettings>('/catchment/settings');
+}
+
+// Attach the data-plane target (set-once in practice). Returns the updated gate, or throws the 409/422
+// detail (already has data / already configured / unusable root).
+export async function setDataRoot(dataRoot: string): Promise<CloudSettings> {
+  const res = await fetch(`${apiBase()}/catchment/settings`, {
+    method: 'PUT',
+    headers: authHeaders({ 'content-type': 'application/json' }),
+    body: JSON.stringify({ data_root: dataRoot }),
+  });
+  if (res.status === 401) throw new UnauthorizedError();
+  if (!res.ok) throw new Error((await res.json().catch(() => null))?.detail ?? `set data root failed (${res.status})`);
+  return res.json();
+}
+
+export function fetchDuckPools(): Promise<DuckPool[]> {
+  return getJSON<{ pools: DuckPool[] }>('/catchment/duck-pools').then((d) => d.pools);
+}
+
+export function addDuckPool(body: {
+  name: string;
+  instance_type?: string | null;
+  min_instances?: number | null;
+  max_instances?: number | null;
+  keep_warm?: number | null;
+  idle_timeout?: number | null;
+  region?: string | null;
+}): Promise<void> {
+  return postJSON('/catchment/duck-pools', body);
+}
+
+export async function removeDuckPool(name: string): Promise<void> {
+  const res = await fetch(`${apiBase()}/catchment/duck-pools/${encodeURIComponent(name)}`, {
+    method: 'DELETE',
+    headers: authHeaders(),
+  });
+  if (res.status === 401) throw new UnauthorizedError();
+  if (!res.ok) throw new Error(`remove pool failed (${res.status})`);
 }
 
 // ─── Spouts (egress) ─────────────────────────────────────────────────────────
