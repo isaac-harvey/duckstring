@@ -1045,6 +1045,63 @@ class Driver:
             "defaults": d,
         }
 
+    # ─── Duck Pools (Catchment-level named remote compute; plans/cloud-config.md) ──
+
+    _POOL_FIELDS = ("instance_type", "min_instances", "max_instances", "idle_timeout",
+                    "keep_warm", "region")
+
+    def list_pools(self) -> list[dict]:
+        rows = self.db.execute(
+            "SELECT name, instance_type, min_instances, max_instances, idle_timeout, keep_warm, region "
+            "FROM duck_pool ORDER BY name"
+        ).fetchall()
+        cols = ("name", *self._POOL_FIELDS)
+        return [dict(zip(cols, r, strict=True)) for r in rows]
+
+    def add_pool(self, name: str, **fields) -> dict:
+        """Create or update a named Duck Pool (infra config; the EC2 launcher reads it). Validated
+        loosely — a pool is inert until a remote launcher is configured."""
+        if not name or not name.strip():
+            raise ValueError("a pool name is required")
+        vals = {k: fields.get(k) for k in self._POOL_FIELDS}
+        for k in ("min_instances", "max_instances", "keep_warm"):
+            if vals[k] is not None and int(vals[k]) < 0:
+                raise ValueError(f"{k} must be >= 0")
+        mn, mx = vals["min_instances"], vals["max_instances"]
+        if mn is not None and mx is not None and int(mn) > int(mx):
+            raise ValueError("min_instances must be <= max_instances")
+        with self.lock:
+            self.db.execute(
+                "INSERT INTO duck_pool (name, instance_type, min_instances, max_instances, "
+                "idle_timeout, keep_warm, region) VALUES (:name, :instance_type, "
+                "COALESCE(:min_instances, 0), COALESCE(:max_instances, 1), :idle_timeout, "
+                "COALESCE(:keep_warm, 0), :region) "
+                "ON CONFLICT(name) DO UPDATE SET instance_type = excluded.instance_type, "
+                "min_instances = excluded.min_instances, max_instances = excluded.max_instances, "
+                "idle_timeout = excluded.idle_timeout, keep_warm = excluded.keep_warm, "
+                "region = excluded.region",
+                {"name": name, **vals},
+            )
+            self.db.commit()
+            self.duck_pool_names.add(name)
+            self.state_version += 1
+        return self.get_pool(name)
+
+    def get_pool(self, name: str) -> dict | None:
+        for p in self.list_pools():
+            if p["name"] == name:
+                return p
+        return None
+
+    def remove_pool(self, name: str) -> None:
+        """Drop a pool. Ponds pinned to it fall back to the Catchment Duck (the same unknown-pool
+        rule as a portable pond.toml), so removal never strands a Pond."""
+        with self.lock:
+            self.db.execute("DELETE FROM duck_pool WHERE name = ?", (name,))
+            self.db.commit()
+            self.duck_pool_names.discard(name)
+            self.state_version += 1
+
     def sleep(self, pond: str, upstream: bool = False) -> None:
         with self.lock:
             self.state = sleep_pond(self.state, pond, _now(), upstream=upstream)

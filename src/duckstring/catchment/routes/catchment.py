@@ -115,6 +115,45 @@ def put_settings(request: Request, body: _SettingsBody):
     return cloud.cloud_status(new, app.state.secret_store)
 
 
+# ─── Duck Pools (Catchment-level named remote compute) ───────────────────────────
+
+
+class _PoolBody(BaseModel):
+    name: str
+    instance_type: str | None = None
+    min_instances: int | None = None
+    max_instances: int | None = None
+    idle_timeout: int | None = None   # seconds before scale-down
+    keep_warm: int | None = None      # spare capacity beyond current load
+    region: str | None = None
+
+
+@router.get("/catchment/duck-pools", dependencies=[auth.read])
+def list_duck_pools(request: Request):
+    """The defined Duck Pools. A Pool is inert until a remote (EC2) launcher is configured — this is
+    the config a pond.toml `duck = "<pool>"` or an operator override resolves against."""
+    return {"pools": request.app.state.driver.list_pools()}
+
+
+@router.post("/catchment/duck-pools", dependencies=[auth.full])
+def upsert_duck_pool(request: Request, body: _PoolBody):
+    """Create or update a named Duck Pool (it provisions billable infra, so full-gated)."""
+    try:
+        return request.app.state.driver.add_pool(
+            body.name, instance_type=body.instance_type, min_instances=body.min_instances,
+            max_instances=body.max_instances, idle_timeout=body.idle_timeout,
+            keep_warm=body.keep_warm, region=body.region)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+
+
+@router.delete("/catchment/duck-pools/{name}", dependencies=[auth.full])
+def delete_duck_pool(request: Request, name: str):
+    """Drop a pool. Ponds pinned to it fall back to the Catchment Duck (never stranded)."""
+    request.app.state.driver.remove_pool(name)
+    return {"ok": True}
+
+
 class _ResetBody(BaseModel):
     clear_history: bool = False
 

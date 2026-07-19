@@ -14,6 +14,8 @@ from typing import Optional
 import typer
 
 app = typer.Typer(help="Per-Pond compute config: Duck target/size + Flock posture.", no_args_is_help=True)
+pool_app = typer.Typer(help="Duck Pools: Catchment-level named remote compute.", no_args_is_help=True)
+app.add_typer(pool_app, name="pool")
 
 _CATCHMENT = typer.Option(None, "--catchment", "-c", help="Catchment to use (uses default if omitted).")
 _MAJOR = typer.Option(None, "--major", "-m", help="Major version to target (default: latest).")
@@ -113,3 +115,69 @@ def set_(
     else:
         got = _http.get(f"{cfg['url']}/api/ponds/{pond}/duck", auth=cfg, params=params).json()
         typer.echo(f"{pond}: {_fmt(got)}")
+
+
+# ─── Duck Pools ──────────────────────────────────────────────────────────────────
+
+
+def _fmt_pool(p: dict) -> str:
+    bits = [f"{p['name']}"]
+    if p.get("instance_type"):
+        bits.append(p["instance_type"])
+    bits.append(f"min {p['min_instances']} / max {p['max_instances']}")
+    if p.get("keep_warm"):
+        bits.append(f"keep-warm {p['keep_warm']}")
+    if p.get("idle_timeout"):
+        bits.append(f"idle {p['idle_timeout']}s")
+    if p.get("region"):
+        bits.append(p["region"])
+    return "   ".join(bits)
+
+
+@pool_app.command("ls")
+def pool_ls(catchment: Optional[str] = _CATCHMENT) -> None:
+    """List the defined Duck Pools."""
+    from . import _http
+    from .config import resolve_catchment
+    _, cfg = resolve_catchment(catchment)
+    pools = _http.get(f"{cfg['url']}/api/catchment/duck-pools", auth=cfg).json().get("pools", [])
+    if not pools:
+        typer.echo("No Duck Pools defined. Add one: duckstring duck pool add <name> --instance-type <t>")
+        return
+    for p in pools:
+        typer.echo(_fmt_pool(p))
+
+
+@pool_app.command("add")
+def pool_add(
+    name: str = typer.Argument(..., help="Pool name (referenced by pond.toml `duck = \"<name>\"`)."),
+    catchment: Optional[str] = _CATCHMENT,
+    instance_type: Optional[str] = typer.Option(None, "--instance-type", "-t", help="EC2 instance type."),
+    min_instances: Optional[int] = typer.Option(None, "--min", help="Floor / keep-warm baseline."),
+    max_instances: Optional[int] = typer.Option(None, "--max", help="Ceiling."),
+    keep_warm: Optional[int] = typer.Option(None, "--keep-warm", help="Spare capacity beyond current load."),
+    idle_timeout: Optional[int] = typer.Option(None, "--idle-timeout", help="Seconds before scale-down."),
+    region: Optional[str] = typer.Option(None, "--region", help="AWS region (defaults to the Catchment's)."),
+) -> None:
+    """Create or update a named Duck Pool. Inert until a remote launcher is configured."""
+    from . import _http
+    from .config import resolve_catchment
+    _, cfg = resolve_catchment(catchment)
+    body = {"name": name, "instance_type": instance_type, "min_instances": min_instances,
+            "max_instances": max_instances, "keep_warm": keep_warm, "idle_timeout": idle_timeout,
+            "region": region}
+    p = _http.post(f"{cfg['url']}/api/catchment/duck-pools", auth=cfg, json=body).json()
+    typer.echo(_fmt_pool(p))
+
+
+@pool_app.command("rm")
+def pool_rm(
+    name: str = typer.Argument(..., help="Pool to remove."),
+    catchment: Optional[str] = _CATCHMENT,
+) -> None:
+    """Remove a Duck Pool. Ponds pinned to it fall back to the Catchment Duck (never stranded)."""
+    from . import _http
+    from .config import resolve_catchment
+    _, cfg = resolve_catchment(catchment)
+    _http.delete(f"{cfg['url']}/api/catchment/duck-pools/{name}", auth=cfg)
+    typer.echo(f"Removed pool '{name}'.")
