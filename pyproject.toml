@@ -61,6 +61,7 @@ dev = [
   "sqlglot>=23",
   "s3fs>=2023.1",
   "boto3>=1.34",
+  "pg8000>=1.31",
 ]
 
 [tool.setuptools]

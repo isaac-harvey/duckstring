@@ -95,6 +95,30 @@ async def _lifespan(app: FastAPI):
     # Restore: resume any Pond Runs that were in flight when the Catchment last stopped.
     driver.resume_incomplete()
 
+    # Data-serving wire adapters (plans/data-serving.md): the Postgres wire (default) + Arrow Flight SQL,
+    # each on its own port when configured, sharing the sandboxed serving core. Put TLS + a network ACL
+    # in front for a hosted Catchment (the password is an API key).
+    app.state.serve_wires = []
+    pg_port = os.environ.get("DUCKSTRING_SERVE_PG_PORT")
+    if pg_port:
+        from .pg_wire import PgWireServer
+
+        pg = PgWireServer(driver, api_key=app.state.api_key,
+                          host=os.environ.get("DUCKSTRING_SERVE_HOST", "127.0.0.1"), port=int(pg_port))
+        pg.start()
+        app.state.serve_wires.append(pg)
+    flight_port = os.environ.get("DUCKSTRING_SERVE_FLIGHT_PORT")
+    if flight_port:
+        try:
+            from .flight_sql import FlightSqlServer
+
+            fl = FlightSqlServer(driver, api_key=app.state.api_key,
+                                 host=os.environ.get("DUCKSTRING_SERVE_HOST", "127.0.0.1"), port=int(flight_port))
+            fl.start()
+            app.state.serve_wires.append(fl)
+        except ImportError:
+            pass  # Flight needs pyarrow.flight; skip if unavailable
+
     from .alert_worker import run_alert_worker
     from .egress_worker import run_egress_worker
     from .poller import run_poller
@@ -141,6 +165,8 @@ async def _lifespan(app: FastAPI):
             except asyncio.CancelledError:
                 pass
         launcher.shutdown_all()
+        for wire in getattr(app.state, "serve_wires", []):
+            wire.stop()
         if app.state.data_lease is not None:
             from .data_lease import release_lease
 
