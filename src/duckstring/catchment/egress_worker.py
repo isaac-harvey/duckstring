@@ -56,7 +56,14 @@ def _egress_spout(root: Path, job: dict, data_root: str | None = None) -> None:
         dp.prepare(con)
         data_dir.duckdb_setup(con)  # object store → httpfs + credentials (no-op local)
         sidecar = load_sidecar(data_dir)
-        tables = [job["table"]] if job["table"] else dp.list_tables(data_dir)
+        # An explicit table ships just that one; else the source's serviceable set (resolved by
+        # take_spout_jobs), falling back to every published table only when serving isn't in play.
+        if job["table"]:
+            tables = [job["table"]]
+        elif job.get("tables") is not None:
+            tables = [t for t in job["tables"] if t in set(dp.list_tables(data_dir))]
+        else:
+            tables = dp.list_tables(data_dir)
         mode = (job.get("mode") or "auto").lower()
         for table in tables:
             pk = sidecar.get(table, {}).get("pk") or None

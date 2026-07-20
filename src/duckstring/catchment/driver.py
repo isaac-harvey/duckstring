@@ -1506,10 +1506,17 @@ class Driver:
                 # `source_f` is the source's actual published freshness, which the data + CDC cursor ride.
                 src_ps = self.state.pond_states.get(src_key)
                 source_f = _iso(src_ps.end_f) if src_ps and src_ps.end_f > NEVER else _iso(f)
+                # A table-less Spout egresses the source's SERVICEABLE set (its declared public products;
+                # plans/data-serving.md) when serving is in play — resolved live per delivery. With NO
+                # serviceable declaration it falls back to every table (the pre-serving behaviour, so an
+                # existing egress isn't silently stopped). An explicit `table` still ships just that one.
+                serviceable = set() if cfg.get("table") else self.serviceable(src_key)
+                tables = sorted(serviceable) if serviceable else None
                 jobs.append({
                     "spout_key": skey, "f": _iso(f), "source_f": source_f,
                     "pond_name": src["name"], "major": src["major"],
-                    "table": cfg.get("table"), "destination": cfg.get("destination"), "mode": cfg.get("mode"),
+                    "table": cfg.get("table"), "tables": tables,
+                    "destination": cfg.get("destination"), "mode": cfg.get("mode"),
                 })
             self._pending_egress = []
             return jobs

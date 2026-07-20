@@ -478,9 +478,14 @@ def add_spout(
 ):
     """Bind a Spout to a Pond (egress its output to an external destination). 422 on a bad
     destination/mode or a duplicate name. Returns the Spout's (possibly generated) name."""
+    driver = _driver(request)
+    # Default the Spout's major to the SERVED major (plans/data-serving.md) — but only as a creation
+    # default; the Spout is then pinned + independent of later serving promotions.
+    if major is None and version is None:
+        major = driver.served_major(name)
     key = _resolve(request, name, major, version)
     try:
-        final = _driver(request).add_spout(key, body.name, body.table, body.destination, body.mode)
+        final = driver.add_spout(key, body.name, body.table, body.destination, body.mode)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     return {"ok": True, "name": final}
