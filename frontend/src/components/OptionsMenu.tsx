@@ -78,6 +78,7 @@ export function TopBar() {
   const collapsedPonds = useLiveStore((s) => s.collapsedPonds);
   const setAllCollapsed = useLiveStore((s) => s.setAllCollapsed);
   const enterSelector = useLiveStore((s) => s.enterSelector);
+  const setCatalogOpen = useLiveStore((s) => s.setCatalogOpen);
   // Stable key over the collapsible Pond ids — avoids re-rendering on every poll.
   const collapsibleKey = useLiveStore((s) =>
     [...new Set(Object.values(s.ripples).map((r) => r.pondId))].sort().join(',')
@@ -161,6 +162,10 @@ export function TopBar() {
               <span style={{ color: '#71717a', fontSize: 11 }}>{allCollapsed ? '▸' : '▾'}</span>
             </button>
           )}
+          <button style={menuItem} onClick={() => { setCatalogOpen(true); close(); }}>
+            <span>Catalog</span>
+            <span style={{ color: '#71717a', fontSize: 11 }}>⊟</span>
+          </button>
           {isFull && (
             <button
               style={{ ...menuItem, color: panel === 'secrets' ? '#e4e4e7' : '#d4d4d8' }}

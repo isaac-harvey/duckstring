@@ -550,6 +550,51 @@ export async function removeSecret(name: string): Promise<void> {
   if (!res.ok) throw new Error(`remove secret failed (${res.status})`);
 }
 
+// ─── Data serving (the Catalog — plans/data-serving.md) ─────────────────────
+
+export interface CatalogTable {
+  table: string;
+  exposed: boolean;
+  source: string; // 'declared' | 'override' | 'hidden'
+  major: number;
+}
+
+export interface CatalogPond {
+  name: string;
+  served_major: number;
+  majors: number[];
+  tables: CatalogTable[];
+}
+
+export interface Catalog {
+  catchment: string | null;
+  ponds: CatalogPond[];
+  connect: Record<string, string>; // {pg: "host:port", flight: "host:port"} for configured wires
+}
+
+export function fetchCatalog(): Promise<Catalog> {
+  return getJSON<Catalog>('/serve');
+}
+
+export async function serveQuery(sql: string, limit = 1000): Promise<{ columns: string[]; rows: unknown[][] }> {
+  const res = await fetch(`${apiBase()}/serve/query`, {
+    method: 'POST',
+    headers: authHeaders({ 'content-type': 'application/json' }),
+    body: JSON.stringify({ sql, limit }),
+  });
+  if (res.status === 401) throw new UnauthorizedError();
+  if (!res.ok) throw new Error((await res.json().catch(() => null))?.detail ?? `query failed (${res.status})`);
+  return res.json();
+}
+
+export function promoteServe(pond: string, major: number): Promise<void> {
+  return postJSON(`/ponds/${encodeURIComponent(pond)}/serve/promote`, { major });
+}
+
+export function exposeTable(pond: string, table: string, exposed: boolean | null, major?: number): Promise<void> {
+  return postJSON(pondPath(pond, 'serve/expose') + (major != null ? `?major=${major}` : ''), { table, exposed });
+}
+
 // ─── Alerts (failure & freshness notification channels — full-gated) ─────────
 
 export interface RawAlertChannel {

@@ -225,6 +225,8 @@ export interface LiveState extends StatusSlice {
 
   // The Pond whose exported tables are open in the full-screen data viewer (null = closed). The modal
   // owns its own table-selection / SQL / windowing state; the store just tracks the target.
+  catalogOpen: boolean;
+  setCatalogOpen(open: boolean): void;
   dataViewerPondId: PondId | null;
   openDataViewer(id: PondId): void;
   closeDataViewer(): void;
@@ -358,6 +360,8 @@ export const useLiveStore = create<LiveState>((set, get) => ({
   selectedRippleId: null,
   selectedTriggerId: null,
   collapsedPonds: {},
+  catalogOpen: false,
+  setCatalogOpen: (open) => set({ catalogOpen: open }),
   dataViewerPondId: null,
 
   runs: [],

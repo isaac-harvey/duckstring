@@ -49,10 +49,13 @@ class _AuthMiddlewareFactory(flight.ServerMiddlewareFactory):
 
 
 class FlightSqlServer(flight.FlightServerBase):
+    kind = "flight"
+
     def __init__(self, driver, *, api_key: str | None = None, host: str = "127.0.0.1", port: int = 0):
         location = f"grpc://{host}:{port}"
         super().__init__(location, middleware={"auth": _AuthMiddlewareFactory(driver, api_key)})
         self.driver = driver
+        self.host = host
         self._thread: threading.Thread | None = None
 
     def _level(self, context) -> auth.Level:

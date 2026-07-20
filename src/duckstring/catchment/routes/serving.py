@@ -47,7 +47,11 @@ def catalog(request: Request, principal: auth.Principal = Depends(auth.get_princ
                     if full or d["exposed"]:
                         tables.append({**d, "major": major})
             ponds.append({"name": name, "served_major": served, "majors": majors, "tables": tables})
-    return {"catchment": (driver.status().get("catchment") or {}).get("name"), "ponds": ponds}
+    connect = {}
+    for wire in getattr(request.app.state, "serve_wires", []):
+        connect[getattr(wire, "kind", "?")] = f"{getattr(wire, 'host', '127.0.0.1')}:{wire.port}"
+    return {"catchment": (driver.status().get("catchment") or {}).get("name"), "ponds": ponds,
+            "connect": connect}
 
 
 class _QueryBody(BaseModel):

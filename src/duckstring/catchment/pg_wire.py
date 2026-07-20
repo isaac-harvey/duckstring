@@ -116,6 +116,8 @@ def _tag_for(sql: str, n: int) -> str:
 
 
 class PgWireServer:
+    kind = "pg"
+
     def __init__(self, driver, *, api_key: str | None = None, host: str = "127.0.0.1", port: int = 5433):
         self.driver = driver
         self.api_key = api_key
