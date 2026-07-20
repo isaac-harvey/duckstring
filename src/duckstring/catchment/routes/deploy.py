@@ -105,6 +105,13 @@ def _pond_config(toml_path: Path) -> dict:
     cfg["flock_mode"] = _validate_choice(flock.get("mode"), ("off", "upgrade", "always"), "[flock] mode")
     cfg["flock_engine"] = flock.get("engine")
     cfg["oom_policy"] = _validate_choice(flock.get("oom_policy"), ("fail_up", "fail"), "[flock] oom_policy")
+    # DECLARED serviceable tables (the pond's public data products; plans/data-serving.md). Absent ⇒
+    # nothing served (opt tables IN). A hint — operationally overridable, reset to this on a new major.
+    serve = info.get("serve", {})
+    tables = serve.get("tables", [])
+    if not isinstance(tables, list) or any(not isinstance(t, str) for t in tables):
+        raise ValueError("pond.toml [serve] tables: expected a list of table names")
+    cfg["serve_tables"] = tables
     return cfg
 
 
@@ -312,6 +319,16 @@ def _register(db, name, version, kind, source_path, cfg, ripples) -> None:
             "INSERT OR IGNORE INTO pond_retry (pond_id, immediate_retries, source_retries) VALUES (?, ?, ?)",
             (pond_id, cfg["immediate_retries"], cfg["source_retries"]),
         )
+
+        # DECLARED serviceable set (pond.toml [serve] tables) — re-read every deploy onto the artifact.
+        db.execute("DELETE FROM pond_version_serve WHERE pond_version_id = ?", (pv_id,))
+        for tbl in cfg.get("serve_tables", []):
+            db.execute("INSERT INTO pond_version_serve (pond_version_id, table_name) VALUES (?, ?)",
+                       (pv_id, tbl))
+        # Seed the served-major pointer on first deploy of this name (the first-deployed = lowest major
+        # in the usual v1-before-v2 flow); it moves thereafter only via `serve promote`.
+        db.execute("INSERT OR IGNORE INTO pond_serve (pond_name_id, served_major) VALUES (?, ?)",
+                   (pn_id, major))
 
         name_to_id: dict[str, int] = {}
         for r in ripples:

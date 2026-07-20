@@ -1132,6 +1132,96 @@ class Driver:
             self.duck_pool_names.discard(name)
             self.state_version += 1
 
+    # ─── Data serving: the exposure model + the served-major pointer (plans/data-serving.md) ──
+
+    def _pond_ids(self, pond_key: str) -> tuple[int, int, int, str, int]:
+        """(pond_id, pond_version_id, pond_name_id, name, major) for a pond key."""
+        m = self.meta[pond_key]
+        row = self.db.execute(
+            "SELECT p.id, p.pond_version_id, p.pond_name_id, p.major FROM pond p WHERE p.id = ?",
+            (m["pond_id"],),
+        ).fetchone()
+        return (row[0], row[1], row[2], m["name"], row[3])
+
+    def _output_tables(self, pond_version_id: int) -> set[str]:
+        return {r[0] for r in self.db.execute(
+            'SELECT DISTINCT "table" FROM pond_version_schema WHERE pond_version_id = ?',
+            (pond_version_id,))}
+
+    def serve_detail(self, pond_key: str) -> list[dict]:
+        """Per output table: its effective exposure + source (declared/override/hidden) — the Catalog
+        table list. Effective = override ?? (table ∈ declared serviceable)."""
+        pond_id, pv_id, _, _, _ = self._pond_ids(pond_key)
+        declared = {r[0] for r in self.db.execute(
+            "SELECT table_name FROM pond_version_serve WHERE pond_version_id = ?", (pv_id,))}
+        overrides = {r[0]: bool(r[1]) for r in self.db.execute(
+            "SELECT table_name, exposed FROM pond_serve_override WHERE pond_id = ?", (pond_id,))}
+        tables = self._output_tables(pv_id) | set(overrides)
+        out = []
+        for t in sorted(tables):
+            if t in overrides:
+                exposed, source = overrides[t], "override"
+            else:
+                exposed, source = (t in declared), ("declared" if t in declared else "hidden")
+            out.append({"table": t, "exposed": exposed, "source": source})
+        return out
+
+    def serviceable(self, pond_key: str) -> set[str]:
+        """The effective exposed (serviceable) tables for a pond line — the serving core's allowlist."""
+        return {d["table"] for d in self.serve_detail(pond_key) if d["exposed"]}
+
+    def set_exposed(self, pond_key: str, table: str, exposed: bool | None) -> None:
+        """Toggle the operational eye override for a table: True/False sets an explicit override,
+        None clears it (reverts to the pond.toml-declared default). Persists on the pond line (survives
+        a minor redeploy; a new major line starts fresh)."""
+        pond_id = self.meta[pond_key]["pond_id"]
+        with self.lock:
+            if exposed is None:
+                self.db.execute("DELETE FROM pond_serve_override WHERE pond_id = ? AND table_name = ?",
+                                (pond_id, table))
+            else:
+                self.db.execute(
+                    "INSERT INTO pond_serve_override (pond_id, table_name, exposed) VALUES (?, ?, ?) "
+                    "ON CONFLICT(pond_id, table_name) DO UPDATE SET exposed = excluded.exposed",
+                    (pond_id, table, int(exposed)))
+            self.db.commit()
+            self.state_version += 1
+
+    def served_major(self, name: str) -> int | None:
+        row = self.db.execute(
+            "SELECT ps.served_major FROM pond_serve ps JOIN pond_name pn ON pn.id = ps.pond_name_id "
+            "WHERE pn.name = ?", (name,)).fetchone()
+        return row[0] if row else None
+
+    def deployed_majors(self, name: str) -> list[int]:
+        return [r[0] for r in self.db.execute(
+            "SELECT p.major FROM pond p JOIN pond_name pn ON pn.id = p.pond_name_id "
+            "WHERE pn.name = ? ORDER BY p.major", (name,))]
+
+    def promote(self, name: str, major: int) -> None:
+        """Flip the served-major pointer (blue-green). Validated: the target major must publish every
+        table currently exposed on the served major, so a promotion never 404s a live query."""
+        from ..keys import pond_key
+        majors = self.deployed_majors(name)
+        if major not in majors:
+            raise ValueError(f"'{name}@{major}' is not deployed")
+        current = self.served_major(name)
+        if current is not None and current in majors:
+            exposed_now = self.serviceable(pond_key(name, current))
+            target_out = self._output_tables(self._pond_ids(pond_key(name, major))[1])
+            missing = exposed_now - target_out
+            if missing:
+                raise ValueError(
+                    f"'{name}@{major}' doesn't publish currently-served table(s): {', '.join(sorted(missing))}")
+        with self.lock:
+            (pn_id,) = self.db.execute("SELECT id FROM pond_name WHERE name = ?", (name,)).fetchone()
+            self.db.execute(
+                "INSERT INTO pond_serve (pond_name_id, served_major) VALUES (?, ?) "
+                "ON CONFLICT(pond_name_id) DO UPDATE SET served_major = excluded.served_major",
+                (pn_id, major))
+            self.db.commit()
+            self.state_version += 1
+
     def sleep(self, pond: str, upstream: bool = False) -> None:
         with self.lock:
             self.state = sleep_pond(self.state, pond, _now(), upstream=upstream)

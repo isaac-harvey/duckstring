@@ -73,6 +73,7 @@ src/duckstring/
     relay.py                 #   RelayManager: the auto-relay (ssh -R reverse tunnel via a tiny EC2 box) so a LOCAL Catchment behind NAT can run cloud Ducks with no manual tunnel; rides the RemoteDialback pending/drain seam, TTL-watchdog self-terminate. See Duck launchers
     db.py                  #   SQLite connect + migration runner
     secrets.py             #   SecretStore — the write-only catchment secret store (secrets.json, 0600, names-only read; see Secrets)
+    serving.py             #   The serving core (plans/data-serving.md): one warm/resident/SANDBOXED read-only DuckDB executor over the published data — catchment=catalog, pond=schema (served major + _vN), serviceable-gated. Read users get materialised-local tables + enable_external_access=false (the teeth); full users get views over all output tables. Increment 1 (model + core); wire adapters (pg/Flight) + Catalog UI are follow-ups.
     schema/001_init.sql    #   Database schema (see below)
     routes/                #   deploy, orchestrate (triggers/control/status/runs/windows/spouts), secrets, alerts, metrics (Prometheus /metrics), duck (jobs/events), data (parquet), catchment (health)
     registry.py, dag.py    #   pond DuckDB registry paths; inter-pond cycle check
