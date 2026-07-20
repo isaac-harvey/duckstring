@@ -94,14 +94,52 @@ def _relation_exists(con, schema: str, table: str) -> bool:
         [schema, table]).fetchone() is not None
 
 
+class ServingCache:
+    """Warm serving connections, keyed by sandboxed-ness. Rebuilt when the Driver's ``state_version``
+    moves (a deploy / promote / eye-toggle / new run) — so the surface stays fresh (snapshot-consistent)
+    without re-materialising the whole catalog on every query. Each query runs on its own ``cursor()``
+    over the shared connection (DuckDB cursors are independent; the sandbox settings are instance-global,
+    so they hold across cursors)."""
+
+    def __init__(self):
+        self._cache: dict[bool, tuple[int, object]] = {}
+
+    def connection(self, driver, *, sandboxed: bool):
+        version = driver.state_version
+        entry = self._cache.get(sandboxed)
+        if entry is not None and entry[0] == version:
+            return entry[1]
+        if entry is not None:
+            try:
+                entry[1].close()
+            except Exception:
+                pass
+        con = build_serving_con(driver, sandboxed=sandboxed)
+        self._cache[sandboxed] = (version, con)
+        return con
+
+    def close(self):
+        for _, con in self._cache.values():
+            try:
+                con.close()
+            except Exception:
+                pass
+        self._cache.clear()
+
+
+def _cache(driver) -> ServingCache:
+    cache = getattr(driver, "_serving_cache", None)
+    if cache is None:
+        cache = ServingCache()
+        driver._serving_cache = cache
+    return cache
+
+
 def serving_query(driver, sql: str, *, sandboxed: bool = True) -> dict:
-    """Run a read-only query against the serving surface. Returns {columns, rows}. Read users get the
-    sandboxed connection (serviceable-only, no external access); full users get the ops connection."""
-    con = build_serving_con(driver, sandboxed=sandboxed)
-    try:
-        cur = con.execute(sql)
-        columns = [d[0] for d in cur.description] if cur.description else []
-        rows = cur.fetchall()
-        return {"columns": columns, "rows": rows}
-    finally:
-        con.close()
+    """Run a read-only query against the (warm) serving surface. Returns {columns, rows}. Read users get
+    the sandboxed connection (serviceable-only, no external access); full users get the ops connection."""
+    cur = _cache(driver).connection(driver, sandboxed=sandboxed).cursor()
+    cur.execute(sql)
+    columns = [d[0] for d in cur.description] if cur.description else []
+    rows = cur.fetchall()
+    return {"columns": columns, "rows": rows}
