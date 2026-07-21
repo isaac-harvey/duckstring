@@ -81,7 +81,9 @@ function CatalogModal({ preselect, onClose }: { preselect: string | null; onClos
   const [active, setActive] = useState<string | null>(null);
   const [treeMajor, setTreeMajor] = useState<Record<string, number>>({});
   const [search, setSearch] = useState('');
-  const [leftCollapsed, setLeftCollapsed] = useState(false);
+  // Opened from a Pond (preselect) → start focused on that Pond (tree collapsed); from Options → Catalog
+  // → start with the tree open to browse.
+  const [leftCollapsed, setLeftCollapsed] = useState(!!preselect);
   const [pending, setPending] = useState<Pending | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const nonce = useRef(1);
@@ -235,6 +237,8 @@ function PondTree({
           const isActive = p.name === active;
           const major = treeMajor[p.name] ?? p.served_major;
           const tables = p.tables.filter((t) => t.major === major);
+          // Expand the active pond, and (while searching) any pond that holds a matching table.
+          const showTables = isActive || (search !== '' && p.tables.some((t) => t.table.includes(search)));
           return (
             <div key={p.name}>
               <div
@@ -245,7 +249,7 @@ function PondTree({
                   color: isActive ? '#f4f4f5' : '#c4c4c8',
                 }}
               >
-                <span style={{ color: '#71717a', fontSize: 10, width: 8 }}>{isActive ? '▾' : '▸'}</span>
+                <span style={{ color: '#71717a', fontSize: 10, width: 8 }}>{showTables ? '▾' : '▸'}</span>
                 <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                   {p.name}
                 </span>
@@ -253,21 +257,24 @@ function PondTree({
                   value={major}
                   onClick={(e) => e.stopPropagation()}
                   onChange={(e) => onPickMajor(p.name, Number(e.target.value))}
-                  title="Major line — determines the tables shown below"
+                  title="Major line — the served major is green; determines the tables shown below"
                   style={{
                     appearance: 'none', WebkitAppearance: 'none', MozAppearance: 'none',
                     background: '#18181b', border: '1px solid #3f3f46', borderRadius: 5, padding: '2px 6px',
-                    color: '#a1a1aa', fontSize: 11, fontFamily: 'inherit', outline: 'none', cursor: 'pointer',
+                    color: major === p.served_major ? THEME_SUCCESS : '#a1a1aa', fontSize: 11,
+                    fontFamily: 'inherit', outline: 'none', cursor: 'pointer',
                   }}
                 >
                   {p.majors.map((m) => (
-                    <option key={m} value={m} style={{ fontWeight: m === p.served_major ? 700 : 400 }}>
-                      v{m}{m === p.served_major ? ' · served' : ''}
+                    <option key={m} value={m}
+                            style={{ color: m === p.served_major ? THEME_SUCCESS : undefined,
+                                     fontWeight: m === p.served_major ? 700 : 400 }}>
+                      v{m}
                     </option>
                   ))}
                 </select>
               </div>
-              {isActive && (
+              {showTables && (
                 <div style={{ padding: '2px 0 6px 0' }}>
                   {tables.map((t) => (
                     <TableRow key={t.table} pond={p.name} major={major} t={t} canManage={canManage}
@@ -321,7 +328,6 @@ function TableRow({
                      cursor: 'pointer', fontSize: 12, color: t.exposed ? '#e4e4e7' : '#71717a' }}>
         {t.table}
       </span>
-      {canManage && <span style={{ color: '#52525b', fontSize: 10 }}>{t.source}</span>}
       <button onClick={copy} title={`Copy ${copyName(pond, major, t.table)}`}
               style={{ background: 'transparent', border: 'none', cursor: 'pointer', padding: '0 2px',
                        color: copied ? THEME_SUCCESS : '#71717a', fontSize: 11, fontFamily: 'inherit' }}>
@@ -544,8 +550,9 @@ function DataViewer({
           {leftCollapsed ? '›' : '‹'}
         </button>
         <span style={{ fontSize: 13, fontWeight: 700, color: '#e4e4e7' }}>{pondName}</span>
-        <span style={{ fontSize: 11, color: major === servedMajor ? THEME_SUCCESS : '#71717a' }}>
-          v{major}{major === servedMajor ? ' · served' : ''}
+        <span title={major === servedMajor ? 'the served (default) major' : undefined}
+              style={{ fontSize: 11, color: major === servedMajor ? THEME_SUCCESS : '#71717a' }}>
+          v{major}
         </span>
         {canPromote && (
           <button
@@ -553,7 +560,7 @@ function DataViewer({
             title={`Make v${major} the served (default) major`}
             style={{ ...chip, color: THEME_SUCCESS, borderColor: THEME_SUCCESS }}
           >
-            Promote to served
+            Promote
           </button>
         )}
         {hasObjects && tables && tables.length > 0 && (
