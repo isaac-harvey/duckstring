@@ -36,21 +36,36 @@ def extract_schema(con) -> Schema:
     """The output schema of every published table in a Pond's registry connection
     (``{table: {column: type}}``).
 
-    A Trickle's ``__changelog``/``__droplog`` companions are framework-internal (CDC / dropped-row
-    diagnostic), and ``_duckstring_*`` system columns are framework-owned — all excluded so the contract
-    captures only the user-facing output schema."""
-    from .dataplane import RESERVED_PREFIX, registry_tables
-    from .trickle_io import CHANGELOG_SUFFIX, DROPLOG_SUFFIX
+    Trickle companions (``__changelog``/``__droplog``/``__band``/``__base``) are framework-internal, and
+    ``_duckstring_*`` system columns are framework-owned — all excluded so the contract captures only the
+    user-facing output schema.
 
-    return {
-        table: {
+    A **merge main** is log-structured: its physical base table (same name) is materialised only at the
+    first checkpoint (compaction), so before then the registry holds only the ``__changelog``. The main's
+    user-facing schema is nonetheless well-defined from run 1 — it is exactly the changelog's user columns
+    — so a changelog is taken as evidence of its merge main and described from it. Without this, an
+    un-compacted merge main is invisible to the contract, the catalog, and column lineage."""
+    from .dataplane import RESERVED_PREFIX, registry_tables
+    from .trickle_io import BASE_SUFFIX, CHANGELOG_SUFFIX, DROPLOG_SUFFIX, WARM_SUFFIX, base_table_name
+
+    def _cols(table: str) -> dict[str, str]:
+        return {
             row[0]: row[1]
             for row in con.execute(f'DESCRIBE "{table}"').fetchall()
             if not str(row[0]).startswith(RESERVED_PREFIX)
         }
-        for table in registry_tables(con)
-        if not table.endswith((CHANGELOG_SUFFIX, DROPLOG_SUFFIX))
-    }
+
+    out: Schema = {}
+    for table in registry_tables(con):
+        if table.endswith(CHANGELOG_SUFFIX):
+            # The merge main — its user schema is the changelog's user columns (available before the
+            # base is materialised). A physical base (below) overrides with the same columns.
+            out.setdefault(base_table_name(table), _cols(table))
+        elif table.endswith((DROPLOG_SUFFIX, WARM_SUFFIX, BASE_SUFFIX)):
+            continue  # framework-internal Trickle companions — never an output on their own
+        else:
+            out[table] = _cols(table)  # a plain table, an append history, or a checkpointed merge base
+    return out
 
 
 def contract_violations(output: Schema, contract: Schema | None) -> list[str]:

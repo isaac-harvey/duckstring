@@ -38,6 +38,35 @@ def test_dropped_column_removed_table_and_type_change_are_violations():
     assert "side" in msgs and "no longer produced" in msgs
 
 
+# ── extract_schema over a live registry (Trickle-aware) ─────────────────────────
+
+
+def test_extract_schema_covers_uncompacted_merge_main():
+    """Regression: a merge Trickle's physical base table (same name) is only materialised at the first
+    checkpoint, so before then the registry holds only ``{name}__changelog``. The main's user schema
+    must still be captured (from the changelog) — else the contract, catalog, and column lineage all
+    miss it until it compacts. Append history + companions behave as expected."""
+    from datetime import datetime, timezone
+
+    import duckdb
+
+    from duckstring.schema_contract import extract_schema
+    from duckstring.trickle import io as tio
+
+    con = duckdb.connect()
+    con.execute("SET TimeZone='UTC'")
+    f = datetime(2020, 1, 1, tzinfo=timezone.utc)
+    tio.merge_table(con, "product", con.sql("SELECT 1 AS product_id, 'p' AS name"), f, ("product_id",))
+    tio.append_table(con, "order_line", con.sql("SELECT 2 AS order_id, 5 AS qty"), f, pk=("order_id",))
+
+    schema = extract_schema(con)
+    # The merge main is present with its user columns — no physical base table exists yet.
+    assert schema["product"] == {"product_id": "INTEGER", "name": "VARCHAR"}
+    assert schema["order_line"] == {"order_id": "INTEGER", "qty": "INTEGER"}
+    # No framework companions (changelog/droplog/band/base) or system columns leak in.
+    assert not any(k.startswith("_") or "__" in k for k in schema)
+
+
 # ── Catchment: capture + forward-only contract + block ──────────────────────────
 
 _CFG_INLET = {"sources": {}, "immediate_retries": 0, "source_retries": 0, "kind": "inlet"}
