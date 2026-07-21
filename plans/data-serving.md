@@ -164,6 +164,20 @@ CREATE TABLE pond_serve (                    -- the served-major pointer, per na
 **Increment 3 — Postgres wire adapter** (the introspection is the work). **Increment 4 — Flight SQL.**
 **Increment 5 — egress table-subset + served-major default.** **Increment 6 — the Catalog UI.**
 
+**Increment 7 — unify the query surface + govern data access (this commit set).**
+1. The custom-`sql` branch of `/api/query/count` + `/api/query/page` now runs through the **serving core**
+   (`serving.py` `serving_count`/`serving_page`) — cross-pond joins within the Catchment, sandboxed to the
+   serviceable surface unless the caller is full — the same brain `/serve/query` + the pg/Flight wires use.
+   The per-pond `table`/`trickle` browse stays on the Pond's exported snapshot (freshness windows, history).
+2. **Governance by role, everywhere:** a non-full caller sees only serviceable tables in the picker
+   (`list_pond_tables`), may not browse/history/freshness a hidden table (`_require_serviceable` → 403), and
+   its custom SQL is sandboxed. Full sees + manages everything.
+3. **UI:** the Catalog and the Data Viewer are **one modal** (`DataViewerModal` → `CatalogModal`) — opened
+   from Options → Catalog or a Pond's table icon (that Pond+Major preselected). A collapsible left pond-tree
+   (per-pond version dropdown, served major bold; expandable table list with exposure eyes + copy-with-✓ that
+   always emits the `_vN` name) drives the embedded viewer; Promote moved into the viewer's top row. The old
+   full-page `CatalogView` + the `serveQuery` client are gone.
+
 ## Deferred
 
 - **Federated cross-Catchment query** (query upstream tables *through* this Catchment over ducts) — the
