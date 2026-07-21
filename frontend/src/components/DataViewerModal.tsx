@@ -237,6 +237,8 @@ function PondTree({
           const isActive = p.name === active;
           const major = treeMajor[p.name] ?? p.served_major;
           const tables = p.tables.filter((t) => t.major === major);
+          // While searching, list only the matching tables; otherwise the whole (selected-major) set.
+          const shown = search ? tables.filter((t) => t.table.includes(search)) : tables;
           // Expand the active pond, and (while searching) any pond that holds a matching table.
           const showTables = isActive || (search !== '' && p.tables.some((t) => t.table.includes(search)));
           return (
@@ -276,14 +278,14 @@ function PondTree({
               </div>
               {showTables && (
                 <div style={{ padding: '2px 0 6px 0' }}>
-                  {tables.map((t) => (
+                  {shown.map((t) => (
                     <TableRow key={t.table} pond={p.name} major={major} t={t} canManage={canManage}
                               onPick={() => onPickTable(p.name, major, t.table)}
                               onExpose={() => onExpose(p.name, major, t)} />
                   ))}
-                  {tables.length === 0 && (
+                  {shown.length === 0 && (
                     <div style={{ padding: '4px 10px 4px 24px', color: '#52525b', fontSize: 11.5 }}>
-                      No {canManage ? '' : 'serviceable '}tables on v{major}.
+                      {search ? 'No matching tables.' : `No ${canManage ? '' : 'serviceable '}tables on v${major}.`}
                     </div>
                   )}
                 </div>
