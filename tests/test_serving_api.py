@@ -59,6 +59,8 @@ def _client(tmp_path, monkeypatch):
     app.include_router(router, prefix="/api")
     app.state.driver = driver
     app.state.db = db
+    app.state.root = tmp_path  # the per-pond browse path (_open_pond) reads exported Parquet from here
+    app.state.data_root = None
     return TestClient(app), driver, db
 
 
@@ -108,6 +110,48 @@ def test_promote_validates(tmp_path, monkeypatch):
     driver.reload()
     assert client.post("/api/ponds/sales/serve/promote", json={"major": 2}).status_code == 200
     assert driver.served_major("sales") == 2
+
+
+def test_query_page_is_cross_pond(tmp_path, monkeypatch):
+    # The paged data-viewer surface routes custom `sql` through the serving core, so a query can JOIN
+    # across ponds within the catchment (the browse-by-table path stays single-pond).
+    client, driver, db = _client(tmp_path, monkeypatch)
+    _register(db, "orders", "1.0.0", "outlet", "ponds/orders/1.0.0", _cfg(["line"]), _RIPPLES)
+    _schema(db, _pv(db, "orders", "1.0.0"), ["line"])
+    _publish(tmp_path, "orders", 1, "line", 7)
+    driver.reload()
+    sql = "SELECT count(*) AS n FROM sales.revenue r JOIN orders.line o ON r.id = o.id"
+    page = client.post("/api/query/page", json={"pond": "sales", "sql": sql, "limit": 100}).json()
+    assert page["columns"] == ["n"] and page["rows"] == [[7]]
+    assert client.post("/api/query/count", json={"pond": "sales", "sql": sql}).json()["count"] == 1
+
+
+def test_role_gates_serviceable_surface(tmp_path, monkeypatch):
+    # Governance: a non-full caller sees + touches only serviceable tables; full sees everything.
+    from duckstring.catchment import auth
+
+    client, _, db = _client(tmp_path, monkeypatch)
+    keys = auth.generate(db, ["read", "demand", "full"])
+    read = {"Authorization": f"Bearer {keys['read']}"}
+    full = {"Authorization": f"Bearer {keys['full']}"}
+
+    # The table picker: read sees only the serviceable `revenue`; full sees the hidden one too.
+    rtabs = {t["name"] for t in client.get("/api/ponds/sales/tables", headers=read).json()["tables"]}
+    ftabs = {t["name"] for t in client.get("/api/ponds/sales/tables", headers=full).json()["tables"]}
+    assert rtabs == {"revenue"} and {"revenue", "secret_internal"} <= ftabs
+
+    # Browse: read may read the serviceable table, not the hidden one (403). Full reaches both.
+    assert client.post("/api/query/count", json={"pond": "sales", "table": "revenue"}, headers=read).status_code == 200
+    assert client.post("/api/query/count", json={"pond": "sales", "table": "secret_internal"},
+                       headers=read).status_code == 403
+    assert client.post("/api/query/count", json={"pond": "sales", "table": "secret_internal"},
+                       headers=full).status_code == 200
+
+    # Custom sql: read is sandboxed to the serviceable surface — the hidden table isn't even materialised.
+    assert client.post("/api/query/page", json={"pond": "sales", "sql": "SELECT * FROM sales.secret_internal"},
+                       headers=read).status_code == 400
+    assert client.post("/api/query/page", json={"pond": "sales", "sql": "SELECT * FROM sales.secret_internal"},
+                       headers=full).status_code == 200
 
 
 def test_route_audit_boots_with_serving_routes(tmp_path, monkeypatch):

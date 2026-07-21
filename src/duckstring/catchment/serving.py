@@ -143,3 +143,34 @@ def serving_query(driver, sql: str, *, sandboxed: bool = True) -> dict:
     columns = [d[0] for d in cur.description] if cur.description else []
     rows = cur.fetchall()
     return {"columns": columns, "rows": rows}
+
+
+def _json_safe(v):
+    """Coerce a DuckDB cell to something JSON can carry (mirrors routes.data._json_safe)."""
+    if v is None or isinstance(v, (bool, int, float, str)):
+        return v
+    return str(v)
+
+
+def serving_count(driver, sql: str, *, sandboxed: bool = True) -> int:
+    """Total rows of a cross-pond serving query — sizes the data viewer's virtual scroll."""
+    inner = sql.strip().rstrip(";")
+    cur = _cache(driver).connection(driver, sandboxed=sandboxed).cursor()
+    (n,) = cur.execute(f"SELECT count(*) FROM ({inner}) AS _ds_count").fetchone()
+    return int(n)
+
+
+def serving_page(driver, sql: str, *, sandboxed: bool = True, limit: int = 200, offset: int = 0,
+                 order_by: str | None = None, order_desc: bool = False) -> dict:
+    """A paged read of a cross-pond serving query (the data viewer's query mode): wraps the SQL with an
+    optional ORDER BY + LIMIT/OFFSET and returns {columns, rows, has_more}. One row beyond the page is
+    fetched to flag ``has_more`` without a separate count."""
+    inner = sql.strip().rstrip(";")
+    order = f" ORDER BY {_qi(order_by)} {'DESC' if order_desc else 'ASC'}" if order_by else ""
+    cur = _cache(driver).connection(driver, sandboxed=sandboxed).cursor()
+    rel = cur.execute(f"SELECT * FROM ({inner}) AS _ds_page{order} LIMIT {limit + 1} OFFSET {offset}")
+    cols = [d[0] for d in rel.description] if rel.description else []
+    fetched = rel.fetchall()
+    has_more = len(fetched) > limit
+    rows = [[_json_safe(c) for c in row] for row in fetched[:limit]]
+    return {"columns": cols, "rows": rows, "has_more": has_more}
