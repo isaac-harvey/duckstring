@@ -576,16 +576,8 @@ export function fetchCatalog(): Promise<Catalog> {
   return getJSON<Catalog>('/serve');
 }
 
-export async function serveQuery(sql: string, limit = 1000): Promise<{ columns: string[]; rows: unknown[][] }> {
-  const res = await fetch(`${apiBase()}/serve/query`, {
-    method: 'POST',
-    headers: authHeaders({ 'content-type': 'application/json' }),
-    body: JSON.stringify({ sql, limit }),
-  });
-  if (res.status === 401) throw new UnauthorizedError();
-  if (!res.ok) throw new Error((await res.json().catch(() => null))?.detail ?? `query failed (${res.status})`);
-  return res.json();
-}
+// Cross-pond hand-written SQL now runs through the paginated /query/page + /query/count surface (the data
+// viewer's query mode) — the standalone /serve/query is the CLI/wire JSON path, not a frontend client.
 
 export function promoteServe(pond: string, major: number): Promise<void> {
   return postJSON(`/ponds/${encodeURIComponent(pond)}/serve/promote`, { major });

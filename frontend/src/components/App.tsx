@@ -10,7 +10,6 @@ import { Sidebar } from './Sidebar';
 import { RunHistory } from './RunHistory';
 import { RunDetail } from './RunDetail';
 import { DataViewerModal } from './DataViewerModal';
-import { CatalogView } from './CatalogView';
 import { ConfirmDialog } from './ConfirmDialog';
 import { TopBar } from './OptionsMenu';
 
@@ -284,7 +283,6 @@ function SelectorBanner() {
 export function App() {
   const refresh = useLiveStore((s) => s.refresh);
   const needsKey = useLiveStore((s) => s.needsKey);
-  const catalogOpen = useLiveStore((s) => s.catalogOpen);
   const isMobile = useIsMobile();
 
   useEffect(() => {
@@ -310,7 +308,7 @@ export function App() {
   return (
     <div className="ds-app" style={{ display: 'flex', flexDirection: 'column', width: '100%', overflow: 'hidden', fontFamily: 'ui-monospace, SFMono-Regular, monospace' }}>
       {needsKey && <KeyPrompt />}
-      {catalogOpen && <CatalogView />}
+      {/* One modal serves both the Catalog (Options → Catalog) and the per-Pond Data Viewer (table icon). */}
       <DataViewerModal />
       {/* Mobile: the TopBar is a full-width page header pinned above everything (desktop floats it on the canvas). */}
       {isMobile && <TopBar />}

@@ -1,14 +1,21 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { useLiveStore, atLeast, THEME_BLOCKED, THEME_BRAND } from '@/lib/store';
+import { useLiveStore, atLeast, THEME_BLOCKED, THEME_BRAND, THEME_SUCCESS } from '@/lib/store';
 import {
   fetchTables, fetchFreshness, fetchHistory, fetchCount, fetchPage, fetchObjects, downloadObject,
-  deleteTable, deleteObject,
-  type DataQuery, type TableInfo, type TrickleMode, type PageResult, type ObjectInfo, UnauthorizedError,
+  deleteTable, deleteObject, fetchCatalog, promoteServe, exposeTable,
+  type DataQuery, type TableInfo, type TrickleMode, type PageResult, type ObjectInfo,
+  type Catalog, type CatalogTable, UnauthorizedError,
 } from '@/lib/api';
-import type { PondId } from '@/lib/types';
 import { ConfirmDialog, type ConfirmOpts } from './ConfirmDialog';
+
+// The unified Catalog (plans/data-serving.md): one modal that IS the Data Viewer. Opened from Options →
+// Catalog (no preselection) or a Pond's table icon (that Pond+Major preselected). A collapsible left
+// pond-tree (per-pond version dropdown + expandable table list with exposure eyes + copy) drives the
+// embedded Data Viewer on the right. The table dropdown/browse stays single-pond + Trickle-aware; the
+// hand-written SQL box runs cross-pond through the serving core (governed: read/demand see only the
+// serviceable surface; full manages exposure + the served-major pointer).
 
 const ROW_H = 26;
 const NUM_W = 60;
@@ -35,22 +42,329 @@ function baseTableName(name: string): string {
   return name;
 }
 
-const browseSql = (pond: string, table: string) => `SELECT * FROM "${pond}"."${table}" LIMIT 1000`;
+// The serving-core schema for a (pond, major): the bare pond name for the served major, `{pond}_v{major}`
+// otherwise — so a browsed non-served major's default SQL targets the right line when Run'd cross-pond.
+const schemaName = (pond: string, major: number, served: number | null) =>
+  major === served ? pond : `${pond}_v${major}`;
+const browseSql = (pond: string, major: number, served: number | null, table: string) =>
+  `SELECT * FROM "${schemaName(pond, major, served)}"."${table}" LIMIT 1000`;
+// The copy-to-clipboard query name ALWAYS carries the _vN suffix (robust against a later promotion);
+// the bare `pond.table` form is only a convenience for exploring through a connected app.
+const copyName = (pond: string, major: number, table: string) => `${pond}_v${major}.${table}`;
+
 const on401 = (e: unknown) => e instanceof UnauthorizedError && useLiveStore.setState({ needsKey: true });
 // A freshness ISO → compact, stable 'YYYY-MM-DD HH:MM:SS' (backend serialises in UTC).
 const fmtTs = (iso: string) => iso.slice(0, 19).replace('T', ' ');
 
-export function DataViewerModal() {
-  const pondId = useLiveStore((s) => s.dataViewerPondId);
-  if (!pondId) return null;
-  return <DataViewer key={pondId} pondId={pondId} />;
+// A pond id "name@major" → its parts (the tree preselects from the store's dataViewerPondId).
+function splitId(id: string): { name: string; major: number | null } {
+  const at = id.lastIndexOf('@');
+  return { name: at === -1 ? id : id.slice(0, at), major: at === -1 ? null : Number(id.slice(at + 1)) };
 }
 
-function DataViewer({ pondId }: { pondId: PondId }) {
-  const close = useLiveStore((s) => s.closeDataViewer);
-  const pondName = useLiveStore((s) => s.ponds[pondId]?.name ?? pondId);
-  const hasObjects = useLiveStore((s) => s.pondInfo[pondId]?.hasObjects ?? false);
+type Pending = { pond: string; major: number; table: string; nonce: number };
+
+// ─── The modal shell: tree + viewer ─────────────────────────────────────────
+
+export function DataViewerModal() {
+  const catalogOpen = useLiveStore((s) => s.catalogOpen);
+  const preselect = useLiveStore((s) => s.dataViewerPondId);
+  const setCatalogOpen = useLiveStore((s) => s.setCatalogOpen);
+  const closeDataViewer = useLiveStore((s) => s.closeDataViewer);
+  if (!catalogOpen && !preselect) return null;
+  return <CatalogModal preselect={preselect} onClose={() => { setCatalogOpen(false); closeDataViewer(); }} />;
+}
+
+function CatalogModal({ preselect, onClose }: { preselect: string | null; onClose: () => void }) {
   const canManage = useLiveStore((s) => atLeast(s.accessLevel, 'full'));
+  const [cat, setCat] = useState<Catalog | null>(null);
+  const [active, setActive] = useState<string | null>(null);
+  const [treeMajor, setTreeMajor] = useState<Record<string, number>>({});
+  const [search, setSearch] = useState('');
+  const [leftCollapsed, setLeftCollapsed] = useState(false);
+  const [pending, setPending] = useState<Pending | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const nonce = useRef(1);
+
+  const load = useCallback(async () => {
+    try {
+      const c = await fetchCatalog();
+      setCat(c);
+      const pre = preselect ? splitId(preselect) : null;
+      setActive((a) => a ?? pre?.name ?? c.ponds[0]?.name ?? null);
+      if (pre?.major != null) setTreeMajor((m) => (pre.name in m ? m : { ...m, [pre.name]: pre.major as number }));
+    } catch (e) {
+      on401(e);
+      setCat({ catchment: null, ponds: [], connect: {} });
+    }
+  }, [preselect]);
+  useEffect(() => {
+    const t = setTimeout(() => void load(), 0); // defer — no synchronous setState in the effect body
+    return () => clearTimeout(t);
+  }, [load]);
+
+  const activePond = cat?.ponds.find((p) => p.name === active) ?? null;
+  const servedMajor = activePond?.served_major ?? null;
+  const activeMajor = activePond ? (treeMajor[activePond.name] ?? activePond.served_major) : null;
+  const matchesActive = (p: Pending | null) =>
+    !!p && activePond != null && p.pond === activePond.name && p.major === activeMajor;
+
+  const pickTable = (pond: string, major: number, table: string) => {
+    setActive(pond);
+    setTreeMajor((m) => ({ ...m, [pond]: major }));
+    setPending({ pond, major, table, nonce: nonce.current++ });
+  };
+  const onExpose = (pond: string, major: number, t: CatalogTable) =>
+    exposeTable(pond, t.table, !t.exposed, major).then(load).catch((e) => setErr(String(e?.message ?? e)));
+  const onPromote = () =>
+    activePond && activeMajor != null
+      ? promoteServe(activePond.name, activeMajor).then(load).catch((e) => setErr(String(e?.message ?? e)))
+      : undefined;
+
+  return (
+    <div
+      onClick={onClose}
+      style={{
+        position: 'fixed', inset: 0, zIndex: 1100, display: 'flex', alignItems: 'center',
+        justifyContent: 'center', background: 'rgba(9, 9, 11, 0.78)', backdropFilter: 'blur(2px)',
+        fontFamily: 'ui-monospace, SFMono-Regular, monospace',
+      }}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          background: '#101014', border: '1px solid #27272a', borderRadius: 10,
+          width: '94vw', height: '90vh', display: 'flex', overflow: 'hidden', position: 'relative',
+        }}
+      >
+        {/* Left: the collapsible pond tree. */}
+        {!leftCollapsed && (
+          <div style={{ width: 248, flexShrink: 0, borderRight: '1px solid #27272a', display: 'flex', flexDirection: 'column', minHeight: 0 }}>
+            <PondTree
+              cat={cat}
+              active={active}
+              treeMajor={treeMajor}
+              search={search}
+              setSearch={setSearch}
+              canManage={canManage}
+              onActivate={setActive}
+              onPickMajor={(name, major) => setTreeMajor((m) => ({ ...m, [name]: major }))}
+              onPickTable={pickTable}
+              onExpose={onExpose}
+            />
+            <ConnectFooter catchment={cat?.catchment ?? null} connect={cat?.connect ?? {}} />
+          </div>
+        )}
+
+        {/* Right: the Data Viewer, keyed on pond+major so a switch remounts it fresh. */}
+        {activePond && activeMajor != null ? (
+          <DataViewer
+            key={`${activePond.name}:${activeMajor}`}
+            pondName={activePond.name}
+            major={activeMajor}
+            servedMajor={servedMajor}
+            canManage={canManage}
+            initialTable={matchesActive(pending) ? pending!.table : undefined}
+            selectSig={matchesActive(pending) ? pending : null}
+            leftCollapsed={leftCollapsed}
+            onToggleLeft={() => setLeftCollapsed((v) => !v)}
+            onPromote={onPromote}
+            onClose={onClose}
+          />
+        ) : (
+          <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#71717a', fontSize: 13, position: 'relative' }}>
+            {leftCollapsed && (
+              <button onClick={() => setLeftCollapsed(false)} title="Show ponds"
+                      style={{ position: 'absolute', top: 12, left: 12, ...chip }}>›</button>
+            )}
+            {cat == null ? 'Loading…' : 'Nothing serviceable.'}
+            <button onClick={onClose} style={{ position: 'absolute', top: 12, right: 12, ...chip }}>✕</button>
+          </div>
+        )}
+
+        {err && (
+          <div onClick={() => setErr(null)} title="dismiss"
+               style={{ position: 'absolute', bottom: 12, right: 12, maxWidth: '50%', background: '#2a1416',
+                        border: `1px solid ${THEME_BLOCKED}66`, borderRadius: 6, padding: '6px 10px',
+                        color: '#fca5a5', fontSize: 11.5, cursor: 'pointer', wordBreak: 'break-word' }}>
+            {err}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+const chip: React.CSSProperties = {
+  background: 'transparent', border: '1px solid #3f3f46', borderRadius: 5, color: '#a1a1aa',
+  fontSize: 13, lineHeight: 1, padding: '4px 9px', cursor: 'pointer', fontFamily: 'inherit',
+};
+
+// ─── The pond tree (left panel) ──────────────────────────────────────────────
+
+function PondTree({
+  cat, active, treeMajor, search, setSearch, canManage, onActivate, onPickMajor, onPickTable, onExpose,
+}: {
+  cat: Catalog | null;
+  active: string | null;
+  treeMajor: Record<string, number>;
+  search: string;
+  setSearch: (s: string) => void;
+  canManage: boolean;
+  onActivate: (name: string) => void;
+  onPickMajor: (name: string, major: number) => void;
+  onPickTable: (pond: string, major: number, table: string) => void;
+  onExpose: (pond: string, major: number, t: CatalogTable) => void;
+}) {
+  const ponds = (cat?.ponds ?? []).filter(
+    (p) => !search || p.name.includes(search) || p.tables.some((t) => t.table.includes(search)));
+  return (
+    <>
+      <input
+        value={search}
+        onChange={(e) => setSearch(e.target.value)}
+        placeholder="search ponds / tables"
+        style={{
+          margin: 8, boxSizing: 'border-box', width: 'calc(100% - 16px)', background: '#18181b',
+          border: '1px solid #3f3f46', borderRadius: 6, color: '#e4e4e7', padding: '6px 9px',
+          fontSize: 12, fontFamily: 'inherit', outline: 'none',
+        }}
+      />
+      <div style={{ overflowY: 'auto', flex: 1, minHeight: 0 }}>
+        {ponds.map((p) => {
+          const isActive = p.name === active;
+          const major = treeMajor[p.name] ?? p.served_major;
+          const tables = p.tables.filter((t) => t.major === major);
+          return (
+            <div key={p.name}>
+              <div
+                onClick={() => onActivate(p.name)}
+                style={{
+                  display: 'flex', alignItems: 'center', gap: 6, padding: '6px 10px', cursor: 'pointer',
+                  fontSize: 12.5, background: isActive ? '#1f1f27' : 'transparent',
+                  color: isActive ? '#f4f4f5' : '#c4c4c8',
+                }}
+              >
+                <span style={{ color: '#71717a', fontSize: 10, width: 8 }}>{isActive ? '▾' : '▸'}</span>
+                <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                  {p.name}
+                </span>
+                <select
+                  value={major}
+                  onClick={(e) => e.stopPropagation()}
+                  onChange={(e) => onPickMajor(p.name, Number(e.target.value))}
+                  title="Major line — determines the tables shown below"
+                  style={{
+                    appearance: 'none', WebkitAppearance: 'none', MozAppearance: 'none',
+                    background: '#18181b', border: '1px solid #3f3f46', borderRadius: 5, padding: '2px 6px',
+                    color: '#a1a1aa', fontSize: 11, fontFamily: 'inherit', outline: 'none', cursor: 'pointer',
+                  }}
+                >
+                  {p.majors.map((m) => (
+                    <option key={m} value={m} style={{ fontWeight: m === p.served_major ? 700 : 400 }}>
+                      v{m}{m === p.served_major ? ' · served' : ''}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              {isActive && (
+                <div style={{ padding: '2px 0 6px 0' }}>
+                  {tables.map((t) => (
+                    <TableRow key={t.table} pond={p.name} major={major} t={t} canManage={canManage}
+                              onPick={() => onPickTable(p.name, major, t.table)}
+                              onExpose={() => onExpose(p.name, major, t)} />
+                  ))}
+                  {tables.length === 0 && (
+                    <div style={{ padding: '4px 10px 4px 24px', color: '#52525b', fontSize: 11.5 }}>
+                      No {canManage ? '' : 'serviceable '}tables on v{major}.
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          );
+        })}
+        {ponds.length === 0 && (
+          <div style={{ padding: 12, color: '#52525b', fontSize: 12 }}>
+            {cat == null ? 'Loading…' : 'Nothing serviceable.'}
+          </div>
+        )}
+      </div>
+    </>
+  );
+}
+
+function TableRow({
+  pond, major, t, canManage, onPick, onExpose,
+}: {
+  pond: string; major: number; t: CatalogTable; canManage: boolean; onPick: () => void; onExpose: () => void;
+}) {
+  const [copied, setCopied] = useState(false);
+  const copy = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    navigator.clipboard?.writeText(copyName(pond, major, t.table)).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1100);
+    }).catch(() => undefined);
+  };
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '3px 10px 3px 22px' }}>
+      {canManage && (
+        <span role="button" title={t.exposed ? 'Serviceable — click to hide' : 'Hidden — click to expose'}
+              onClick={(e) => { e.stopPropagation(); onExpose(); }}
+              style={{ cursor: 'pointer', color: t.exposed ? THEME_BRAND : '#52525b', fontSize: 12 }}>
+          {t.exposed ? '●' : '○'}
+        </span>
+      )}
+      <span onClick={onPick} title="Open in the viewer"
+            style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                     cursor: 'pointer', fontSize: 12, color: t.exposed ? '#e4e4e7' : '#71717a' }}>
+        {t.table}
+      </span>
+      {canManage && <span style={{ color: '#52525b', fontSize: 10 }}>{t.source}</span>}
+      <button onClick={copy} title={`Copy ${copyName(pond, major, t.table)}`}
+              style={{ background: 'transparent', border: 'none', cursor: 'pointer', padding: '0 2px',
+                       color: copied ? THEME_SUCCESS : '#71717a', fontSize: 11, fontFamily: 'inherit' }}>
+        {copied ? '✓' : '⧉'}
+      </button>
+    </div>
+  );
+}
+
+function ConnectFooter({ catchment, connect }: { catchment: string | null; connect: Record<string, string> }) {
+  const wires = Object.entries(connect);
+  return (
+    <div style={{ borderTop: '1px solid #27272a', padding: '7px 10px', fontSize: 10, color: '#71717a', display: 'flex', flexDirection: 'column', gap: 3 }}>
+      {catchment && <span style={{ color: '#a1a1aa' }}>{catchment}</span>}
+      {wires.length === 0
+        ? <span style={{ color: '#52525b' }}>no wire ports</span>
+        : wires.map(([k, v]) => (
+            <span key={k} title="Point a BI tool / client here (password = your API key)">
+              {k}: <span style={{ color: '#a1a1aa' }}>{v}</span>
+            </span>
+          ))}
+    </div>
+  );
+}
+
+// ─── The Data Viewer (right panel) ───────────────────────────────────────────
+
+function DataViewer({
+  pondName, major, servedMajor, canManage, initialTable, selectSig, leftCollapsed, onToggleLeft, onPromote, onClose,
+}: {
+  pondName: string;
+  major: number;
+  servedMajor: number | null;
+  canManage: boolean;
+  initialTable?: string;
+  selectSig: Pending | null;
+  leftCollapsed: boolean;
+  onToggleLeft: () => void;
+  onPromote: () => void;
+  onClose: () => void;
+}) {
+  const pondId = `${pondName}@${major}`;
+  const hasObjects = useLiveStore((s) => s.pondInfo[pondId]?.hasObjects ?? false);
 
   // Tabular data vs non-tabular Objects (models/blobs). Objects are a separate published surface.
   const [view, setView] = useState<'tables' | 'objects'>('tables');
@@ -76,6 +390,8 @@ function DataViewer({ pondId }: { pondId: PondId }) {
   const cycleSort = (col: string) =>
     setSort((s) => (s.col !== col ? { col, desc: false } : !s.desc ? { col, desc: true } : { col: null, desc: false }));
   const taRef = useRef<HTMLTextAreaElement>(null);
+  // The selectSig nonce already consumed (the mount picks `initialTable`; later tree clicks fire here).
+  const lastSig = useRef<number | undefined>(selectSig?.nonce);
 
   const tableInfo = tables?.find((t) => t.name === table) ?? null;
   const trickle: TrickleMode | null = tableInfo?.trickle ?? null;
@@ -99,16 +415,26 @@ function DataViewer({ pondId }: { pondId: PondId }) {
     [pondId]
   );
 
-  // Load the table list once on mount; auto-select the first table (deferred — no sync setState in effect).
+  const openTable = useCallback((t: string, ti: TableInfo | undefined) => {
+    setTable(t);
+    setMode('browse');
+    setSqlText(browseSql(pondName, major, servedMajor, t));
+    setFLo(null);
+    setFHi(null);
+    setTotal(null);
+    setSort({ col: null, desc: false }); // columns differ between tables
+    void loadFreshness(t, ti);
+  }, [pondName, major, servedMajor, loadFreshness]);
+
+  // Load the table list once on mount; select `initialTable` (a tree click) else the first table.
   useEffect(() => {
     const t = setTimeout(async () => {
       try {
         const ts = await fetchTables(pondId);
         setTables(ts);
-        if (ts.length) {
-          setTable(ts[0].name);
-          setSqlText(browseSql(pondName, ts[0].name));
-          void loadFreshness(ts[0].name, ts[0]);
+        const want = (initialTable && ts.find((x) => x.name === initialTable)) ? initialTable : ts[0]?.name;
+        if (want) {
+          openTable(want, ts.find((x) => x.name === want));
         } else if (hasObjects) {
           setView('objects'); // no tables — open straight to the Objects tab
         }
@@ -122,13 +448,24 @@ function DataViewer({ pondId }: { pondId: PondId }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // A tree table-click within the CURRENT pond+major (no remount) selects the table in place.
+  useEffect(() => {
+    if (!selectSig || !tables) return;
+    if (lastSig.current === selectSig.nonce) return;
+    const ti = tables.find((x) => x.name === selectSig.table);
+    if (!ti) return;
+    lastSig.current = selectSig.nonce;
+    const t = setTimeout(() => { setView('tables'); openTable(selectSig.table, ti); }, 0);
+    return () => clearTimeout(t);
+  }, [selectSig, tables, openTable]);
+
   useEffect(() => {
     // When a confirm dialog is open it owns Escape (it closes itself); don't also close the modal.
     const onKey = (e: KeyboardEvent) =>
-      e.key === 'Escape' && !confirm && (historyPk ? setHistoryPk(null) : close());
+      e.key === 'Escape' && !confirm && (historyPk ? setHistoryPk(null) : onClose());
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [close, historyPk, confirm]);
+  }, [onClose, historyPk, confirm]);
 
   const expand = () => {
     setExpanded(true);
@@ -140,17 +477,7 @@ function DataViewer({ pondId }: { pondId: PondId }) {
     if (taRef.current) taRef.current.style.height = '38px';
   };
 
-  const selectTable = (t: string) => {
-    const ti = tables?.find((x) => x.name === t);
-    setTable(t);
-    setMode('browse');
-    setSqlText(browseSql(pondName, t));
-    setFLo(null);
-    setFHi(null);
-    setTotal(null);
-    setSort({ col: null, desc: false }); // columns differ between tables
-    void loadFreshness(t, ti);
-  };
+  const selectTable = (t: string) => openTable(t, tables?.find((x) => x.name === t));
   const deleteCurrentTable = () => {
     if (!table) return;
     const target = table;
@@ -170,11 +497,8 @@ function DataViewer({ pondId }: { pondId: PondId }) {
           await deleteTable(pondId, target); // the Catchment resolves a companion to its base
           const ts = await fetchTables(pondId);
           setTables(ts);
-          setTable(ts[0]?.name ?? null);
-          if (ts[0]) {
-            setSqlText(browseSql(pondName, ts[0].name));
-            void loadFreshness(ts[0].name, ts[0]);
-          }
+          if (ts[0]) openTable(ts[0].name, ts[0]);
+          else setTable(null);
         } catch (e) {
           on401(e);
           setTablesError(e instanceof Error ? e.message : String(e));
@@ -193,10 +517,11 @@ function DataViewer({ pondId }: { pondId: PondId }) {
     setMode('browse');
     setTotal(null);
     setSort({ col: null, desc: false });
-    if (table) setSqlText(browseSql(pondName, table));
+    if (table) setSqlText(browseSql(pondName, major, servedMajor, table));
   };
 
-  // The active grid query + a key that remounts the grid whenever the source/window/sort changes.
+  // The active grid query + a key that remounts the grid whenever the source/window/sort changes. A
+  // hand-written query runs cross-pond through the serving core; a browse stays on this pond+major.
   let query: DataQuery | null =
     mode === 'query'
       ? { pond: pondId, sql: activeSql }
@@ -209,109 +534,95 @@ function DataViewer({ pondId }: { pondId: PondId }) {
   const queryKey =
     (mode === 'query' ? `sql:${activeSql}` : `tbl:${table}:${trickle}:${fLo}:${fHi}`) + `:${sort.col}:${sort.desc}`;
 
+  const canPromote = canManage && servedMajor != null && major !== servedMajor;
+
   return (
-    <div
-      onClick={close}
-      style={{
-        position: 'fixed', inset: 0, zIndex: 1100, display: 'flex', alignItems: 'center',
-        justifyContent: 'center', background: 'rgba(9, 9, 11, 0.78)', backdropFilter: 'blur(2px)',
-        fontFamily: 'ui-monospace, SFMono-Regular, monospace',
-      }}
-    >
-      <div
-        onClick={(e) => e.stopPropagation()}
-        style={{
-          background: '#101014', border: '1px solid #27272a', borderRadius: 10,
-          width: '92vw', height: '88vh', display: 'flex', flexDirection: 'column', overflow: 'hidden',
-          position: 'relative',
-        }}
-      >
-        {/* Header */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '10px 14px', borderBottom: '1px solid #27272a', flexShrink: 0 }}>
-          <span style={{ fontSize: 13, fontWeight: 700, color: '#e4e4e7' }}>{pondName}</span>
-          {hasObjects && tables && tables.length > 0 && (
-            <span style={{ display: 'inline-flex', border: '1px solid #3f3f46', borderRadius: 6, overflow: 'hidden' }}>
-              {(['tables', 'objects'] as const).map((v) => (
-                <button
-                  key={v}
-                  onClick={() => setView(v)}
-                  style={{
-                    background: view === v ? '#27272a' : 'transparent', border: 'none', padding: '5px 11px',
-                    color: view === v ? '#e4e4e7' : '#71717a', fontSize: 12, fontWeight: 700, cursor: 'pointer',
-                    fontFamily: 'inherit',
-                  }}
-                >
-                  {v === 'tables' ? 'Tables' : 'Objects'}
-                </button>
-              ))}
-            </span>
-          )}
-          {view === 'tables' && tables && tables.length > 0 && (
-            <span style={{ position: 'relative', display: 'inline-flex', alignItems: 'center' }}>
-              <select
-                value={mode === 'browse' ? table ?? '' : ''}
-                onChange={(e) => selectTable(e.target.value)}
+    <div style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', position: 'relative' }}>
+      {/* Top row: [◂ tree] pond · Promote | table select | Delete | rows | ✕ */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '10px 14px', borderBottom: '1px solid #27272a', flexShrink: 0 }}>
+        <button onClick={onToggleLeft} title={leftCollapsed ? 'Show ponds' : 'Hide ponds'} style={chip}>
+          {leftCollapsed ? '›' : '‹'}
+        </button>
+        <span style={{ fontSize: 13, fontWeight: 700, color: '#e4e4e7' }}>{pondName}</span>
+        <span style={{ fontSize: 11, color: major === servedMajor ? THEME_SUCCESS : '#71717a' }}>
+          v{major}{major === servedMajor ? ' · served' : ''}
+        </span>
+        {canPromote && (
+          <button
+            onClick={onPromote}
+            title={`Make v${major} the served (default) major`}
+            style={{ ...chip, color: THEME_SUCCESS, borderColor: THEME_SUCCESS }}
+          >
+            Promote to served
+          </button>
+        )}
+        {hasObjects && tables && tables.length > 0 && (
+          <span style={{ display: 'inline-flex', border: '1px solid #3f3f46', borderRadius: 6, overflow: 'hidden' }}>
+            {(['tables', 'objects'] as const).map((v) => (
+              <button
+                key={v}
+                onClick={() => setView(v)}
                 style={{
-                  appearance: 'none', WebkitAppearance: 'none', MozAppearance: 'none',
-                  background: '#18181b', border: '1px solid #3f3f46', borderRadius: 6, padding: '5px 26px 5px 9px',
-                  color: '#e4e4e7', fontSize: 12.5, fontFamily: 'inherit', outline: 'none', cursor: 'pointer',
+                  background: view === v ? '#27272a' : 'transparent', border: 'none', padding: '5px 11px',
+                  color: view === v ? '#e4e4e7' : '#71717a', fontSize: 12, fontWeight: 700, cursor: 'pointer',
+                  fontFamily: 'inherit',
                 }}
               >
-                {mode === 'query' && <option value="">(query)</option>}
-                {tables.map((t) => (
-                  <option key={t.name} value={t.name}>{t.name}{t.trickle ? ` · ${t.trickle}` : ''}</option>
-                ))}
-              </select>
-              <span style={{ position: 'absolute', right: 9, pointerEvents: 'none', color: '#71717a', fontSize: 9 }}>▼</span>
-            </span>
-          )}
-          {view === 'tables' && mode === 'browse' && table && canManage && (
-            <button
-              onClick={deleteCurrentTable}
-              title={`Delete "${table}" (drops its data + state, then rebuilds)`}
+                {v === 'tables' ? 'Tables' : 'Objects'}
+              </button>
+            ))}
+          </span>
+        )}
+        {view === 'tables' && tables && tables.length > 0 && (
+          <span style={{ position: 'relative', display: 'inline-flex', alignItems: 'center' }}>
+            <select
+              value={mode === 'browse' ? table ?? '' : ''}
+              onChange={(e) => selectTable(e.target.value)}
               style={{
-                background: 'transparent', border: `1px solid ${THEME_BLOCKED}66`, borderRadius: 5,
-                color: THEME_BLOCKED, fontSize: 11.5, fontWeight: 700, padding: '4px 9px', cursor: 'pointer',
-                fontFamily: 'inherit',
+                appearance: 'none', WebkitAppearance: 'none', MozAppearance: 'none',
+                background: '#18181b', border: '1px solid #3f3f46', borderRadius: 6, padding: '5px 26px 5px 9px',
+                color: '#e4e4e7', fontSize: 12.5, fontFamily: 'inherit', outline: 'none', cursor: 'pointer',
               }}
             >
-              Delete
-            </button>
-          )}
-          {view === 'tables' && mode === 'query' && (
-            <span style={{ fontSize: 10, fontWeight: 700, color: '#ee9333', letterSpacing: '0.06em' }}>QUERY</span>
-          )}
-          {view === 'tables' && (
-            <span style={{ fontSize: 11, color: '#71717a' }}>
-              {total == null ? '' : `${total.toLocaleString()} row${total === 1 ? '' : 's'}`}
-            </span>
-          )}
+              {mode === 'query' && <option value="">(query)</option>}
+              {tables.map((t) => (
+                <option key={t.name} value={t.name}>{t.name}{t.trickle ? ` · ${t.trickle}` : ''}</option>
+              ))}
+            </select>
+            <span style={{ position: 'absolute', right: 9, pointerEvents: 'none', color: '#71717a', fontSize: 9 }}>▼</span>
+          </span>
+        )}
+        {view === 'tables' && mode === 'browse' && table && canManage && (
           <button
-            onClick={close}
-            title="Close (Esc)"
+            onClick={deleteCurrentTable}
+            title={`Delete "${table}" (drops its data + state, then rebuilds)`}
             style={{
-              marginLeft: 'auto', background: 'transparent', border: '1px solid #3f3f46', borderRadius: 5,
-              color: '#a1a1aa', fontSize: 13, lineHeight: 1, padding: '4px 9px', cursor: 'pointer', fontFamily: 'inherit',
+              background: 'transparent', border: `1px solid ${THEME_BLOCKED}66`, borderRadius: 5,
+              color: THEME_BLOCKED, fontSize: 11.5, fontWeight: 700, padding: '4px 9px', cursor: 'pointer',
+              fontFamily: 'inherit',
             }}
           >
-            ✕
+            Delete
           </button>
-        </div>
-
-        {/* Freshness window — only for a Trickle table being browsed */}
-        {view === 'tables' && mode === 'browse' && trickle && (
-          <FreshnessWindow
-            freshness={freshness}
-            floor={floor}
-            fLo={fLo}
-            fHi={fHi}
-            setLo={setFLo}
-            setHi={setFHi}
-          />
         )}
-
-        {/* SQL box */}
+        {view === 'tables' && mode === 'query' && (
+          <span style={{ fontSize: 10, fontWeight: 700, color: '#ee9333', letterSpacing: '0.06em' }}>QUERY</span>
+        )}
         {view === 'tables' && (
+          <span style={{ fontSize: 11, color: '#71717a' }}>
+            {total == null ? '' : `${total.toLocaleString()} row${total === 1 ? '' : 's'}`}
+          </span>
+        )}
+        <button onClick={onClose} title="Close (Esc)" style={{ ...chip, marginLeft: 'auto' }}>✕</button>
+      </div>
+
+      {/* Freshness window — only for a Trickle table being browsed */}
+      {view === 'tables' && mode === 'browse' && trickle && (
+        <FreshnessWindow freshness={freshness} floor={floor} fLo={fLo} fHi={fHi} setLo={setFLo} setHi={setFHi} />
+      )}
+
+      {/* SQL box — hand-written SQL runs cross-pond (serving core); browse names are pre-filled per major */}
+      {view === 'tables' && (
         <div style={{ display: 'flex', alignItems: 'flex-start', gap: 8, padding: '10px 14px', borderBottom: '1px solid #27272a', flexShrink: 0 }}>
           <textarea
             ref={taRef}
@@ -326,6 +637,7 @@ function DataViewer({ pondId }: { pondId: PondId }) {
               }
             }}
             spellCheck={false}
+            placeholder='SELECT * FROM "pond_v1"."table" — or JOIN across ponds in this Catchment'
             style={{
               flex: 1, resize: expanded ? 'vertical' : 'none', height: 38, minHeight: 38, maxHeight: '45vh',
               background: '#18181b', border: '1px solid #3f3f46', borderRadius: 6, padding: '8px 10px',
@@ -359,31 +671,30 @@ function DataViewer({ pondId }: { pondId: PondId }) {
             )}
           </div>
         </div>
+      )}
+
+      {/* Body: the tabular grid, or the Objects list */}
+      <div style={{ flex: 1, minHeight: 0 }}>
+        {view === 'objects' ? (
+          <ObjectsPanel pondId={pondId} canManage={canManage} requestConfirm={setConfirm} />
+        ) : tablesError ? (
+          <div style={{ padding: 16, color: '#ef4444', fontSize: 12.5 }}>{tablesError}</div>
+        ) : tables == null ? (
+          <div style={{ padding: 16, color: '#71717a', fontSize: 12.5 }}>Loading…</div>
+        ) : query == null ? (
+          <div style={{ padding: 16, color: '#71717a', fontSize: 12.5 }}>
+            This Pond has no {canManage ? 'exported' : 'serviceable'} tables.{hasObjects ? ' See the Objects tab.' : ''}
+          </div>
+        ) : (
+          <VirtualGrid key={queryKey} query={query} onTotal={setTotal} onRowClick={setHistoryPk} sort={sort} onSort={cycleSort} />
         )}
-
-        {/* Body: the tabular grid, or the Objects list */}
-        <div style={{ flex: 1, minHeight: 0 }}>
-          {view === 'objects' ? (
-            <ObjectsPanel pondId={pondId} canManage={canManage} requestConfirm={setConfirm} />
-          ) : tablesError ? (
-            <div style={{ padding: 16, color: '#ef4444', fontSize: 12.5 }}>{tablesError}</div>
-          ) : tables == null ? (
-            <div style={{ padding: 16, color: '#71717a', fontSize: 12.5 }}>Loading…</div>
-          ) : query == null ? (
-            <div style={{ padding: 16, color: '#71717a', fontSize: 12.5 }}>
-              This Pond has no exported tables.{hasObjects ? ' See the Objects tab.' : ''}
-            </div>
-          ) : (
-            <VirtualGrid key={queryKey} query={query} onTotal={setTotal} onRowClick={setHistoryPk} sort={sort} onSort={cycleSort} />
-          )}
-        </div>
-
-        {historyPk && table && (
-          <HistoryOverlay pond={pondId} pondName={pondName} table={table} pk={historyPk} onClose={() => setHistoryPk(null)} />
-        )}
-
-        {confirm && <ConfirmDialog opts={confirm} onClose={() => setConfirm(null)} />}
       </div>
+
+      {historyPk && table && (
+        <HistoryOverlay pond={pondId} pondName={pondName} table={table} pk={historyPk} onClose={() => setHistoryPk(null)} />
+      )}
+
+      {confirm && <ConfirmDialog opts={confirm} onClose={() => setConfirm(null)} />}
     </div>
   );
 }
@@ -404,7 +715,7 @@ function fmtBytes(n: number | null): string {
 }
 
 function ObjectsPanel({ pondId, canManage, requestConfirm }: {
-  pondId: PondId; canManage: boolean; requestConfirm: (o: ConfirmOpts) => void;
+  pondId: string; canManage: boolean; requestConfirm: (o: ConfirmOpts) => void;
 }) {
   const [objects, setObjects] = useState<ObjectInfo[] | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -768,7 +1079,7 @@ function VirtualGrid({
 function HistoryOverlay({
   pond, pondName, table, pk, onClose,
 }: {
-  pond: PondId;
+  pond: string;
   pondName: string;
   table: string;
   pk: Record<string, unknown>;
