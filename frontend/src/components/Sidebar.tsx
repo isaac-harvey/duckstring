@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from 'react';
 import { fetchAlerts, fetchLineage, fetchSecrets, testSpout, type RawAlertChannel, type RawLineageRipple } from '@/lib/api';
-import { useLiveStore, atLeast, formatAge, formatDuration, parseTs, THEME_PULL, THEME_PUSH, THEME_SUCCESS, THEME_DANGER, THEME_BLOCKED, THEME_WAKE, THEME_BRAND } from '@/lib/store';
+import { useLiveStore, atLeast, formatAge, formatDuration, parseTs, runKey, THEME_PULL, THEME_PUSH, THEME_SUCCESS, THEME_DANGER, THEME_BLOCKED, THEME_WAKE, THEME_BRAND } from '@/lib/store';
 import type { FreqUnit, Pond, PondInfo, PondRun } from '@/lib/types';
 import { AlertChannelForm, ChannelRow } from './AlertsMenu';
 import { DuckSection } from './DuckSection';
@@ -440,29 +440,47 @@ const TIDE_UNITS: { value: FreqUnit; label: string; secs: number }[] = [
 
 const ms = (iso: string | null): number => parseTs(iso);
 
-// Completion times (asc, ms) and per-run durations (ms) for a set of Pond Runs.
-function pondTrace(runs: PondRun[]): { times: number[]; durations: number[] } {
-  const asc = [...runs].reverse(); // store holds newest-first
-  const times: number[] = [];
-  const durations: number[] = [];
-  for (const r of asc) {
-    if (r.finishedAt) times.push(ms(r.finishedAt));
-    if (r.startedAt && r.finishedAt) durations.push(ms(r.finishedAt) - ms(r.startedAt));
+// A per-run point on the timing trace — one per run that has a duration (both timestamps). `run` is the
+// Pond Run it maps to, so a click selects it (opening Run Detail) and a selected run highlights back here.
+type TracePoint = { key: string; time: number; duration: number; run: PondRun };
+
+// Per-run points (asc) for a set of Pond Runs — each run's completion time + its duration.
+function pondTrace(runs: PondRun[]): TracePoint[] {
+  const pts: TracePoint[] = [];
+  for (const r of [...runs].reverse()) { // store holds newest-first
+    if (r.startedAt && r.finishedAt) {
+      pts.push({ key: runKey(r), time: ms(r.finishedAt), duration: ms(r.finishedAt) - ms(r.startedAt), run: r });
+    }
   }
-  return { times, durations };
+  return pts;
 }
 
-// Ripple completion times (asc, ms) and per-run durations (ms) from the selected Pond's run history.
-function rippleTrace(runs: PondRun[], rippleName: string): { times: number[]; durations: number[] } {
-  const asc = [...runs].reverse();
-  const times: number[] = [];
-  const durations: number[] = [];
-  for (const r of asc) {
+// Per-run points (asc) for one Ripple across the Pond's run history — plots the *ripple's* timing, but
+// still maps to the containing Pond Run (Run Detail is per Pond Run).
+function rippleTrace(runs: PondRun[], rippleName: string): TracePoint[] {
+  const pts: TracePoint[] = [];
+  for (const r of [...runs].reverse()) {
     const rr = r.ripples?.find((x) => x.ripple === rippleName);
-    if (rr?.finishedAt) times.push(ms(rr.finishedAt));
-    if (rr?.startedAt && rr?.finishedAt) durations.push(ms(rr.finishedAt) - ms(rr.startedAt));
+    if (rr?.startedAt && rr?.finishedAt) {
+      pts.push({ key: runKey(r), time: ms(rr.finishedAt), duration: ms(rr.finishedAt) - ms(rr.startedAt), run: r });
+    }
   }
-  return { times, durations };
+  return pts;
+}
+
+// The interactive timing chart wired to run selection: clicking a point opens that run in Run Detail;
+// the selected run (from anywhere — e.g. a Run History click) enlarges its point here.
+function RunTrace({ points }: { points: TracePoint[] }) {
+  const selectRun = useLiveStore((s) => s.selectRun);
+  const selectedRun = useLiveStore((s) => s.selectedRun);
+  const selectedKey = selectedRun ? runKey(selectedRun) : null;
+  return (
+    <TraceChart
+      points={points}
+      selectedKey={selectedKey}
+      onSelect={(key) => { const p = points.find((x) => x.key === key); if (p) selectRun(p.run); }}
+    />
+  );
 }
 
 // ─── Options modal: the rarely-needed per-Pond config, off the always-visible sidebar ───────────────
@@ -561,13 +579,13 @@ export function TracePanel() {
   const pond = selectedPondId ? ponds[selectedPondId] : null;
 
   let title: string | null = null;
-  let trace: { times: number[]; durations: number[] } | null = null;
+  let points: TracePoint[] | null = null;
   if (selectedRipple) {
     title = `${selectedRipple.name} · run timing`;
-    trace = rippleTrace(runs, selectedRipple.name);
+    points = rippleTrace(runs, selectedRipple.name);
   } else if (pond) {
     title = `${pond.name} · run timing`;
-    trace = pondTrace(runs);
+    points = pondTrace(runs);
   }
 
   return (
@@ -575,8 +593,8 @@ export function TracePanel() {
       <div style={{ fontSize: 10, fontWeight: 700, color: '#52525b', letterSpacing: '0.1em', textTransform: 'uppercase', marginBottom: 10, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
         {title ?? 'Run timing'}
       </div>
-      {trace ? (
-        <TraceChart {...trace} />
+      {points ? (
+        <RunTrace points={points} />
       ) : (
         <div style={{ fontSize: 12, color: '#52525b', margin: 'auto', textAlign: 'center' }}>Select a Pond or Ripple</div>
       )}
@@ -820,7 +838,7 @@ export function Sidebar({ mobile = false }: { mobile?: boolean }) {
           {/* Desktop shows run timing in the bottom-right quadrant (TracePanel); mobile keeps it here. */}
           {mobile && (
             <Section>
-              <TraceChart {...pondTrace(selectedPondRuns)} />
+              <RunTrace points={pondTrace(selectedPondRuns)} />
             </Section>
           )}
 
@@ -855,7 +873,7 @@ export function Sidebar({ mobile = false }: { mobile?: boolean }) {
 
           {mobile && (
             <Section>
-              <TraceChart {...rippleTrace(selectedPondRuns, selectedRipple.name)} />
+              <RunTrace points={rippleTrace(selectedPondRuns, selectedRipple.name)} />
             </Section>
           )}
         </>
