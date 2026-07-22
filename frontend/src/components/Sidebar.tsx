@@ -5,6 +5,7 @@ import { fetchAlerts, fetchLineage, fetchRuns, fetchSecrets, testSpout, type Raw
 import { useLiveStore, atLeast, formatAge, formatDuration, mapRun, parseTs, runKey, THEME_PULL, THEME_PUSH, THEME_SUCCESS, THEME_DANGER, THEME_BLOCKED, THEME_WAKE, THEME_BRAND } from '@/lib/store';
 import type { FreqUnit, Pond, PondInfo, PondRun } from '@/lib/types';
 import { AlertChannelForm, ChannelRow } from './AlertsMenu';
+import { DbtIcon } from './DbtIcon';
 import { DuckSection } from './DuckSection';
 import { TraceChart } from './TraceChart';
 import { WindowEditor } from './WindowEditor';
@@ -771,15 +772,7 @@ export function Sidebar({ mobile = false }: { mobile?: boolean }) {
             {/* The Pond name is the sidebar's headline — prominent, and shown verbatim (not upper-cased).
                 The kind is implied (and shown on the meta line below), so it needs no label here. */}
             <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
-              {selectedPond.dbt && (
-                // The dbt wordmark logo (lowercase, dbt orange) — see PondNode for the icon-asset note.
-                <span title="dbt-mode Pond — its Ripples are dbt models"
-                      style={{ fontSize: 18, fontWeight: 800, color: '#ff694b', flexShrink: 0,
-                               fontFamily: '"Segoe UI", system-ui, -apple-system, sans-serif',
-                               letterSpacing: '-0.04em', lineHeight: 1 }}>
-                  dbt
-                </span>
-              )}
+              {selectedPond.dbt && <DbtIcon size={20} />}
               <span style={{ fontSize: 18, fontWeight: 700, color: '#f4f4f5', lineHeight: 1.2, wordBreak: 'break-word', minWidth: 0 }}>
                 {selectedPond.isSpout
                   ? selectedPond.name.split('#').slice(1).join('#') || selectedPond.name
