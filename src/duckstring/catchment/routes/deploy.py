@@ -285,19 +285,19 @@ def _register(db, name, version, kind, source_path, cfg, ripples) -> None:
             db.execute(
                 "UPDATE pond_version SET source_path = ?, major = ?, immediate_retries = ?, "
                 "source_retries = ?, deployed_at = ?, duck_pool = ?, flock_mode = ?, flock_engine = ?, "
-                "oom_policy = ? WHERE id = ?",
+                "oom_policy = ?, dbt = ? WHERE id = ?",
                 (source_path, major, cfg["immediate_retries"], cfg["source_retries"], deployed_at,
                  cfg.get("duck_pool"), cfg.get("flock_mode"), cfg.get("flock_engine"),
-                 cfg.get("oom_policy"), pv_id),
+                 cfg.get("oom_policy"), int(bool(cfg.get("dbt_project"))), pv_id),
             )
         else:
             db.execute(
                 "INSERT INTO pond_version (pond_name_id, version, major, source_path, "
                 "immediate_retries, source_retries, deployed_at, duck_pool, flock_mode, flock_engine, "
-                "oom_policy) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "oom_policy, dbt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (pn_id, version, major, source_path, cfg["immediate_retries"], cfg["source_retries"],
                  deployed_at, cfg.get("duck_pool"), cfg.get("flock_mode"), cfg.get("flock_engine"),
-                 cfg.get("oom_policy")),
+                 cfg.get("oom_policy"), int(bool(cfg.get("dbt_project")))),
             )
             (pv_id,) = db.execute(
                 "SELECT id FROM pond_version WHERE pond_name_id = ? AND version = ?", (pn_id, version)

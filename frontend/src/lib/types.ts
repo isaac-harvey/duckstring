@@ -18,6 +18,7 @@ export interface Pond {
   kind: string; // inlet | pond | outlet
   isDraw: boolean; // a Pond Draw — fed by a duct from an upstream Catchment
   isSpout: boolean; // a Spout — egresses its source's output to an external system (terminal)
+  dbt: boolean; // a dbt-mode Pond — its Ripples are dbt models (no @ripple code)
   sources: PondId[];
 }
 

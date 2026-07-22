@@ -138,6 +138,17 @@ export const PondNode = memo(function PondNode({ data }: NodeProps) {
               {pond.isDraw ? '[DRAW]' : '[SPOUT]'}
             </span>
           )}
+          {pond.dbt && (
+            <span
+              title="dbt-mode Pond — its Ripples are dbt models"
+              style={{
+                fontSize: 9, fontWeight: 800, color: '#ff694b', letterSpacing: '0.02em', flexShrink: 0,
+                border: '1px solid #ff694b', borderRadius: 3, padding: '0 3px', lineHeight: 1.6, alignSelf: 'center',
+              }}
+            >
+              dbt
+            </span>
+          )}
           <span style={{ fontSize: 13, fontWeight: 700, color: '#e4e4e7', letterSpacing: '0.04em', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
             {displayName}
           </span>

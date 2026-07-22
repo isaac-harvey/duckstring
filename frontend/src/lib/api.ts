@@ -83,6 +83,7 @@ export interface RawPond {
   kind: string;
   is_draw: boolean; // a Pond Draw — fed by a duct from an upstream Catchment, not run by a Duck
   is_spout: boolean; // a Spout — egresses its source's output to an external system (run by the egress worker)
+  dbt: boolean; // a dbt-mode Pond — its Ripples are dbt models
   spout: { destination: string; table: string | null; mode: string; armed: boolean } | null;
   version: string;
   has_tables: boolean; // this major line has published at least one table — the data viewer is offered

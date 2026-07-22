@@ -770,10 +770,19 @@ export function Sidebar({ mobile = false }: { mobile?: boolean }) {
           <Section>
             {/* The Pond name is the sidebar's headline — prominent, and shown verbatim (not upper-cased).
                 The kind is implied (and shown on the meta line below), so it needs no label here. */}
-            <div style={{ fontSize: 18, fontWeight: 700, color: '#f4f4f5', lineHeight: 1.2, wordBreak: 'break-word', marginBottom: 8 }}>
-              {selectedPond.isSpout
-                ? selectedPond.name.split('#').slice(1).join('#') || selectedPond.name
-                : selectedPond.name}
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+              {selectedPond.dbt && (
+                <span title="dbt-mode Pond — its Ripples are dbt models"
+                      style={{ fontSize: 10, fontWeight: 800, color: '#ff694b', border: '1px solid #ff694b',
+                               borderRadius: 3, padding: '1px 4px', lineHeight: 1.3, flexShrink: 0 }}>
+                  dbt
+                </span>
+              )}
+              <span style={{ fontSize: 18, fontWeight: 700, color: '#f4f4f5', lineHeight: 1.2, wordBreak: 'break-word', minWidth: 0 }}>
+                {selectedPond.isSpout
+                  ? selectedPond.name.split('#').slice(1).join('#') || selectedPond.name
+                  : selectedPond.name}
+              </span>
             </div>
             <div style={{ fontSize: 11, color: '#71717a', marginBottom: 8, lineHeight: 1.7 }}>
               <div>

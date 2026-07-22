@@ -141,7 +141,7 @@ function transformStatus(payload: StatusPayload): StatusSlice {
     if (p.is_draw && !consumed.has(p.id)) continue;
     ponds[p.id] = {
       id: p.id, name: p.name, kind: p.kind,
-      isDraw: p.is_draw ?? false, isSpout: p.is_spout ?? false, sources: [],
+      isDraw: p.is_draw ?? false, isSpout: p.is_spout ?? false, dbt: p.dbt ?? false, sources: [],
     };
     pondInfo[p.id] = {
       version: p.version,

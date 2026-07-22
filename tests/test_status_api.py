@@ -82,6 +82,18 @@ def test_status_flags_ponds_with_exported_tables(tmp_path):
     assert _pond(d.status(), "snk")["has_tables"] is False  # only src exported
 
 
+def test_status_flags_dbt_mode_pond(tmp_path):
+    db = connect(tmp_path / "duck.db")
+    migrate(db)
+    _register(db, "py", "1.0.0", "pond", "ponds/py/1.0.0", _cfg(kind="pond"), _RIPPLES)
+    _register(db, "shop", "1.0.0", "pond", "ponds/shop/1.0.0",
+              {**_cfg(kind="pond"), "dbt_project": "dbt/"}, _RIPPLES)
+    d = Driver(db, tmp_path, "http://x", NoopLauncher())
+    st = {p["id"]: p for p in d.status()["ponds"]}
+    assert st["shop@1"]["dbt"] is True
+    assert st["py@1"]["dbt"] is False
+
+
 def test_status_exposes_d_ms_and_null_trigger_by_default(tmp_path):
     d = _driver(tmp_path)
     snk = _pond(d.status(), "snk")
