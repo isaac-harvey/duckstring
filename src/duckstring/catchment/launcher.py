@@ -150,6 +150,20 @@ class DispatchingLauncher:
                 return remote
         return self.local
 
+    def attach_remotes(self, remotes, dialback=None) -> None:
+        """Install remote backends onto a live launcher — runtime cloud-enable (creds / the data root
+        were added after boot). Resolves the shared dial-back to the currently-known bind address so the
+        newly-attached backends aren't stuck deferred (the boot middleware fires only once)."""
+        self.remotes = remotes if isinstance(remotes, dict) else {"_any": remotes}
+        self.dialback = dialback
+        url = self.local.base_url
+        if url is not None:
+            if dialback is not None:
+                dialback.set_base_url(url)
+            else:
+                for remote in self.remotes.values():
+                    remote.set_base_url(url)
+
     def set_base_url(self, url: str) -> None:
         self.local.set_base_url(url)
         if self.dialback is not None:

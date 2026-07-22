@@ -41,6 +41,13 @@ def set_secret(request: Request, body: _SecretBody):
     if body.name.startswith(cloud.AWS_SECRET_PREFIX):
         os.environ[body.name] = body.value
         cloud._chain_has_credentials.cache_clear()
+        # Adding/rotating a credential must make remote compute usable (and pick up the new value)
+        # without a restart — attach or refresh the remote backends live. Guarded so it never fails set.
+        try:
+            from ..cloud_backends import refresh_cloud_backends
+            refresh_cloud_backends(request.app)
+        except Exception:
+            pass
     return {"ok": True, "name": body.name}
 
 

@@ -87,6 +87,10 @@ class Ec2Launcher:
             self._client = boto3.client("ec2", **({"region_name": self.region} if self.region else {}))
         return self._client
 
+    def reset_client(self) -> None:
+        """Drop the cached boto3 client so added/rotated credentials take effect on the next spawn."""
+        self._client = None
+
     @property
     def remote_base_url(self) -> str | None:
         return self.dialback.url

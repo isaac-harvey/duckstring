@@ -71,6 +71,10 @@ class FargateLauncher:
             self._client = boto3.client("ecs", **({"region_name": self.region} if self.region else {}))
         return self._client
 
+    def reset_client(self) -> None:
+        """Drop the cached boto3 client so added/rotated credentials take effect on the next spawn."""
+        self._client = None
+
     # ─── the launcher interface ───────────────────────────────────────────────────
 
     def set_base_url(self, url: str) -> None:

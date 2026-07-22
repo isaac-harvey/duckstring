@@ -54,43 +54,39 @@ async def _lifespan(app: FastAPI):
             # dedicated ones on EC2 — the same code whether the Catchment is local or hosted. The EC2
             # backend is only built when cloud is enabled (remote data root + AWS creds); otherwise
             # remote targets degrade to local (plans/cloud-config.md).
-            from . import cloud
+            from .cloud_backends import build_remote_backends
             from .launcher import DispatchingLauncher
 
             local = SubprocessLauncher(
                 app.state.root, base_url, token=app.state.duck_token, data_root=app.state.data_root
             )
-            remotes, dialback = {}, None
-            if cloud.is_remote(app.state.data_root) and cloud.aws_configured(app.state.secret_store):
-                from .dialback import RemoteDialback
-                from .ec2_launcher import Ec2Launcher
-                from .fargate_launcher import FargateLauncher
-                from .relay import RelayManager, needs_relay
-
-                # A local Catchment (a laptop behind NAT) can't be dialed back — the auto-relay bridges it
-                # (plans/cloud-config.md). Built only when needed + configured; a public
-                # DUCKSTRING_CATCHMENT_PUBLIC_URL still wins and skips the relay.
-                relay = None
-                has_public = os.environ.get("DUCKSTRING_CATCHMENT_PUBLIC_URL")
-                relay_off = os.environ.get("DUCKSTRING_RELAY", "").lower() in ("off", "0", "false")
-                if not has_public and not relay_off and needs_relay(base_url):
-                    candidate = RelayManager(bind_url=base_url)
-                    if candidate.configured():
-                        relay = candidate
-                # One shared dial-back (URL + relay) across the remote backends. Fargate is the default;
-                # EC2 rides alongside for escape-hatch pools. Both are inert until a matching pool spawns.
-                # An explicit DUCKSTRING_CATCHMENT_PUBLIC_URL is the reachable dial-back address (a tunnel /
-                # a hosted Catchment's URL) — it wins over both the relay and the local bind.
-                dialback = RemoteDialback(base_url, relay=relay, public_url=has_public)
-                kw = dict(token=app.state.duck_token, data_root=app.state.data_root, dialback=dialback)
-                remotes = {
-                    "fargate": FargateLauncher(app.state.root, base_url, **kw),
-                    "ec2": Ec2Launcher(app.state.root, base_url, **kw),
-                }
+            # The remote backends (Fargate/EC2 + the shared dial-back) exist only when cloud is enabled
+            # (remote data root + AWS creds); otherwise remote targets degrade to local. The same builder
+            # re-attaches them live when creds / the data root change at runtime (see cloud_backends).
+            remotes, dialback = build_remote_backends(
+                app.state.root, base_url, app.state.duck_token, app.state.data_root, app.state.secret_store)
             launcher = DispatchingLauncher(local, remotes, dialback=dialback, default_provider="fargate")
     driver = Driver(app.state.db, app.state.root, base_url, launcher, data_root=app.state.data_root)
     app.state.driver = driver
     app.state.launcher = launcher
+
+    # Boot credential check: the cloud gate is presence-based (deterministic, network-free), so a
+    # present-but-rejected key would show "enabled" while every remote launch fails. Validate the creds
+    # actually authenticate and WARN if not — non-blocking (a daemon thread), never fails boot. Validity
+    # is surfaced, not folded into the gate (a transient STS blip must not strand a running setup).
+    from . import cloud as _cloud
+    if _cloud.is_remote(app.state.data_root) and _cloud.aws_configured(app.state.secret_store):
+        import logging
+        import threading
+
+        def _probe_credentials():
+            err = _cloud.validate_credentials()
+            if err:
+                logging.getLogger("duckstring.catchment").warning(
+                    "cloud is enabled but the AWS credentials did not validate (STS GetCallerIdentity): "
+                    "%s — remote Duck launches will fail until this is fixed (Options → Cloud → Verify).", err)
+
+        threading.Thread(target=_probe_credentials, daemon=True).start()
 
     # Restore: resume any Pond Runs that were in flight when the Catchment last stopped.
     driver.resume_incomplete()

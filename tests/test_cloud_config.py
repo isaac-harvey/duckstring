@@ -177,6 +177,63 @@ def test_verify_flags_unwritable_bucket(client, monkeypatch):
     assert body["ok"] is True and body["bucket_ok"] is False and "AccessDenied" in body["bucket_error"]
 
 
+# ─── Live credential validation ─────────────────────────────────────────────────
+
+def test_validate_credentials_ok(monkeypatch):
+    monkeypatch.setitem(sys.modules, "boto3", _make_boto3())
+    assert cloud.validate_credentials() is None
+
+
+def test_validate_credentials_reports_error(monkeypatch):
+    monkeypatch.setitem(sys.modules, "boto3", _make_boto3(sts_error=RuntimeError("ExpiredToken")))
+    assert cloud.validate_credentials() == "ExpiredToken"
+
+
+# ─── Runtime rebuild of the remote backends ─────────────────────────────────────
+
+def _dispatching_app(tmp_path, store, base_url="http://catchment.example:7474"):
+    from duckstring.catchment.launcher import DispatchingLauncher, SubprocessLauncher
+    disp = DispatchingLauncher(SubprocessLauncher(tmp_path, base_url), {})
+    return types.SimpleNamespace(state=types.SimpleNamespace(
+        launcher=disp, data_root="s3://bucket/prefix", secret_store=store,
+        root=tmp_path, duck_token="tok", base_url=base_url))
+
+
+def test_build_remote_backends_empty_without_gate(tmp_path):
+    from duckstring.catchment.cloud_backends import build_remote_backends
+    store = SecretStore(tmp_path)  # no creds, local data root
+    assert build_remote_backends(tmp_path, "http://x:1", "tok", None, store) == ({}, None)
+
+
+def test_refresh_attaches_remotes_at_runtime_then_resets(tmp_path, monkeypatch):
+    monkeypatch.setenv("DUCKSTRING_RELAY", "off")  # never provision a relay in a unit test
+    from duckstring.catchment.cloud_backends import refresh_cloud_backends
+    store = SecretStore(tmp_path)
+    store.set("AWS_ACCESS_KEY_ID", "AKIA_TEST")  # flips aws_configured → gate enabled (s3 root below)
+    app = _dispatching_app(tmp_path, store)
+
+    # No remotes yet (cloud was "disabled" at construction) → refresh builds + attaches them live.
+    assert app.state.launcher.remotes == {}
+    assert refresh_cloud_backends(app) is True
+    assert set(app.state.launcher.remotes) == {"fargate", "ec2"}
+
+    # A second refresh (a credential rotation) drops the cached boto client so new creds take effect.
+    app.state.launcher.remotes["fargate"]._client = "stale"
+    assert refresh_cloud_backends(app) is True
+    assert app.state.launcher.remotes["fargate"]._client is None
+
+
+def test_refresh_is_a_noop_for_a_non_dispatching_launcher(tmp_path):
+    from duckstring.catchment.cloud_backends import refresh_cloud_backends
+    from duckstring.catchment.launcher import NoopLauncher
+    store = SecretStore(tmp_path)
+    store.set("AWS_ACCESS_KEY_ID", "AKIA_TEST")
+    app = types.SimpleNamespace(state=types.SimpleNamespace(
+        launcher=NoopLauncher(), data_root="s3://bucket/prefix", secret_store=store,
+        root=tmp_path, duck_token="tok", base_url="http://x:1"))
+    assert refresh_cloud_backends(app) is False
+
+
 # ─── Access gating ──────────────────────────────────────────────────────────────
 
 def test_aws_routes_are_full_gated(tmp_path, monkeypatch):

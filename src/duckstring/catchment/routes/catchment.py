@@ -112,6 +112,13 @@ def put_settings(request: Request, body: _SettingsBody):
     launcher = getattr(app.state, "launcher", None)
     if launcher is not None:
         launcher.data_root = new
+    # Attaching the data root can flip the gate to enabled (creds may already be present) — build the
+    # remote backends live so remote compute works without a restart. Guarded: never fail the set.
+    try:
+        from ..cloud_backends import refresh_cloud_backends
+        refresh_cloud_backends(app)
+    except Exception:
+        pass
     return cloud.cloud_status(new, app.state.secret_store)
 
 
@@ -238,20 +245,20 @@ def verify_cloud(request: Request, body: _VerifyBody = _VerifyBody()):
     the set-once data root. Returns ``{ok, account?, arn?, region?, bucket_ok?, bucket_error?, error?}``;
     a credential/permission problem is a 200 ``{ok: false, error}``, not a 5xx. Full-gated."""
     region = _region_from_env()
+    signing = region or "us-east-1"  # STS/S3 clients need a region to sign; the identity is global
     try:
         import boto3
     except Exception:
         return {"ok": False, "error": "boto3 is not installed on the Catchment"}
     try:
-        sts = boto3.client("sts", **({"region_name": region} if region else {}))
-        ident = sts.get_caller_identity()
+        ident = boto3.client("sts", region_name=signing).get_caller_identity()
     except Exception as exc:
         return {"ok": False, "region": region, "error": _aws_error(exc)}
     result = {"ok": True, "account": ident.get("Account"), "arn": ident.get("Arn"), "region": region}
     root = (body.data_root or "").strip()
     if root and root.lower().startswith("s3://"):
         try:
-            _probe_s3_writable(boto3, root, region)
+            _probe_s3_writable(boto3, root, signing)
             result["bucket_ok"] = True
         except Exception as exc:
             result["bucket_ok"] = False

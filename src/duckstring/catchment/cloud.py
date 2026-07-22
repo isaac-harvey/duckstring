@@ -111,6 +111,21 @@ def load_aws_env(secret_store=None) -> None:
         _chain_has_credentials.cache_clear()
 
 
+def validate_credentials(region: str | None = None) -> str | None:
+    """A *live* credential check: None if the control-plane AWS creds authenticate (STS
+    GetCallerIdentity), else a short error string. Deliberately **separate** from the presence-based
+    ``aws_configured`` gate — the gate must stay deterministic and network-free (a transient STS blip
+    must never flip cloud off and strand a running setup), so validity is surfaced (a boot warning, the
+    Verify button), not folded into the gate. A region is required only to sign the request."""
+    region = region or os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or "us-east-1"
+    try:
+        import boto3
+        boto3.client("sts", region_name=region).get_caller_identity()
+        return None
+    except Exception as exc:
+        return str(exc) or exc.__class__.__name__
+
+
 def cloud_status(data_root: str | None, secret_store=None) -> dict:
     """The gate + its reasons — surfaced on /api/status and the settings endpoint so the UI can grey
     out remote-compute options and explain why."""
