@@ -447,28 +447,30 @@ const RUN_CAP = 50;
 // Pond Run it maps to, so a click selects it (opening Run Detail) and a selected run highlights back here.
 type TracePoint = { key: string; time: number; duration: number; run: PondRun };
 
-// Per-run points (asc) for a set of Pond Runs — each run's completion time + its duration.
+// Per-run points for a set of Pond Runs — each run's completion time + its duration. Sorted ascending by
+// time so the plot renders oldest→newest regardless of the source order (the feed is newest-first, but a
+// "from"-anchored range fetch comes back ascending).
 function pondTrace(runs: PondRun[]): TracePoint[] {
   const pts: TracePoint[] = [];
-  for (const r of [...runs].reverse()) { // store holds newest-first
+  for (const r of runs) {
     if (r.startedAt && r.finishedAt) {
       pts.push({ key: runKey(r), time: ms(r.finishedAt), duration: ms(r.finishedAt) - ms(r.startedAt), run: r });
     }
   }
-  return pts;
+  return pts.sort((a, b) => a.time - b.time);
 }
 
-// Per-run points (asc) for one Ripple across the Pond's run history — plots the *ripple's* timing, but
-// still maps to the containing Pond Run (Run Detail is per Pond Run).
+// Per-run points for one Ripple across the Pond's run history — plots the *ripple's* timing, but still
+// maps to the containing Pond Run (Run Detail is per Pond Run). Sorted ascending by time.
 function rippleTrace(runs: PondRun[], rippleName: string): TracePoint[] {
   const pts: TracePoint[] = [];
-  for (const r of [...runs].reverse()) {
+  for (const r of runs) {
     const rr = r.ripples?.find((x) => x.ripple === rippleName);
     if (rr?.startedAt && rr?.finishedAt) {
       pts.push({ key: runKey(r), time: ms(rr.finishedAt), duration: ms(rr.finishedAt) - ms(rr.startedAt), run: r });
     }
   }
-  return pts;
+  return pts.sort((a, b) => a.time - b.time);
 }
 
 // The interactive timing chart wired to run selection: clicking a point opens that run in Run Detail;
@@ -626,6 +628,7 @@ export function TracePanel() {
             <span style={{ width: 26, fontSize: 10, color: '#52525b' }}>from</span>
             <input type="datetime-local" step="1" value={from} max={to || undefined}
                    onChange={(e) => setFrom(e.target.value)} style={dateInput} />
+            <span style={{ width: 14, flexShrink: 0 }} />
           </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
             <span style={{ width: 26, fontSize: 10, color: '#52525b' }}>to</span>
@@ -635,7 +638,7 @@ export function TracePanel() {
               onClick={() => { setFrom(''); setTo(''); setRangeRuns(null); }}
               disabled={!rangeActive}
               title="Clear range — show the last 50 runs"
-              style={{ background: 'transparent', border: 'none', color: rangeActive ? '#a1a1aa' : '#3f3f46', cursor: rangeActive ? 'pointer' : 'default', fontSize: 12, padding: '0 2px', fontFamily: 'inherit' }}
+              style={{ width: 14, flexShrink: 0, textAlign: 'center', background: 'transparent', border: 'none', color: rangeActive ? '#a1a1aa' : '#3f3f46', cursor: rangeActive ? 'pointer' : 'default', fontSize: 12, padding: 0, fontFamily: 'inherit' }}
             >
               ✕
             </button>

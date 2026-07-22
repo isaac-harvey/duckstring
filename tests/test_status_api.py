@@ -253,6 +253,26 @@ def test_run_history_date_range_filters_started_at(tmp_path):
     assert hist(before="2026-07-22T14:35:35.000Z") == []
 
 
+def test_run_history_range_anchoring_and_order(tmp_path):
+    # The window anchors on the bound: "from" → the first `limit` runs ascending from it; "to"-only (and
+    # the default) → the most-recent `limit`, descending.
+    d = _driver(tmp_path)
+    pv = d.db.execute("SELECT pv.id FROM pond_version pv JOIN pond_name pn ON pn.id = pv.pond_name_id "
+                      "WHERE pn.name = 'src'").fetchone()[0]
+    for h in (10, 11, 12):
+        ts = f"2026-07-22T{h:02d}:00:00+00:00"
+        d.db.execute("INSERT INTO pond_run (pond_version_id, f, started_at, finished_at, status) "
+                     "VALUES (?, ?, ?, ?, 'success')", (pv, ts, ts, ts))
+    d.db.commit()
+
+    def hours(**kw):
+        return [r["started_at"][11:13] for r in d.run_history("src@1", lineage=False, ripples=False, **kw)]
+
+    assert hours(limit=2) == ["12", "11"]                                   # default: most recent
+    assert hours(limit=2, after="2026-07-22T10:30:00Z") == ["11", "12"]      # from → forward (ascending)
+    assert hours(limit=2, before="2026-07-22T11:30:00Z") == ["11", "10"]     # to-only → the runs just prior
+
+
 # ─── HTTP layer ──────────────────────────────────────────────────────────────────
 
 

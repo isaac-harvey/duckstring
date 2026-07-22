@@ -3090,13 +3090,17 @@ class Driver:
                 conds.append("pr.started_at <= ?")
                 params.append(before)
             where = ("WHERE " + " AND ".join(conds)) if conds else ""
+            # Anchor the window: with an ``after`` bound, take the first ``limit`` runs *from* it (ascending
+            # — "from → to/now"); otherwise the most recent ``limit`` (descending — the default feed, and
+            # the ``before``-only case = the runs just prior to it).
+            order = "ASC" if after is not None else "DESC"
             rows = self.db.execute(
                 "SELECT pn.name, pv.major, pv.version, pr.pond_version_id, pr.f, pr.started_at, pr.finished_at, "
                 "pr.status, pr.error, pr.traceback "
                 "FROM pond_run pr "
                 "JOIN pond_version pv ON pv.id = pr.pond_version_id "
                 "JOIN pond_name pn ON pn.id = pv.pond_name_id "
-                f"{where} ORDER BY pr.started_at DESC, pr.f DESC LIMIT ?",
+                f"{where} ORDER BY pr.started_at {order}, pr.f {order} LIMIT ?",
                 (*params, limit),
             ).fetchall()
 
