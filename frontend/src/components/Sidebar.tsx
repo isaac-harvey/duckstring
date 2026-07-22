@@ -768,10 +768,8 @@ export function Sidebar({ mobile = false }: { mobile?: boolean }) {
       {selectedPond && !selectedRippleId && (
         <>
           <Section>
-            {/* The Pond name is the sidebar's headline — prominent, and shown verbatim (not upper-cased). */}
-            <div style={{ fontSize: 10, fontWeight: 700, color: '#52525b', letterSpacing: '0.1em', textTransform: 'uppercase', marginBottom: 3 }}>
-              {selectedPond.isSpout ? 'Spout' : 'Pond'}
-            </div>
+            {/* The Pond name is the sidebar's headline — prominent, and shown verbatim (not upper-cased).
+                The kind is implied (and shown on the meta line below), so it needs no label here. */}
             <div style={{ fontSize: 18, fontWeight: 700, color: '#f4f4f5', lineHeight: 1.2, wordBreak: 'break-word', marginBottom: 8 }}>
               {selectedPond.isSpout
                 ? selectedPond.name.split('#').slice(1).join('#') || selectedPond.name
