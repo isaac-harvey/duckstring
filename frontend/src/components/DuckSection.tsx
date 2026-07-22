@@ -3,6 +3,7 @@
 import { useEffect, useState } from 'react';
 import { useLiveStore, THEME_BRAND, THEME_PULL } from '@/lib/store';
 import { fetchDuckPools, type DuckConfig, type DuckPool } from '@/lib/api';
+import { InstanceTypePicker } from './InstanceTypePicker';
 
 // The per-Pond compute config (plans/cloud-config.md): the Duck TARGET (where it runs) + size, and the
 // Flock posture (over-envelope offload). The effective value coalesces override ?? declared ?? default;
@@ -80,12 +81,11 @@ export function DuckSection({ pondId, duck }: { pondId: string; duck: DuckConfig
       {target === 'dedicated' && (
         <div style={row}>
           <span style={lbl}>Box</span>
-          <input
+          <InstanceTypePicker
+            value={duck.dedicated_instance_type ?? ''}
             style={input}
-            defaultValue={duck.dedicated_instance_type ?? ''}
             placeholder="instance type (e.g. r6i.2xlarge)"
-            onBlur={(e) => {
-              const v = e.target.value.trim();
+            onCommit={(v) => {
               if (v !== (duck.dedicated_instance_type ?? '')) setDuck(pondId, { dedicated_instance_type: v || null });
             }}
           />

@@ -83,6 +83,34 @@ def _chain_has_credentials() -> bool:
         return False
 
 
+AWS_SECRET_PREFIX = "AWS_"
+
+
+def load_aws_env(secret_store=None) -> None:
+    """Inject any ``AWS_*`` secrets into the process environment so botocore's default credential chain
+    actually picks them up. ``aws_configured`` already *counts* an ``AWS_*`` secret as creds (the gate);
+    this gives that its teeth — every boto3 client is built off the ambient chain, so without this a
+    secret-stored key would flip the gate green but real launches would fail with no ambient creds.
+
+    Real environment variables win (``setdefault``), so an operator's explicit env is never overridden.
+    Called at startup and after a matching secret is set (see routes/secrets)."""
+    if secret_store is None:
+        return
+    try:
+        names = [n["name"] for n in secret_store.names() if n["name"].startswith(AWS_SECRET_PREFIX)]
+    except Exception:
+        return
+    changed = False
+    for name in names:
+        if name not in os.environ:
+            value = secret_store.get(name)
+            if value is not None:
+                os.environ[name] = value
+                changed = True
+    if changed:
+        _chain_has_credentials.cache_clear()
+
+
 def cloud_status(data_root: str | None, secret_store=None) -> dict:
     """The gate + its reasons — surfaced on /api/status and the settings endpoint so the UI can grey
     out remote-compute options and explain why."""

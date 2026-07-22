@@ -1,0 +1,194 @@
+"""Cloud config: the AWS_*-secret → environment wiring (the enable-by-secret teeth), the live
+instance-type discovery endpoint, and the enable-verification probe. AWS is faked (no network)."""
+
+from __future__ import annotations
+
+import os
+import sys
+import types
+
+import pytest
+from fastapi.testclient import TestClient
+
+from duckstring.catchment import auth, cloud
+from duckstring.catchment.app import create_app
+from duckstring.catchment.routes import catchment as croute
+from duckstring.catchment.secrets import SecretStore
+
+pytestmark = pytest.mark.timeout(10)
+
+
+@pytest.fixture(autouse=True)
+def _clean_aws_env():
+    """Snapshot/restore AWS_* env and the per-region instance-type cache so tests don't leak into each
+    other (load_aws_env / the secret route mutate the real process environment by design)."""
+    saved = {k: v for k, v in os.environ.items() if k.startswith("AWS_")}
+    for k in list(os.environ):
+        if k.startswith("AWS_"):
+            del os.environ[k]
+    croute._INSTANCE_TYPES.clear()
+    cloud._chain_has_credentials.cache_clear()
+    yield
+    for k in list(os.environ):
+        if k.startswith("AWS_"):
+            del os.environ[k]
+    os.environ.update(saved)
+    croute._INSTANCE_TYPES.clear()
+    cloud._chain_has_credentials.cache_clear()
+
+
+# ─── Fake boto3 (injected via sys.modules so `import boto3` in a route returns it) ──
+
+class _Paginator:
+    def __init__(self, pages):
+        self._pages = pages
+
+    def paginate(self, **_kw):
+        return list(self._pages)
+
+
+class _Ec2:
+    def __init__(self, pages):
+        self._pages = pages
+
+    def get_paginator(self, _name):
+        return _Paginator(self._pages)
+
+
+class _Sts:
+    def __init__(self, ident, error):
+        self._ident, self._error = ident, error
+
+    def get_caller_identity(self):
+        if self._error:
+            raise self._error
+        return self._ident
+
+
+class _S3:
+    def __init__(self, error):
+        self._error = error
+
+    def put_object(self, **_kw):
+        if self._error:
+            raise self._error
+
+    def delete_object(self, **_kw):
+        pass
+
+
+def _make_boto3(*, ident=None, sts_error=None, ec2_pages=None, s3_error=None):
+    def client(service, **_kw):
+        if service == "ec2":
+            return _Ec2(ec2_pages or [])
+        if service == "sts":
+            return _Sts(ident or {"Account": "123456789012", "Arn": "arn:aws:iam::123456789012:user/tester"}, sts_error)
+        if service == "s3":
+            return _S3(s3_error)
+        raise ValueError(service)
+    return types.SimpleNamespace(client=client)
+
+
+_EC2_PAGES = [{"InstanceTypes": [
+    {"InstanceType": "m6i.large", "VCpuInfo": {"DefaultVCpus": 2}, "MemoryInfo": {"SizeInMiB": 8192}},
+    {"InstanceType": "c6i.large", "VCpuInfo": {"DefaultVCpus": 2}, "MemoryInfo": {"SizeInMiB": 4096}},
+    {"InstanceType": "g5.xlarge", "VCpuInfo": {"DefaultVCpus": 4}, "MemoryInfo": {"SizeInMiB": 16384},
+     "GpuInfo": {"Gpus": [{"Count": 1}]}},
+]}]
+
+
+@pytest.fixture
+def client(tmp_path):
+    with TestClient(create_app(tmp_path)) as c:  # open mode → full access
+        yield c
+
+
+# ─── AWS_* secrets → environment ────────────────────────────────────────────────
+
+def test_load_aws_env_injects_only_aws_prefixed(tmp_path):
+    store = SecretStore(tmp_path)
+    store.set("AWS_ACCESS_KEY_ID", "AKIA_TEST")
+    store.set("PGPASS", "hunter2")
+    cloud.load_aws_env(store)
+    assert os.environ.get("AWS_ACCESS_KEY_ID") == "AKIA_TEST"
+    assert "PGPASS" not in os.environ  # a non-AWS_ secret is never leaked into the environment
+
+
+def test_load_aws_env_real_env_wins(tmp_path):
+    os.environ["AWS_DEFAULT_REGION"] = "us-east-1"
+    store = SecretStore(tmp_path)
+    store.set("AWS_DEFAULT_REGION", "eu-west-1")
+    cloud.load_aws_env(store)
+    assert os.environ["AWS_DEFAULT_REGION"] == "us-east-1"  # setdefault: ambient env is authoritative
+
+
+def test_setting_aws_secret_via_api_populates_env(client):
+    assert client.post("/api/secrets", json={"name": "AWS_SESSION_TOKEN", "value": "tok"}).status_code == 200
+    assert os.environ.get("AWS_SESSION_TOKEN") == "tok"  # applied live so boto3 uses it without a restart
+
+
+# ─── Instance-type discovery ────────────────────────────────────────────────────
+
+def test_instance_types_needs_a_region(client):
+    body = client.get("/api/catchment/instance-types").json()
+    assert body["available"] is False and body["types"] == []
+
+
+def test_instance_types_lists_and_sorts(client, monkeypatch):
+    monkeypatch.setitem(sys.modules, "boto3", _make_boto3(ec2_pages=_EC2_PAGES))
+    body = client.get("/api/catchment/instance-types?region=us-east-1").json()
+    assert body["available"] is True and body["region"] == "us-east-1"
+    # sorted by (vcpu, memory, name): the 2-vCPU/4-GiB comes first, the GPU box carries its gpu count.
+    assert [t["name"] for t in body["types"]] == ["c6i.large", "m6i.large", "g5.xlarge"]
+    g5 = next(t for t in body["types"] if t["name"] == "g5.xlarge")
+    assert g5["gpu"] == 1 and g5["memory_gib"] == 16.0
+
+
+def test_instance_types_graceful_on_aws_error(client, monkeypatch):
+    def _boom(_service, **_kw):
+        raise RuntimeError("Unable to locate credentials")
+    monkeypatch.setitem(sys.modules, "boto3", types.SimpleNamespace(client=_boom))
+    body = client.get("/api/catchment/instance-types?region=us-east-1").json()
+    assert body["available"] is False and "credentials" in body["error"]
+
+
+# ─── The enable-verification probe ──────────────────────────────────────────────
+
+def test_verify_ok_with_bucket_probe(client, monkeypatch):
+    os.environ["AWS_DEFAULT_REGION"] = "us-east-1"
+    monkeypatch.setitem(sys.modules, "boto3", _make_boto3(ec2_pages=_EC2_PAGES))
+    body = client.post("/api/catchment/cloud/verify", json={"data_root": "s3://bucket/prefix"}).json()
+    assert body["ok"] is True
+    assert body["account"] == "123456789012" and body["bucket_ok"] is True
+
+
+def test_verify_reports_bad_credentials_as_200(client, monkeypatch):
+    monkeypatch.setitem(sys.modules, "boto3",
+                        _make_boto3(sts_error=RuntimeError("The security token is invalid")))
+    res = client.post("/api/catchment/cloud/verify", json={})
+    assert res.status_code == 200
+    assert res.json()["ok"] is False
+
+
+def test_verify_flags_unwritable_bucket(client, monkeypatch):
+    monkeypatch.setitem(sys.modules, "boto3",
+                        _make_boto3(s3_error=RuntimeError("AccessDenied")))
+    body = client.post("/api/catchment/cloud/verify", json={"data_root": "s3://bucket/prefix"}).json()
+    assert body["ok"] is True and body["bucket_ok"] is False and "AccessDenied" in body["bucket_error"]
+
+
+# ─── Access gating ──────────────────────────────────────────────────────────────
+
+def test_aws_routes_are_full_gated(tmp_path, monkeypatch):
+    # Fake boto3 so the authorised call is deterministic + offline (a machine with an ambient AWS
+    # profile would otherwise make a real STS call).
+    monkeypatch.setitem(sys.modules, "boto3", _make_boto3())
+    app = create_app(tmp_path)
+    keys = auth.generate(app.state.db)
+    with TestClient(app) as c:
+        for level in ("read", "demand"):
+            h = {"Authorization": f"Bearer {keys[level]}"}
+            assert c.get("/api/catchment/instance-types?region=us-east-1", headers=h).status_code == 403
+            assert c.post("/api/catchment/cloud/verify", headers=h, json={}).status_code == 403
+        full = {"Authorization": f"Bearer {keys['full']}"}
+        assert c.post("/api/catchment/cloud/verify", headers=full, json={}).status_code == 200

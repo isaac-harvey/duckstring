@@ -157,6 +157,108 @@ def delete_duck_pool(request: Request, name: str):
     return {"ok": True}
 
 
+# ─── AWS discovery (instance types) + the cloud-enable verification probe ─────────
+#
+# Both use the control-plane AWS creds (env / profile / role, or an AWS_* secret loaded into the env by
+# cloud.load_aws_env). Any AWS failure is a 200 result ({available|ok: false, error}), never a 5xx — the
+# UI degrades to free-text entry and shows the reason rather than erroring.
+
+_INSTANCE_TYPES: dict[str, list[dict]] = {}  # region → sorted spec list; process-lifetime cache
+
+
+def _aws_error(exc: Exception) -> str:
+    """A short, non-secret message for the UI. boto3 error strings carry the operation + error code,
+    not credentials, but cap the length so a stray verbose message can't dominate the panel."""
+    msg = str(exc) or exc.__class__.__name__
+    return msg if len(msg) <= 300 else msg[:297] + "..."
+
+
+def _region_from_env() -> str | None:
+    import os
+    return os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
+
+
+def _describe_instance_types(client) -> list[dict]:
+    """Every current-generation EC2 instance type in the client's region, with vCPU / memory / GPU —
+    enough to render an informative, sortable dropdown."""
+    out: list[dict] = []
+    paginator = client.get_paginator("describe_instance_types")
+    for page in paginator.paginate(Filters=[{"Name": "current-generation", "Values": ["true"]}]):
+        for it in page.get("InstanceTypes", []):
+            gpus = sum(g.get("Count", 0) for g in it.get("GpuInfo", {}).get("Gpus", []))
+            out.append({
+                "name": it["InstanceType"],
+                "vcpu": it.get("VCpuInfo", {}).get("DefaultVCpus"),
+                "memory_gib": round(it.get("MemoryInfo", {}).get("SizeInMiB", 0) / 1024, 1),
+                "gpu": gpus,
+            })
+    out.sort(key=lambda t: (t.get("vcpu") or 0, t.get("memory_gib") or 0, t["name"]))
+    return out
+
+
+@router.get("/catchment/instance-types", dependencies=[auth.full])
+def instance_types(request: Request, region: str | None = None):
+    """EC2 instance types offered in ``region`` (current generation) with vCPU/memory/GPU — feeds the
+    compute dropdowns so an operator doesn't type an instance type blind. Full-gated (control-plane
+    creds). Cached per region for the process lifetime."""
+    region = (region or "").strip() or _region_from_env()
+    if not region:
+        return {"available": False, "error": "no region — pass ?region= or set AWS_DEFAULT_REGION", "types": []}
+    if region in _INSTANCE_TYPES:
+        return {"available": True, "region": region, "types": _INSTANCE_TYPES[region]}
+    try:
+        import boto3  # lazy — only a cloud-enabled Catchment ever needs it
+        client = boto3.client("ec2", region_name=region)
+        types = _describe_instance_types(client)
+    except Exception as exc:
+        return {"available": False, "region": region, "error": _aws_error(exc), "types": []}
+    _INSTANCE_TYPES[region] = types
+    return {"available": True, "region": region, "types": types}
+
+
+class _VerifyBody(BaseModel):
+    data_root: str | None = None  # optional: also probe this S3 bucket is writable (before committing it)
+
+
+def _probe_s3_writable(boto3, uri: str, region: str | None) -> None:
+    """Put and delete a tiny probe object under the data-root prefix — proves write access without
+    leaving anything behind. Raises the boto3 error on failure."""
+    rest = uri.split("://", 1)[1]
+    bucket, _, prefix = rest.partition("/")
+    key = f"{prefix.rstrip('/')}/.duckstring-probe" if prefix else ".duckstring-probe"
+    s3 = boto3.client("s3", **({"region_name": region} if region else {}))
+    s3.put_object(Bucket=bucket, Key=key, Body=b"duckstring")
+    s3.delete_object(Bucket=bucket, Key=key)
+
+
+@router.post("/catchment/cloud/verify", dependencies=[auth.full])
+def verify_cloud(request: Request, body: _VerifyBody = _VerifyBody()):
+    """Probe the control-plane AWS creds (STS ``GetCallerIdentity``) and, when a ``data_root`` is given,
+    that its S3 bucket is writable (a probe object put+delete) — so the UI can confirm before committing
+    the set-once data root. Returns ``{ok, account?, arn?, region?, bucket_ok?, bucket_error?, error?}``;
+    a credential/permission problem is a 200 ``{ok: false, error}``, not a 5xx. Full-gated."""
+    region = _region_from_env()
+    try:
+        import boto3
+    except Exception:
+        return {"ok": False, "error": "boto3 is not installed on the Catchment"}
+    try:
+        sts = boto3.client("sts", **({"region_name": region} if region else {}))
+        ident = sts.get_caller_identity()
+    except Exception as exc:
+        return {"ok": False, "region": region, "error": _aws_error(exc)}
+    result = {"ok": True, "account": ident.get("Account"), "arn": ident.get("Arn"), "region": region}
+    root = (body.data_root or "").strip()
+    if root and root.lower().startswith("s3://"):
+        try:
+            _probe_s3_writable(boto3, root, region)
+            result["bucket_ok"] = True
+        except Exception as exc:
+            result["bucket_ok"] = False
+            result["bucket_error"] = _aws_error(exc)
+    return result
+
+
 class _ResetBody(BaseModel):
     clear_history: bool = False
 

@@ -499,6 +499,7 @@ const modalBackdrop: React.CSSProperties = {
 function PondOptionsModal({ pond, canControl, onClose }: { pond: Pond; canControl: boolean; onClose: () => void }) {
   const pondInfo = useLiveStore((s) => s.pondInfo);
   const setBudget = useLiveStore((s) => s.setBudget);
+  const cloudEnabled = useLiveStore((s) => s.cloud?.cloud_enabled ?? false);
   const info = pondInfo[pond.id];
   // Retry-budget inputs, seeded from the Pond's live config (the modal remounts per pond, so a plain
   // initializer is enough — no re-seed-on-poll dance needed).
@@ -555,8 +556,9 @@ function PondOptionsModal({ pond, canControl, onClose }: { pond: Pond; canContro
               ))}
             </Section>
           )}
-          {/* Compute config (full only; Draws/Spouts carry none). */}
-          {canControl && info?.duck && (
+          {/* Compute config (full only; Draws/Spouts carry none). Hidden unless cloud is enabled — with
+              no remote backend every Duck runs on the Catchment box, so there is nothing to configure. */}
+          {canControl && cloudEnabled && info?.duck && (
             <Section>
               <Label>Compute</Label>
               <DuckSection pondId={pond.id} duck={info.duck} />

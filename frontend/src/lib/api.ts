@@ -462,6 +462,53 @@ export async function removeDuckPool(name: string): Promise<void> {
   if (!res.ok) throw new Error(`remove pool failed (${res.status})`);
 }
 
+// ─── AWS discovery + the cloud-enable verification probe ──────────────────────
+
+// One EC2 instance type + its specs (from the Catchment's DescribeInstanceTypes) — powers the compute
+// dropdowns so nobody types an instance type blind.
+export interface InstanceType {
+  name: string;
+  vcpu: number | null;
+  memory_gib: number | null;
+  gpu: number;
+}
+export interface InstanceTypesResult {
+  available: boolean; // false → AWS unreachable / no creds / no region; UI falls back to free text
+  region?: string;
+  error?: string;
+  types: InstanceType[];
+}
+
+// Fetch the offered instance types for a region (defaults to the Catchment's AWS region). Cached
+// Catchment-side; never throws on an AWS problem (returns available:false).
+export function fetchInstanceTypes(region?: string): Promise<InstanceTypesResult> {
+  const q = region ? `?region=${encodeURIComponent(region)}` : '';
+  return getJSON<InstanceTypesResult>(`/catchment/instance-types${q}`);
+}
+
+export interface CloudVerifyResult {
+  ok: boolean;            // STS GetCallerIdentity succeeded (creds are valid)
+  account?: string;
+  arn?: string;
+  region?: string | null;
+  bucket_ok?: boolean;    // present only when a data_root was probed
+  bucket_error?: string;
+  error?: string;
+}
+
+// Probe the control-plane AWS creds (and, if given, that the data-root bucket is writable) — a 200 with
+// ok:false on a credential/permission problem, so read the body rather than catching.
+export async function verifyCloud(dataRoot?: string): Promise<CloudVerifyResult> {
+  const res = await fetch(`${apiBase()}/catchment/cloud/verify`, {
+    method: 'POST',
+    headers: authHeaders({ 'content-type': 'application/json' }),
+    body: JSON.stringify({ data_root: dataRoot ?? null }),
+  });
+  if (res.status === 401) throw new UnauthorizedError();
+  if (!res.ok) throw new Error((await res.json().catch(() => null))?.detail ?? `verify failed (${res.status})`);
+  return res.json();
+}
+
 // ─── Spouts (egress) ─────────────────────────────────────────────────────────
 
 export interface RawSpout {

@@ -243,6 +243,10 @@ def create_app(
     from .secrets import SecretStore
     app.state.secret_store = SecretStore(root)
     credentials.set_secret_provider(app.state.secret_store.get)
+    # Give the AWS_* secrets teeth: load them into the environment so botocore's chain uses them (the
+    # enable-by-secret cloud flow). Real env wins.
+    from . import cloud as _cloud
+    _cloud.load_aws_env(app.state.secret_store)
     # The address Ducks dial back to: explicit argument (the CLI passes its bind address), or the
     # environment, or None — unknown, because the host platform picks the bind address (e.g. Posit
     # Connect). When None it is learned from the first request's ASGI scope below.
