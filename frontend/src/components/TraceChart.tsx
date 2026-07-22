@@ -8,18 +8,17 @@ import { THEME_PULL, THEME_RUNNING } from '@/lib/store';
 // close to it ⇒ it is. The y-axis is clipped near the 90th percentile (plus a margin
 // proportional to the mean) so aberrant gaps — e.g. after a stop — don't squash the rest.
 //
-// Both series' markers are interactive. Hovering a duration marker shows the run's completion time +
-// duration; hovering an interval marker shows the previous → this completion times + the gap. Clicking
-// either selects that run (opening it in Run Detail). Symmetrically, `selectedKey` enlarges both markers
-// of the selected run — a run with no marker here (a different Pond, or a no-duration pass) doesn't
-// highlight. Intervals are indexed to the *later* run (the completion that ends the gap), so a run's
-// duration and interval markers share its x-position and either one selects it.
+// Both series' markers are interactive. Hovering either marker of a run picks that run: a dashed
+// vertical line joins its two points and a static readout beneath the plot shows the previous → this
+// completion times, the interval, and the duration (same readout whichever marker is hovered — no
+// edge-clipped floating tooltip). Clicking either selects the run (opening it in Run Detail).
+// Symmetrically, `selectedKey` enlarges both markers of the selected run — a run with no marker here
+// (a different Pond, or a no-duration pass) doesn't highlight. Intervals are indexed to the *later* run
+// (the completion that ends the gap), so a run's two markers share its x-position and either selects it.
 const INTERVAL_COLOR = THEME_PULL; // run cadence, tied to Wave/pull (≈ bottleneck under a Wave)
 const DURATION_COLOR = THEME_RUNNING; // run duration, tied to the running state
 
 export type TracePointView = { key: string; time: number; duration: number };
-
-type Hover = { i: number; kind: 'dur' | 'int' };
 
 function quantile(sortedAsc: number[], q: number): number {
   if (sortedAsc.length === 0) return 0;
@@ -40,7 +39,7 @@ export function TraceChart({
   selectedKey?: string | null;
   onSelect?: (key: string) => void;
 }) {
-  const [hover, setHover] = useState<Hover | null>(null);
+  const [hover, setHover] = useState<number | null>(null);
   const W = 256;
   const H = 100;
   const padL = 6;
@@ -100,57 +99,61 @@ export function TraceChart({
   const durLine = polyline(durs.map((v, i) => `${x(i)},${y(v)}`), DURATION_COLOR);
   const intLine = polyline(points.slice(1).map((_, k) => `${x(k + 1)},${y(interval(k + 1))}`), INTERVAL_COLOR);
 
-  // Per-run markers for both series (a run's duration marker always; its interval marker for i ≥ 1).
+  // A marker for one series of one run: a visible dot (enlarged when hovered/selected) + a wide hit area.
   const marker = (i: number, kind: 'dur' | 'int', color: string) => {
     const cy = kind === 'dur' ? y(durs[i]) : y(interval(i));
-    const active = selectedKey === points[i].key || (hover?.i === i && hover.kind === kind);
+    const active = selectedKey === points[i].key || hover === i;
     return (
       <g key={kind}>
         <circle cx={x(i)} cy={cy} r={active ? 4 : 2} fill={color} stroke={active ? '#fff' : 'none'} strokeWidth={active ? 1 : 0} />
         <circle cx={x(i)} cy={cy} r={7} fill="transparent" style={{ cursor: onSelect ? 'pointer' : 'default' }}
-                onMouseEnter={() => setHover({ i, kind })}
-                onMouseLeave={() => setHover((h) => (h && h.i === i && h.kind === kind ? null : h))}
+                onMouseEnter={() => setHover(i)}
+                onMouseLeave={() => setHover((h) => (h === i ? null : h))}
                 onClick={onSelect ? () => onSelect(points[i].key) : undefined} />
       </g>
     );
   };
 
-  const tip = hover && points[hover.i]
-    ? (hover.kind === 'dur'
-        ? { cx: x(hover.i), cy: y(durs[hover.i]), color: DURATION_COLOR,
-            top: clock(times[hover.i]), val: `${durs[hover.i].toFixed(2)}s` }
-        : { cx: x(hover.i), cy: y(interval(hover.i)), color: INTERVAL_COLOR,
-            top: `${clock(times[hover.i - 1])} → ${clock(times[hover.i])}`, val: `${interval(hover.i).toFixed(2)}s` })
-    : null;
-
   return (
     <div>
       {header}
-      <div style={{ position: 'relative' }}>
-        <svg width={W} height={H} style={{ display: 'block' }}>
-          <line x1={padL} y1={H - padB} x2={W - padR} y2={H - padB} stroke="#27272a" strokeWidth={1} />
-          {meanLine(meanLast3(intervalVals), INTERVAL_COLOR)}
-          {meanLine(meanLast3(durs), DURATION_COLOR)}
-          {durLine}
-          {intLine}
-          {points.map((p, i) => (
-            <Fragment key={p.key}>
-              {marker(i, 'dur', DURATION_COLOR)}
-              {i >= 1 && marker(i, 'int', INTERVAL_COLOR)}
-            </Fragment>
-          ))}
-        </svg>
-        {tip && (
-          <div
-            style={{
-              position: 'absolute', left: tip.cx, top: tip.cy, transform: 'translate(-50%, -118%)',
-              pointerEvents: 'none', background: '#09090b', border: '1px solid #3f3f46', borderRadius: 5,
-              padding: '3px 7px', fontSize: 10.5, lineHeight: 1.5, color: '#e4e4e7', whiteSpace: 'nowrap', zIndex: 5,
-            }}
-          >
-            <div style={{ color: '#a1a1aa' }}>{tip.top}</div>
-            <div style={{ color: tip.color, fontWeight: 700 }}>{tip.val}</div>
-          </div>
+      <svg width={W} height={H} style={{ display: 'block' }}>
+        <line x1={padL} y1={H - padB} x2={W - padR} y2={H - padB} stroke="#27272a" strokeWidth={1} />
+        {meanLine(meanLast3(intervalVals), INTERVAL_COLOR)}
+        {meanLine(meanLast3(durs), DURATION_COLOR)}
+        {durLine}
+        {intLine}
+        {/* The dashed connector joins the hovered run's two points. */}
+        {hover != null && hover >= 1 && (
+          <line x1={x(hover)} y1={y(durs[hover])} x2={x(hover)} y2={y(interval(hover))}
+                stroke="#71717a" strokeWidth={1} strokeDasharray="3 2" />
+        )}
+        {points.map((p, i) => (
+          <Fragment key={p.key}>
+            {marker(i, 'dur', DURATION_COLOR)}
+            {i >= 1 && marker(i, 'int', INTERVAL_COLOR)}
+          </Fragment>
+        ))}
+      </svg>
+      {/* Static readout beneath the plot (never clipped) — same info whichever marker is hovered. */}
+      <div style={{ marginTop: 6, minHeight: 30, fontSize: 10.5, lineHeight: 1.5, fontFamily: 'inherit' }}>
+        {hover != null && points[hover] ? (
+          <>
+            <div style={{ color: '#a1a1aa' }}>
+              {hover >= 1 ? `${clock(times[hover - 1])} → ${clock(times[hover])}` : clock(times[hover])}
+            </div>
+            <div>
+              {hover >= 1 && (
+                <>
+                  <span style={{ color: INTERVAL_COLOR }}>interval {interval(hover).toFixed(2)}s</span>
+                  <span style={{ color: '#52525b' }}> · </span>
+                </>
+              )}
+              <span style={{ color: DURATION_COLOR }}>run {durs[hover].toFixed(2)}s</span>
+            </div>
+          </>
+        ) : (
+          <div style={{ color: '#3f3f46' }}>Hover a point for run timing.</div>
         )}
       </div>
     </div>
