@@ -75,6 +75,24 @@ def _iso(dt: datetime) -> str:
     return dt.isoformat()
 
 
+def _plane_freshness(sidecar: dict) -> str | None:
+    """A Pond's freshness as recorded in its data plane — the max ``f`` (ISO string) across the
+    ``_trickle.json`` sidecar's table entries and its ``objects`` section (all output of a run shares the
+    run's ``f``). ``None`` for an empty plane (no sidecar). The ``state`` section (agg/acc companion
+    snapshots) is skipped — it is bounded by its base table's ``f``. ISO-8601 sorts lexically, so ``max``
+    over the strings is correct. This is the last *published* freshness (== ``changed_f``), not the
+    pass-heartbeat ``end_f`` (a no-change pass writes nothing to the plane) — coherent with the bytes."""
+    fs: list[str] = []
+    for key, entry in sidecar.items():
+        if key == "objects" and isinstance(entry, dict):
+            fs += [o["f"] for o in entry.values() if isinstance(o, dict) and o.get("f")]
+        elif key == "state":
+            continue
+        elif isinstance(entry, dict) and entry.get("f"):
+            fs.append(entry["f"])
+    return max(fs) if fs else None
+
+
 def _split_scope(scope: str | None) -> tuple[str | None, int | None]:
     """An alert-channel scope string → ``(scope_name, scope_major)``. ``"name@major"`` → one line;
     ``"name"`` → ``(name, None)`` (a bare name — ``add_channel`` resolves it to the highest deployed major);
@@ -675,19 +693,22 @@ class Driver:
             self._process(_now())
             return {"ponds": len(lines)}
 
-    def switch_data_root(self, new_root: str | None) -> dict:
-        """Re-point the data plane to ``new_root`` (``None`` = local, under the state root), leaving every
-        Pond **as if its data had been deleted** — and **dormant**. Stop-the-world: quiesce every Duck,
-        re-point future spawns, rewind all freshness to ``NEVER`` (cold refresh pending), and clear ALL
-        demand — pull, push, and standing Wave/Tide triggers — so **nothing auto-runs**.
+    def switch_data_root(self, new_root: str | None, *, mode: str = "empty") -> dict:
+        """Re-point the data plane to ``new_root`` (``None`` = local, under the state root). Stop-the-world
+        (quiesce every Duck) and **NON-destructive** — the OLD location is never scrubbed, so it stays a
+        readable backup / hand-migration source. Two modes (plans/data-root-switch.md):
 
-        This is deliberately NOT an auto-rebuild: the switch leaves the pipeline idle so the operator can
-        drive it — re-trigger the lines that can be re-derived from Inlets, or **hand-copy** (e.g. S3→S3)
-        the published data of lines that *can't* be re-derived, into the new location, before anything runs.
+        - ``"empty"`` (default): leave every Pond **as if its data were deleted** and **dormant** — rewind
+          all freshness to ``NEVER`` (cold refresh pending) and clear ALL demand (pull, push, standing
+          Wave/Tide). Nothing auto-runs; the operator drives the rebuild (or hand-copies data in first).
+        - ``"adopt"``: **pick up whatever data already sits in the target plane** (a bucket you copied into,
+          or one you're returning to) and resume with **no rebuild** — read each Pond's freshness from its
+          ``_trickle.json`` sidecar in the target, set the ledger to match, drop the local hot state
+          (registry + ledger) so the next run re-hydrates from the target, and **keep** demand + triggers.
 
-        **NON-destructive**: the *old* location's published data is left completely intact — a readable
-        backup / hand-migration source. Topology, deploys, and secrets are untouched (freshness + demand
-        are the only engine state reset). Returns ``{"ponds": n}``."""
+        Returns ``{"ponds": n}``."""
+        if mode not in ("empty", "adopt"):
+            raise ValueError(f"unknown switch mode {mode!r} (expected 'empty' or 'adopt')")
         with self.lock:
             # 1. Quiesce: stop every Duck (wait, so the registry handles are free) and drop pending work.
             for key in list(self.state.ponds):
@@ -696,7 +717,7 @@ class Driver:
             self._pending_transfers.clear()
             self._pending_egress.clear()
             self._idle_since.clear()
-            lines = [(m["name"], m["major"]) for m in self.meta.values()
+            lines = [(m["name"], m["major"], m["pond_id"]) for m in self.meta.values()
                      if not m.get("is_draw") and not m.get("is_spout")]
             # 2. Re-point future spawns (publish + read) at the new plane. NOTE: the OLD location is not
             #    touched — no scrub — so it remains a hand-migration source / switch-back backup.
@@ -705,22 +726,53 @@ class Driver:
                 self.launcher.set_data_root(new_root)
             else:
                 self.launcher.data_root = new_root
-            # 3. "Delete the data": rewind freshness to NEVER + flag a cold refresh (a run, if the operator
-            #    triggers one, wipes the stale registry and rebuilds), AND clear every form of demand so the
-            #    pipeline stays idle — pull tokens, push targets, and standing Wave/Tide triggers.
-            self.db.execute(
-                "UPDATE pond_state SET start_f=?, end_f=?, changed_f=?, d_ms=0, is_failed=0, is_blocked=0, "
-                "failed_f=?, failures=0, is_killed=0, refresh_pending=1, has_pull=0, has_received_pull=0",
-                (_iso(NEVER), _iso(NEVER), _iso(NEVER), _iso(NEVER)),
-            )
-            self.db.execute("DELETE FROM pond_target")   # push demand
-            self.db.execute("DELETE FROM pond_trigger")  # standing Wave/Tide
+            if mode == "empty":
+                # "Delete the data": rewind freshness + flag a cold refresh, and clear every form of demand
+                # so the pipeline stays idle — pull tokens, push targets, and standing Wave/Tide triggers.
+                self.db.execute(
+                    "UPDATE pond_state SET start_f=?, end_f=?, changed_f=?, d_ms=0, is_failed=0, is_blocked=0, "
+                    "failed_f=?, failures=0, is_killed=0, refresh_pending=1, has_pull=0, has_received_pull=0",
+                    (_iso(NEVER), _iso(NEVER), _iso(NEVER), _iso(NEVER)),
+                )
+                self.db.execute("DELETE FROM pond_target")   # push demand
+                self.db.execute("DELETE FROM pond_trigger")  # standing Wave/Tide
+            else:
+                self._adopt_plane(lines, new_root)
             self.db.commit()
-            # 4. Rebuild the engine from the rewound, demand-free DB. Do NOT kick a rebuild — stay dormant
-            #    until the operator triggers (or hand-copies data in).
+            # 3. Rebuild the engine from the DB. empty → dormant (no kick); adopt → resumes on its own demand.
             self.reload()
             self.state_version += 1
             return {"ponds": len(lines)}
+
+    def _adopt_plane(self, lines, new_root: str | None) -> None:
+        """Set each line's freshness to what the *target* plane actually holds (read from its sidecar) and
+        drop its local hot state so the next run re-hydrates from that plane. Demand/triggers are kept, so
+        the pipeline resumes incrementally instead of rebuilding. Empty target → NEVER (a cold start)."""
+        from pathlib import Path
+
+        from ..trickle_io import load_sidecar
+        from .registry import pond_data_dir, pond_major_dir
+
+        root = Path(self.root)
+        for name, major, pond_id in lines:
+            try:
+                sidecar = load_sidecar(pond_data_dir(root, name, major, new_root))
+            except Exception:
+                sidecar = {}
+            f_iso = _plane_freshness(sidecar) or _iso(NEVER)
+            self.db.execute(
+                "UPDATE pond_state SET start_f=?, end_f=?, changed_f=?, d_ms=0, is_failed=0, is_blocked=0, "
+                "failed_f=?, failures=0, is_killed=0, refresh_pending=0 WHERE pond_id=?",
+                (f_iso, f_iso, f_iso, _iso(NEVER), pond_id),
+            )
+            # Drop the (old-plane) hot state → the executor re-hydrates the registry from the target plane
+            # on the next run (registry-loss recovery). Keep the OLD data dir (backup) untouched.
+            major_dir = pond_major_dir(root, name, major)
+            for fname in ("registry.duckdb", "pond.db"):
+                try:
+                    (major_dir / fname).unlink(missing_ok=True)
+                except Exception:
+                    pass
 
     def remove_pond(self, name: str, major: int, wipe: bool = False) -> dict:
         """Remove (retire) one deployed major line ``name@major`` — delete its live ``pond`` selection, its

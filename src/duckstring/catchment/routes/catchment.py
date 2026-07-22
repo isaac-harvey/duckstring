@@ -76,6 +76,7 @@ def _catchment_name(db) -> str:
 class _SettingsBody(BaseModel):
     data_root: str = ""       # an object-store URI (s3://…, gs://…) / path; empty → local (the state root)
     confirm: str | None = None  # must equal the catchment name to SWITCH once a root / data already exists
+    mode: str = "empty"       # "empty" (reset + dormant) | "adopt" (pick up data already in the target)
 
 
 @router.put("/catchment/settings", dependencies=[auth.full])
@@ -93,6 +94,8 @@ def put_settings(request: Request, body: _SettingsBody):
 
     app = request.app
     db = _db(request)
+    if body.mode not in ("empty", "adopt"):
+        raise HTTPException(status_code=422, detail="mode must be 'empty' or 'adopt'")
     new = (body.data_root or "").strip() or None  # empty → local
     current = getattr(app.state, "data_root", None)
     if new == current:
@@ -119,8 +122,9 @@ def put_settings(request: Request, body: _SettingsBody):
             acquire_lease(new_store, owner_id)
         except Exception as exc:
             raise HTTPException(status_code=409, detail=f"data root is in use: {exc}") from None
-    # Switch: quiesce, re-point, rewind + cold-rebuild into the new plane (old location untouched).
-    app.state.driver.switch_data_root(new)
+    # Switch: quiesce, re-point (old location untouched). 'empty' resets + goes dormant; 'adopt' picks up
+    # data already in the target (freshness from its sidecars) and resumes with no rebuild.
+    app.state.driver.switch_data_root(new, mode=body.mode)
     cloud.set_setting(db, cloud.DATA_ROOT_KEY, new)  # None → deletes the setting (back to local)
     # Release the previous store's lease now that we've moved off it.
     old_lease = getattr(app.state, "data_lease", None)

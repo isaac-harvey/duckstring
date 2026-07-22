@@ -230,13 +230,14 @@ function DataPlaneSection({ settings, catchmentName, reload }:
   const [open, setOpen] = useState(false);
   const [target, setTarget] = useState('');   // new data root ('' = local)
   const [confirm, setConfirm] = useState('');
+  const [mode, setMode] = useState<'empty' | 'adopt'>('empty');
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
   const switchTo = async (toLocal: boolean) => {
     setErr(null); setBusy(true);
     try {
-      await setDataRoot(toLocal ? '' : target.trim(), confirm.trim());
+      await setDataRoot(toLocal ? '' : target.trim(), confirm.trim(), mode);
       setTarget(''); setConfirm(''); setOpen(false);
       reload();
     } catch (e) {
@@ -247,6 +248,13 @@ function DataPlaneSection({ settings, catchmentName, reload }:
   };
 
   const confirmed = confirm.trim() === catchmentName && catchmentName !== '';
+  const modeChip = (m: 'empty' | 'adopt', label: string, hint: string) => (
+    <button onClick={() => setMode(m)} title={hint} style={{
+      flex: 1, background: 'transparent', border: `1px solid ${mode === m ? '#f59e0b' : '#3f3f46'}`,
+      color: mode === m ? '#f59e0b' : '#a1a1aa', borderRadius: 5, padding: '3px 6px', fontSize: 11,
+      cursor: 'pointer', fontFamily: 'inherit',
+    }}>{label}</button>
+  );
   return (
     <div style={{ marginBottom: 12 }}>
       <div style={heading}>DATA PLANE</div>
@@ -257,10 +265,15 @@ function DataPlaneSection({ settings, catchmentName, reload }:
         <button onClick={() => setOpen(true)} style={btn('#f59e0b', false)}>Switch data plane…</button>
       ) : (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+          <div style={{ display: 'flex', gap: 6 }}>
+            {modeChip('empty', 'Empty + reset', 'Leave every Pond with no data and idle (no auto-rebuild).')}
+            {modeChip('adopt', 'Adopt existing', 'The target already holds data (you copied it in / are returning to it) — pick it up and resume, no rebuild.')}
+          </div>
           <div style={{ fontSize: 10, color: '#f59e0b', lineHeight: 1.4 }}>
-            Switching empties the data plane — every Pond is left with no data and idle (no auto-rebuild).
-            Re-trigger to rebuild, or hand-copy data across first. The current location is kept intact as a
-            backup (switch back anytime). Type <b>{catchmentName}</b> to confirm.
+            {mode === 'empty'
+              ? <>Empties the data plane — every Pond is left with no data and idle (no auto-rebuild). Re-trigger to rebuild, or hand-copy data across first.</>
+              : <>Picks up data already in the target (copied in, or a plane you&apos;re returning to) and resumes with no rebuild. Use only if the target already holds this Catchment&apos;s data.</>}
+            {' '}The current location is kept intact as a backup. Type <b>{catchmentName}</b> to confirm.
           </div>
           <input value={target} onChange={(e) => setTarget(e.target.value)} placeholder="s3://bucket/prefix (blank = local)" style={smallInput} />
           <input value={confirm} onChange={(e) => setConfirm(e.target.value)} placeholder={`type ${catchmentName}`} style={smallInput} />

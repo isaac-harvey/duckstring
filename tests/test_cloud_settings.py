@@ -172,6 +172,56 @@ def test_switch_data_root_empties_and_stays_dormant(tmp_path):
     assert old_file.exists()                                               # old location kept as a backup
 
 
+def test_switch_data_root_adopt_restores_freshness_from_plane(tmp_path):
+    import json
+
+    from duckstring.catchment.registry import pond_data_dir, pond_major_dir
+
+    client, db = _client(tmp_path)
+    driver = client.app.state.driver
+    key = next(iter(driver.meta))
+    m = driver.meta[key]
+    name, major, pond_id = m["name"], m["major"], m["pond_id"]
+
+    driver.wave(key)  # a standing Wave that must SURVIVE adopt (unlike the empty switch)
+    # Stale local hot state from the old plane — adopt must drop it so the next run re-hydrates.
+    major_dir = pond_major_dir(tmp_path, name, major)
+    major_dir.mkdir(parents=True, exist_ok=True)
+    (major_dir / "registry.duckdb").write_text("stale")
+    (major_dir / "pond.db").write_text("stale")
+    # The target plane already holds data at freshness F (recorded in its sidecar).
+    F = "2026-05-05T00:00:00+00:00"
+    plane = pond_data_dir(tmp_path, name, major, str(tmp_path / "planeB"))
+    plane.write_text(json.dumps({"orders": {"mode": "overwrite", "f": F}}), "_trickle.json")
+
+    driver.switch_data_root(str(tmp_path / "planeB"), mode="adopt")
+
+    start_f, end_f = db.execute("SELECT start_f, end_f FROM pond_state WHERE pond_id=?", (pond_id,)).fetchone()
+    assert start_f == F and end_f == F                          # freshness adopted from the plane
+    assert not (major_dir / "registry.duckdb").exists()         # hot state dropped → re-hydrate from target
+    assert not (major_dir / "pond.db").exists()
+    assert db.execute("SELECT COUNT(*) FROM pond_trigger").fetchone()[0] == 1  # demand kept → resumes
+
+
+def test_switch_data_root_adopt_empty_target_is_cold(tmp_path):
+    from duckstring.catchment.driver import _iso
+    from duckstring.engine.core import NEVER
+
+    client, db = _client(tmp_path)
+    driver = client.app.state.driver
+    key = next(iter(driver.meta))
+    pond_id = driver.meta[key]["pond_id"]
+    driver.wave(key)  # materialise a pond_state row
+    db.execute("UPDATE pond_state SET end_f='2026-01-01T00:00:00+00:00' WHERE pond_id=?", (pond_id,))
+    db.commit()
+    driver.reload()
+
+    driver.switch_data_root(str(tmp_path / "empty_plane"), mode="adopt")  # no sidecar there
+
+    (end_f,) = db.execute("SELECT end_f FROM pond_state WHERE pond_id=?", (pond_id,)).fetchone()
+    assert end_f in (None, _iso(NEVER))  # empty target → cold (nothing to adopt)
+
+
 def test_status_carries_cloud_block(tmp_path, monkeypatch):
     monkeypatch.delenv("AWS_ACCESS_KEY_ID", raising=False)
     client, _ = _client(tmp_path, data_root="s3://bucket/p", secret_names=["AWS_ACCESS_KEY_ID"])
