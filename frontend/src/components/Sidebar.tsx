@@ -870,9 +870,10 @@ export function Sidebar({ mobile = false }: { mobile?: boolean }) {
           <Section>
             <Label>Control</Label>
             <div style={quadRow}>
+              {/* Two colours paired like Triggers: the go-pair (Force/Wake) green, the stop-pair (Sleep/Kill) red. */}
               <Btn block onClick={() => force(selectedPond.id)} color={THEME_SUCCESS}>Force</Btn>
-              <Btn block onClick={() => wake(selectedPond.id)} color={THEME_WAKE}>Wake</Btn>
-              <Btn block onClick={() => sleep(selectedPond.id)} color={THEME_BLOCKED}>Sleep</Btn>
+              <Btn block onClick={() => wake(selectedPond.id)} color={THEME_SUCCESS}>Wake</Btn>
+              <Btn block onClick={() => sleep(selectedPond.id)} color={THEME_DANGER}>Sleep</Btn>
               <Btn block onClick={() => kill(selectedPond.id)} color={THEME_DANGER}>Kill</Btn>
             </div>
             {/* Refresh / Reset / Remove are collection-oriented — do them via Options → Pond Actions. */}
