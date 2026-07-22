@@ -122,7 +122,7 @@ export function RunDetail() {
 
   return (
     <div style={{ height: '100%', display: 'flex', flexDirection: 'column', background: '#0c0c10', fontFamily: 'ui-monospace, SFMono-Regular, monospace', minWidth: 0 }}>
-      <div style={{ padding: '5px 12px', borderBottom: '1px solid #18181d', fontSize: 11, fontWeight: 700, color: '#a1a1aa', letterSpacing: '0.08em' }}>
+      <div style={{ display: 'flex', alignItems: 'center', height: 30, boxSizing: 'border-box', padding: '0 12px', borderBottom: '1px solid #18181d', fontSize: 11, fontWeight: 700, color: '#a1a1aa', letterSpacing: '0.08em' }}>
         RUN DETAIL
       </div>
 
