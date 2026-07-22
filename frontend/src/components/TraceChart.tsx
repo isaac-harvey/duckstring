@@ -20,12 +20,6 @@ const DURATION_COLOR = THEME_RUNNING; // run duration, tied to the running state
 
 export type TracePointView = { key: string; time: number; duration: number };
 
-function quantile(sortedAsc: number[], q: number): number {
-  if (sortedAsc.length === 0) return 0;
-  const i = Math.floor(q * (sortedAsc.length - 1));
-  return sortedAsc[i];
-}
-
 const clock = (msVal: number): string => {
   const d = new Date(msVal);
   const p = (n: number) => String(n).padStart(2, '0');
@@ -71,16 +65,30 @@ export function TraceChart({
     );
   }
 
-  // Clip the y-axis: 90th percentile of all plotted values + margin ∝ mean.
+  // Log y-axis: durations/intervals routinely span orders of magnitude, so plot log10(value) over the
+  // full [min, max] range (with a small margin). Log compresses the outliers itself, so there's no clip.
+  const FLOOR = 1e-3; // 1 ms — below measurement resolution; guards log(0)
   const all = [...intervalVals, ...durs];
-  const sorted = [...all].sort((a, b) => a - b);
-  const mean = all.reduce((a, b) => a + b, 0) / (all.length || 1);
-  const yMax = Math.max(quantile(sorted, 0.9) + 0.4 * mean, 0.01);
+  const positives = all.filter((v) => v > 0);
+  const vMin = positives.length ? Math.max(Math.min(...positives), FLOOR) : FLOOR;
+  const vMax = positives.length ? Math.max(...positives, vMin) : FLOOR;
+  const logLo = Math.log10(vMin);
+  const logHi = Math.log10(vMax);
+  const margin = Math.max((logHi - logLo) * 0.08, 0.05);
+  const lo = logLo - margin;
+  const span = logHi + margin - lo;
 
   // Shared x-index by completion number (one point per run).
   const n = points.length;
   const x = (i: number) => (n <= 1 ? padL : padL + (i / (n - 1)) * (W - padL - padR));
-  const y = (v: number) => padT + (1 - Math.min(v, yMax) / yMax) * (H - padT - padB);
+  const y = (v: number) => {
+    const t = span > 1e-9 ? (Math.log10(Math.max(v, FLOOR)) - lo) / span : 0.5;
+    return padT + (1 - Math.min(Math.max(t, 0), 1)) * (H - padT - padB);
+  };
+
+  // Faint decade gridlines (powers of 10 in range) — the visual cue that the axis is logarithmic.
+  const decades: number[] = [];
+  for (let e = Math.ceil(logLo); e <= Math.floor(logHi); e++) decades.push(10 ** e);
 
   const meanLast3 = (vals: number[]) => {
     const last3 = vals.slice(-3);
@@ -118,6 +126,9 @@ export function TraceChart({
     <div>
       {header}
       <svg width={W} height={H} style={{ display: 'block' }}>
+        {decades.map((val) => (
+          <line key={val} x1={padL} y1={y(val)} x2={W - padR} y2={y(val)} stroke="#27272a" strokeWidth={0.5} strokeDasharray="1 3" />
+        ))}
         <line x1={padL} y1={H - padB} x2={W - padR} y2={H - padB} stroke="#27272a" strokeWidth={1} />
         {meanLine(meanLast3(intervalVals), INTERVAL_COLOR)}
         {meanLine(meanLast3(durs), DURATION_COLOR)}
