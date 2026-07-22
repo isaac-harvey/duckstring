@@ -579,6 +579,22 @@ const dateInput: React.CSSProperties = {
   padding: '2px 4px', fontSize: 10, fontFamily: 'inherit', outline: 'none', colorScheme: 'dark',
 };
 
+// A per-bound clear (✕) — fixed-width so both bound rows' inputs stay equal; greyed/disabled when empty.
+function ClearX({ active, onClick, title }: { active: boolean; onClick: () => void; title: string }) {
+  return (
+    <button
+      onClick={onClick}
+      disabled={!active}
+      title={title}
+      style={{ width: 14, flexShrink: 0, textAlign: 'center', background: 'transparent', border: 'none',
+               color: active ? '#a1a1aa' : '#3f3f46', cursor: active ? 'pointer' : 'default', fontSize: 12,
+               padding: 0, fontFamily: 'inherit' }}
+    >
+      ✕
+    </button>
+  );
+}
+
 export function TracePanel() {
   const selectedPondId = useLiveStore((s) => s.selectedPondId);
   const selectedRippleId = useLiveStore((s) => s.selectedRippleId);
@@ -628,20 +644,13 @@ export function TracePanel() {
             <span style={{ width: 26, fontSize: 10, color: '#52525b' }}>from</span>
             <input type="datetime-local" step="1" value={from} max={to || undefined}
                    onChange={(e) => setFrom(e.target.value)} style={dateInput} />
-            <span style={{ width: 14, flexShrink: 0 }} />
+            <ClearX active={!!from} onClick={() => setFrom('')} title="Clear the from bound" />
           </div>
           <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
             <span style={{ width: 26, fontSize: 10, color: '#52525b' }}>to</span>
             <input type="datetime-local" step="1" value={to} min={from || undefined}
                    onChange={(e) => setTo(e.target.value)} style={dateInput} />
-            <button
-              onClick={() => { setFrom(''); setTo(''); setRangeRuns(null); }}
-              disabled={!rangeActive}
-              title="Clear range — show the last 50 runs"
-              style={{ width: 14, flexShrink: 0, textAlign: 'center', background: 'transparent', border: 'none', color: rangeActive ? '#a1a1aa' : '#3f3f46', cursor: rangeActive ? 'pointer' : 'default', fontSize: 12, padding: 0, fontFamily: 'inherit' }}
-            >
-              ✕
-            </button>
+            <ClearX active={!!to} onClick={() => setTo('')} title="Clear the to bound" />
           </div>
         </div>
       )}
