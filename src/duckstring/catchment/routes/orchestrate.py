@@ -114,14 +114,17 @@ def runs(
     lineage: bool = True,
     ripples: bool = False,
     limit: int = 100,
+    after: str | None = None,
+    before: str | None = None,
     principal: auth.Principal = Depends(auth.get_principal),
 ):
     """Recent Pond Run history (newest first). ``pond`` filters to that Pond and, when ``lineage``,
     its upstream sources; ``ripples`` nests each run's Ripple Runs. ``limit`` is clamped to [1, 1000].
-    Tracebacks are redacted below full access (the error message is always kept)."""
+    ``after``/``before`` (UTC ISO) bound the run start for date-range navigation. Tracebacks are
+    redacted below full access (the error message is always kept)."""
     key = _resolve(request, pond, major, version) if pond is not None else None
     limit = max(1, min(limit, 1000))
-    history = _driver(request).run_history(key, lineage, ripples, limit)
+    history = _driver(request).run_history(key, lineage, ripples, limit, after=after, before=before)
     if principal.level != auth.Level.FULL:
         _redact_tracebacks(history)
     return {"runs": history}

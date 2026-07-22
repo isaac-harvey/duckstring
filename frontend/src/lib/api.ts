@@ -267,6 +267,8 @@ export interface RunsQuery {
   lineage?: boolean;
   ripples?: boolean;
   limit?: number;
+  after?: string; // UTC ISO — runs started at/after this bound
+  before?: string; // UTC ISO — runs started at/before this bound
 }
 
 export async function fetchRuns(q: RunsQuery = {}): Promise<RawPondRun[]> {
@@ -279,6 +281,8 @@ export async function fetchRuns(q: RunsQuery = {}): Promise<RawPondRun[]> {
   if (q.lineage !== undefined) params.set('lineage', String(q.lineage));
   if (q.ripples !== undefined) params.set('ripples', String(q.ripples));
   if (q.limit !== undefined) params.set('limit', String(q.limit));
+  if (q.after) params.set('after', q.after);
+  if (q.before) params.set('before', q.before);
   const qs = params.toString();
   const data = await getJSON<{ runs: RawPondRun[] }>(`/runs${qs ? `?${qs}` : ''}`);
   return data.runs;

@@ -234,6 +234,22 @@ def test_run_history_nests_ripple_runs_when_requested(tmp_path):
     assert nested == {"r1": "success", "r2": "success"}
 
 
+def test_run_history_date_range_filters_started_at(tmp_path):
+    # The plot's date-range navigation bounds a run's started_at (UTC ISO).
+    d = _driver(tmp_path)
+    d.pulse("src@1")
+    f = _complete_run(d, "src@1")
+    d.db.execute("UPDATE pond_run SET started_at = '2020-06-15T10:00:00+00:00' WHERE f = ?", (f,))
+    d.db.commit()
+
+    def hist(**kw):
+        return d.run_history("src@1", lineage=False, ripples=False, limit=100, **kw)
+
+    assert [r["f"] for r in hist(after="2020-06-01T00:00:00+00:00", before="2020-07-01T00:00:00+00:00")] == [f]
+    assert hist(before="2020-06-01T00:00:00+00:00") == []  # the run is after the upper bound
+    assert hist(after="2020-07-01T00:00:00+00:00") == []   # the run is before the lower bound
+
+
 # ─── HTTP layer ──────────────────────────────────────────────────────────────────
 
 

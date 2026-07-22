@@ -1,8 +1,8 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-import { fetchAlerts, fetchLineage, fetchSecrets, testSpout, type RawAlertChannel, type RawLineageRipple } from '@/lib/api';
-import { useLiveStore, atLeast, formatAge, formatDuration, parseTs, runKey, THEME_PULL, THEME_PUSH, THEME_SUCCESS, THEME_DANGER, THEME_BLOCKED, THEME_WAKE, THEME_BRAND } from '@/lib/store';
+import { fetchAlerts, fetchLineage, fetchRuns, fetchSecrets, testSpout, type RawAlertChannel, type RawLineageRipple } from '@/lib/api';
+import { useLiveStore, atLeast, formatAge, formatDuration, mapRun, parseTs, runKey, THEME_PULL, THEME_PUSH, THEME_SUCCESS, THEME_DANGER, THEME_BLOCKED, THEME_WAKE, THEME_BRAND } from '@/lib/store';
 import type { FreqUnit, Pond, PondInfo, PondRun } from '@/lib/types';
 import { AlertChannelForm, ChannelRow } from './AlertsMenu';
 import { DuckSection } from './DuckSection';
@@ -440,6 +440,9 @@ const TIDE_UNITS: { value: FreqUnit; label: string; secs: number }[] = [
 
 const ms = (iso: string | null): number => parseTs(iso);
 
+// The plot shows at most this many (most-recent) runs; older windows are reached via the date range.
+const RUN_CAP = 50;
+
 // A per-run point on the timing trace — one per run that has a duration (both timestamps). `run` is the
 // Pond Run it maps to, so a click selects it (opening Run Detail) and a selected run highlights back here.
 type TracePoint = { key: string; time: number; duration: number; run: PondRun };
@@ -569,32 +572,77 @@ function PondOptionsModal({ pond, canControl, onClose }: { pond: Pond; canContro
 
 // ─── Run-timing panel: the bottom-right quadrant (Pond sidebar column × the run-history bottom bar) ──
 
+const dateInput: React.CSSProperties = {
+  flex: 1, minWidth: 0, background: '#18181b', border: '1px solid #3f3f46', borderRadius: 5, color: '#a1a1aa',
+  padding: '2px 4px', fontSize: 10, fontFamily: 'inherit', outline: 'none', colorScheme: 'dark',
+};
+
 export function TracePanel() {
   const selectedPondId = useLiveStore((s) => s.selectedPondId);
   const selectedRippleId = useLiveStore((s) => s.selectedRippleId);
   const ripples = useLiveStore((s) => s.ripples);
   const ponds = useLiveStore((s) => s.ponds);
-  const runs = useLiveStore((s) => s.selectedPondRuns);
+  const selectedPondRuns = useLiveStore((s) => s.selectedPondRuns);
   const selectedRipple = selectedRippleId ? ripples[selectedRippleId] : null;
   const pond = selectedPondId ? ponds[selectedPondId] : null;
+  const active = selectedRipple || pond;
 
+  // Date-range navigation (local day bounds → UTC ISO). Empty = the last RUN_CAP runs (selectedPondRuns);
+  // a range fetches that window (capped) from the backend so a long history is navigable.
+  const [from, setFrom] = useState('');
+  const [to, setTo] = useState('');
+  const [rangeRuns, setRangeRuns] = useState<PondRun[] | null>(null);
+  const rangeActive = !!(from || to);
+
+  // A selection change abandons a stale range (it would show another node's dates).
+  const [prevSel, setPrevSel] = useState(selectedPondId);
+  if (selectedPondId !== prevSel) { setPrevSel(selectedPondId); setFrom(''); setTo(''); setRangeRuns(null); }
+
+  useEffect(() => {
+    if (!rangeActive || !selectedPondId) return;
+    let cancelled = false;
+    const after = from ? new Date(`${from}T00:00:00`).toISOString() : undefined;
+    const before = to ? new Date(`${to}T23:59:59.999`).toISOString() : undefined;
+    fetchRuns({ pond: selectedPondId, lineage: false, ripples: true, limit: RUN_CAP, after, before })
+      .then((rows) => { if (!cancelled) setRangeRuns(rows.map(mapRun)); })
+      .catch(() => { if (!cancelled) setRangeRuns([]); });
+    return () => { cancelled = true; };
+  }, [rangeActive, from, to, selectedPondId]);
+
+  const source = (rangeActive ? rangeRuns ?? [] : selectedPondRuns).slice(0, RUN_CAP); // newest-first
   let title: string | null = null;
   let points: TracePoint[] | null = null;
-  if (selectedRipple) {
-    title = `${selectedRipple.name} · run timing`;
-    points = rippleTrace(runs, selectedRipple.name);
-  } else if (pond) {
-    title = `${pond.name} · run timing`;
-    points = pondTrace(runs);
-  }
+  if (selectedRipple) { title = `${selectedRipple.name} · run timing`; points = rippleTrace(source, selectedRipple.name); }
+  else if (pond) { title = `${pond.name} · run timing`; points = pondTrace(source); }
 
   return (
     <div style={{ height: '100%', display: 'flex', flexDirection: 'column', padding: 14, boxSizing: 'border-box', overflow: 'hidden', background: '#15151a' }}>
-      <div style={{ fontSize: 10, fontWeight: 700, color: '#52525b', letterSpacing: '0.1em', textTransform: 'uppercase', marginBottom: 10, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+      <div style={{ fontSize: 10, fontWeight: 700, color: '#52525b', letterSpacing: '0.1em', textTransform: 'uppercase', marginBottom: 8, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
         {title ?? 'Run timing'}
       </div>
+      {active && (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 5, marginBottom: 8 }}>
+          <input type="date" value={from} max={to || undefined} onChange={(e) => setFrom(e.target.value)} title="from" style={dateInput} />
+          <span style={{ color: '#52525b', fontSize: 10 }}>→</span>
+          <input type="date" value={to} min={from || undefined} onChange={(e) => setTo(e.target.value)} title="to" style={dateInput} />
+          <button
+            onClick={() => { setFrom(''); setTo(''); setRangeRuns(null); }}
+            disabled={!rangeActive}
+            title="Clear range — show the last 50 runs"
+            style={{ background: 'transparent', border: 'none', color: rangeActive ? '#a1a1aa' : '#3f3f46', cursor: rangeActive ? 'pointer' : 'default', fontSize: 12, padding: '0 2px', fontFamily: 'inherit' }}
+          >
+            ✕
+          </button>
+        </div>
+      )}
       {points ? (
-        <RunTrace points={points} />
+        <>
+          <RunTrace points={points} />
+          <div style={{ fontSize: 10, color: '#3f3f46', marginTop: 4 }}>
+            {rangeActive ? `${points.length} in range` : `last ${points.length}`}
+            {!rangeActive && selectedPondRuns.length > RUN_CAP ? ' · pick a date range for older' : ''}
+          </div>
+        </>
       ) : (
         <div style={{ fontSize: 12, color: '#52525b', margin: 'auto', textAlign: 'center' }}>Select a Pond or Ripple</div>
       )}
@@ -838,7 +886,7 @@ export function Sidebar({ mobile = false }: { mobile?: boolean }) {
           {/* Desktop shows run timing in the bottom-right quadrant (TracePanel); mobile keeps it here. */}
           {mobile && (
             <Section>
-              <RunTrace points={pondTrace(selectedPondRuns)} />
+              <RunTrace points={pondTrace(selectedPondRuns.slice(0, RUN_CAP))} />
             </Section>
           )}
 
@@ -873,7 +921,7 @@ export function Sidebar({ mobile = false }: { mobile?: boolean }) {
 
           {mobile && (
             <Section>
-              <RunTrace points={rippleTrace(selectedPondRuns, selectedRipple.name)} />
+              <RunTrace points={rippleTrace(selectedPondRuns.slice(0, RUN_CAP), selectedRipple.name)} />
             </Section>
           )}
         </>

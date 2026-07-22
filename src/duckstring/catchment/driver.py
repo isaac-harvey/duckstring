@@ -3070,17 +3070,26 @@ class Driver:
                     queue.append(src)
         return seen
 
-    def run_history(self, pond: str | None, lineage: bool, ripples: bool, limit: int) -> list[dict]:
+    def run_history(self, pond: str | None, lineage: bool, ripples: bool, limit: int,
+                    after: str | None = None, before: str | None = None) -> list[dict]:
         """Recent Pond Runs (newest first), optionally filtered to ``pond`` (an engine key,
         ``name@major``) and — when ``lineage`` — its upstream sources. History within a major line
-        spans every version that ran on it. Ripple Runs are nested only when ``ripples`` is set."""
+        spans every version that ran on it. Ripple Runs are nested only when ``ripples`` is set.
+        ``after``/``before`` (UTC ISO) bound the run's ``started_at`` for date-range navigation."""
         with self.lock:
             params: list = []
-            where = ""
+            conds: list[str] = []
             if pond is not None:
                 keys = self._ancestors(pond) if lineage else {pond}
-                where = f"WHERE (pn.name || '@' || pv.major) IN ({','.join('?' * len(keys))})"
+                conds.append(f"(pn.name || '@' || pv.major) IN ({','.join('?' * len(keys))})")
                 params.extend(sorted(keys))
+            if after is not None:
+                conds.append("pr.started_at >= ?")
+                params.append(after)
+            if before is not None:
+                conds.append("pr.started_at <= ?")
+                params.append(before)
+            where = ("WHERE " + " AND ".join(conds)) if conds else ""
             rows = self.db.execute(
                 "SELECT pn.name, pv.major, pv.version, pr.pond_version_id, pr.f, pr.started_at, pr.finished_at, "
                 "pr.status, pr.error, pr.traceback "

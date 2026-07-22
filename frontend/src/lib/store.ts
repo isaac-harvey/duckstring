@@ -70,7 +70,7 @@ function nodeView(n: RawPond | RawRipple, dMs: number): NodeView {
   };
 }
 
-function mapRun(r: RawPondRun): PondRun {
+export function mapRun(r: RawPondRun): PondRun {
   return {
     pond: r.pond,
     id: r.id,
