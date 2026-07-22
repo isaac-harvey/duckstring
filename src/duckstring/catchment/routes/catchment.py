@@ -67,57 +67,70 @@ def get_settings(request: Request):
     return status
 
 
+def _catchment_name(db) -> str:
+    """The catchment's display name (the switch-confirm token), falling back to its id when unnamed."""
+    rows = dict(db.execute("SELECT key, value FROM catchment_meta").fetchall())
+    return rows.get("name") or rows.get("id") or "unknown"
+
+
 class _SettingsBody(BaseModel):
-    data_root: str  # an object-store URI (s3://…, gs://…) or a shared path — where the data plane lives
+    data_root: str = ""       # an object-store URI (s3://…, gs://…) / path; empty → local (the state root)
+    confirm: str | None = None  # must equal the catchment name to SWITCH once a root / data already exists
 
 
 @router.put("/catchment/settings", dependencies=[auth.full])
 def put_settings(request: Request, body: _SettingsBody):
-    """Attach (or, while empty, re-point) the data-plane target. **Set-once in practice**: refused
-    once the Catchment has published data (switching would strand it — a migration is deferred), and
-    an already-configured root can't be changed in place. Applied live — future Duck spawns publish to
-    the new root — and persisted, so it survives restarts. Full-gated (it moves where all data lives)."""
+    """Attach or **switch** the data-plane target (empty ``data_root`` → back to local). Switching is a
+    **rebuild, not a byte migration**: the pipeline republishes into the new location from the Inlets
+    down, and the OLD location's data is left intact (a readable backup / switch-back source). Because it
+    rebuilds, a switch away from an existing root — or a Catchment that already has published data —
+    requires ``confirm`` == the catchment name (so it can't happen by accident). Applied live (future
+    Duck spawns use the new root) and persisted. Full-gated (it moves where all data lives)."""
     from ...storage import get_storage
     from .. import cloud
-    from ..data_lease import acquire_lease
+    from ..data_lease import acquire_lease, release_lease
 
     app = request.app
-    new = (body.data_root or "").strip()
-    if not new:
-        raise HTTPException(status_code=422, detail="data_root must be a non-empty URI or path")
+    db = _db(request)
+    new = (body.data_root or "").strip() or None  # empty → local
     current = getattr(app.state, "data_root", None)
     if new == current:
-        return {**cloud.cloud_status(current, app.state.secret_store), "unchanged": True}
-    if current is not None:
-        raise HTTPException(status_code=409, detail=(
-            "a data root is already configured; changing it needs a data migration (not yet supported)"))
-    if cloud.has_published_data(_db(request)):
-        raise HTTPException(status_code=409, detail=(
-            "the Catchment already has published data — the data root is set-once (attach it before "
-            "deploying, or reset the Catchment first)"))
-    # Take the single-writer lease on the new store (refuses if another live Catchment owns it), then
-    # apply live + persist. get_storage validates the scheme.
-    try:
-        store = get_storage(new)
-    except Exception as exc:
-        raise HTTPException(status_code=422, detail=f"unusable data root: {exc}") from None
-    cid = _db(request).execute("SELECT value FROM catchment_meta WHERE key = 'id'").fetchone()
-    owner_id = cid[0] if cid else "unknown"
-    try:
-        acquire_lease(store, owner_id)
-    except Exception as exc:
-        raise HTTPException(status_code=409, detail=f"data root is in use: {exc}") from None
-    cloud.set_setting(_db(request), cloud.DATA_ROOT_KEY, new)
+        return {**cloud.cloud_status(current, app.state.secret_store, getattr(app.state, "cloud_creds", None)),
+                "unchanged": True}
+    # A switch rebuilds the pipeline — gate it behind the catchment name once there's an existing root or
+    # any published data, so it isn't done by accident (a first attach on an empty Catchment is free).
+    name = _catchment_name(db)
+    if (current is not None or cloud.has_published_data(db)) and (body.confirm or "") != name:
+        raise HTTPException(status_code=422, detail=(
+            f"switching the data root rebuilds the pipeline into it (the old location is kept as a "
+            f"backup); confirm by passing the catchment name: {name!r}"))
+    owner_id = dict(db.execute("SELECT key, value FROM catchment_meta").fetchall()).get("id") or "unknown"
+    # Take the single-writer lease on the new store (object stores only; local needs none). get_storage
+    # validates the scheme.
+    new_store = None
+    if new is not None:
+        try:
+            new_store = get_storage(new)
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=f"unusable data root: {exc}") from None
+        try:
+            acquire_lease(new_store, owner_id)
+        except Exception as exc:
+            raise HTTPException(status_code=409, detail=f"data root is in use: {exc}") from None
+    # Switch: quiesce, re-point, rewind + cold-rebuild into the new plane (old location untouched).
+    app.state.driver.switch_data_root(new)
+    cloud.set_setting(db, cloud.DATA_ROOT_KEY, new)  # None → deletes the setting (back to local)
+    # Release the previous store's lease now that we've moved off it.
+    old_lease = getattr(app.state, "data_lease", None)
+    if old_lease is not None:
+        try:
+            release_lease(old_lease[0], old_lease[1])
+        except Exception:
+            pass
     app.state.data_root = new
-    app.state.data_lease = (store, owner_id)
-    driver = app.state.driver
-    driver.data_root = new
-    launcher = getattr(app.state, "launcher", None)
-    if launcher is not None:
-        launcher.data_root = new
-    # Attaching the data root can flip the gate to enabled (creds may already be present) — build the
-    # remote backends live so remote compute works without a restart, and re-validate the creds so the
-    # persistent banner reflects the newly-enabled gate. Guarded: never fail the set.
+    app.state.data_lease = (new_store, owner_id) if new_store is not None else None
+    # A switch can flip the cloud gate (creds may already be present) — build the remote backends live and
+    # re-validate the creds so the persistent banner is current. Guarded: never fail the switch.
     try:
         from ..cloud_backends import refresh_cloud_backends, refresh_credential_status
         refresh_cloud_backends(app)

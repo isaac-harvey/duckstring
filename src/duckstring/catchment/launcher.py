@@ -42,6 +42,10 @@ class SubprocessLauncher:
         self._procs: dict[str, subprocess.Popen] = {}  # pond key (name@major) → process
         self._pending: dict[str, tuple] = {}  # spawns deferred until base_url is known
 
+    def set_data_root(self, data_root: str | None) -> None:
+        """Re-point where future Duck spawns publish/read (a live data-root switch)."""
+        self.data_root = data_root
+
     def set_base_url(self, url: str) -> None:
         """Set the dial-back address and spawn any Ducks that were waiting on it. Their queued jobs
         are untouched — a Duck collects them on its first poll."""
@@ -129,6 +133,7 @@ class DispatchingLauncher:
             self.remotes = {"_any": remotes}  # a single remote backend takes every remote spawn
         self.dialback = dialback
         self.default_provider = default_provider
+        self.data_root = getattr(local, "data_root", None)  # mirrors the backends' value (see set_data_root)
         self._owner: dict[str, object] = {}  # pond_key → the backend that spawned it
 
     @property
@@ -149,6 +154,14 @@ class DispatchingLauncher:
             if remote is not None:
                 return remote
         return self.local
+
+    def set_data_root(self, data_root: str | None) -> None:
+        """Propagate a live data-root switch to every backend (the dispatcher itself reads none — its
+        local/remote backends carry the value into each Duck spawn)."""
+        self.data_root = data_root
+        self.local.data_root = data_root
+        for remote in self.remotes.values():
+            remote.data_root = data_root
 
     def attach_remotes(self, remotes, dialback=None) -> None:
         """Install remote backends onto a live launcher — runtime cloud-enable (creds / the data root
@@ -219,6 +232,9 @@ class NoopLauncher:
         pass
 
     def set_base_url(self, url: str) -> None:
+        pass
+
+    def set_data_root(self, data_root: str | None) -> None:
         pass
 
     def is_running(self, pond_key: str) -> bool:

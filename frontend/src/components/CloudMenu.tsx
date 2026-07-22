@@ -6,6 +6,7 @@ import {
   type CloudSettings, type CloudVerifyResult, type DuckPool,
 } from '@/lib/api';
 import { cpuLabel, defaultMemoryFor, FARGATE_CPU, FARGATE_MEMORY, memoryLabel } from '@/lib/aws';
+import { useLiveStore } from '@/lib/store';
 import { InstanceTypePicker } from './InstanceTypePicker';
 
 // Catchment-level cloud config (plans/cloud-config.md, full access only). Two modes:
@@ -29,6 +30,8 @@ const heading: React.CSSProperties = { fontSize: 10, fontWeight: 700, color: '#a
 export function CloudMenu({ onClose }: { onClose: () => void }) {
   const [settings, setSettings] = useState<CloudSettings | null>(null);
   const [pools, setPools] = useState<DuckPool[]>([]);
+  const catchment = useLiveStore((s) => s.catchment);
+  const catchmentName = catchment?.name || catchment?.id || '';
 
   const load = () => {
     void fetchCloudSettings().then(setSettings).catch(() => setSettings(null));
@@ -69,25 +72,30 @@ export function CloudMenu({ onClose }: { onClose: () => void }) {
         </div>
       )}
 
-      {settings && !enabled && <EnableFlow settings={settings} onEnabled={load} />}
-      {enabled && <EnabledConfig settings={settings!} pools={pools} reload={load} />}
+      {settings && !enabled && <EnableFlow settings={settings} catchmentName={catchmentName} onEnabled={load} />}
+      {enabled && <EnabledConfig settings={settings!} pools={pools} catchmentName={catchmentName} reload={load} />}
     </div>
   );
 }
 
 // ─── Enable flow (shown while cloud is disabled) ─────────────────────────────
 
-function EnableFlow({ settings, onEnabled }: { settings: CloudSettings; onEnabled: () => void }) {
+function EnableFlow({ settings, catchmentName, onEnabled }:
+  { settings: CloudSettings; catchmentName: string; onEnabled: () => void }) {
   const [akid, setAkid] = useState('');
   const [secret, setSecret_] = useState('');
   const [region, setRegion] = useState('');
   const [root, setRoot] = useState('');
+  const [confirm, setConfirm] = useState('');
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [result, setResult] = useState<CloudVerifyResult | null>(null);
 
   const needsCreds = !settings.aws_configured;
   const needsRoot = !settings.data_root;
+  // Attaching a data plane to a Catchment that already published locally is a plane SWITCH → it rebuilds,
+  // so the backend requires the catchment name as confirmation.
+  const needsConfirm = needsRoot && settings.has_data;
 
   const run = async () => {
     setErr(null); setResult(null); setBusy(true);
@@ -102,7 +110,7 @@ function EnableFlow({ settings, onEnabled }: { settings: CloudSettings; onEnable
       setResult(res);
       if (!res.ok) return;
       // 3. Commit the data root only once creds check out and the bucket is writable.
-      if (probeRoot && res.bucket_ok !== false) await setDataRoot(probeRoot);
+      if (probeRoot && res.bucket_ok !== false) await setDataRoot(probeRoot, needsConfirm ? confirm.trim() : undefined);
       onEnabled();
     } catch (e) {
       setErr(e instanceof Error ? e.message : 'failed');
@@ -114,6 +122,7 @@ function EnableFlow({ settings, onEnabled }: { settings: CloudSettings; onEnable
   const canRun = !busy && (
     (needsCreds ? akid.trim() !== '' && secret.trim() !== '' : true) &&
     (needsRoot ? root.trim() !== '' : true) &&
+    (needsConfirm ? confirm.trim() === catchmentName : true) &&
     (needsCreds || needsRoot)
   );
 
@@ -138,6 +147,16 @@ function EnableFlow({ settings, onEnabled }: { settings: CloudSettings; onEnable
         <input value={root} onChange={(e) => setRoot(e.target.value)} placeholder="s3://bucket/prefix" style={input} />
       ) : (
         <div style={{ fontSize: 11, color: '#22c55e' }}>data root set: {settings.data_root} ✓</div>
+      )}
+
+      {needsConfirm && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+          <div style={{ fontSize: 10, color: '#f59e0b', lineHeight: 1.4 }}>
+            This Catchment has local data — attaching a bucket rebuilds the pipeline into it (your local
+            data is kept as a backup). Type the catchment name <b>{catchmentName}</b> to confirm.
+          </div>
+          <input value={confirm} onChange={(e) => setConfirm(e.target.value)} placeholder={catchmentName} style={input} />
+        </div>
       )}
 
       {result && (
@@ -205,7 +224,63 @@ function FixCredentials({ reload }: { reload: () => void }) {
   );
 }
 
-function EnabledConfig({ settings, pools, reload }: { settings: CloudSettings; pools: DuckPool[]; reload: () => void }) {
+function DataPlaneSection({ settings, catchmentName, reload }:
+  { settings: CloudSettings; catchmentName: string; reload: () => void }) {
+  const [open, setOpen] = useState(false);
+  const [target, setTarget] = useState('');   // new data root ('' = local)
+  const [confirm, setConfirm] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const switchTo = async (toLocal: boolean) => {
+    setErr(null); setBusy(true);
+    try {
+      await setDataRoot(toLocal ? '' : target.trim(), confirm.trim());
+      setTarget(''); setConfirm(''); setOpen(false);
+      reload();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : 'failed');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const confirmed = confirm.trim() === catchmentName && catchmentName !== '';
+  return (
+    <div style={{ marginBottom: 12 }}>
+      <div style={heading}>DATA PLANE</div>
+      <div style={{ fontSize: 11, color: '#a1a1aa', marginBottom: 4 }}>
+        current: <span style={{ color: '#e4e4e7' }}>{settings.data_root || '(local disk)'}</span>
+      </div>
+      {!open ? (
+        <button onClick={() => setOpen(true)} style={btn('#f59e0b', false)}>Switch data plane…</button>
+      ) : (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+          <div style={{ fontSize: 10, color: '#f59e0b', lineHeight: 1.4 }}>
+            Switching rebuilds the pipeline into the new location. The current location is left intact as a
+            backup — you can switch back to it. Type <b>{catchmentName}</b> to confirm.
+          </div>
+          <input value={target} onChange={(e) => setTarget(e.target.value)} placeholder="s3://bucket/prefix (blank = local)" style={smallInput} />
+          <input value={confirm} onChange={(e) => setConfirm(e.target.value)} placeholder={`type ${catchmentName}`} style={smallInput} />
+          {err && <div style={{ fontSize: 11, color: '#ef4444', wordBreak: 'break-word' }}>{err}</div>}
+          <div style={{ display: 'flex', gap: 6 }}>
+            <button onClick={() => switchTo(false)} disabled={busy || !confirmed || !target.trim()} style={btn('#f59e0b', busy || !confirmed || !target.trim())}>
+              {busy ? 'Switching…' : 'Switch to bucket'}
+            </button>
+            <button onClick={() => switchTo(true)} disabled={busy || !confirmed} style={btn('#a1a1aa', busy || !confirmed)}
+                    title="Point the data plane back at local disk">
+              Switch to local
+            </button>
+          </div>
+          <button onClick={() => { setOpen(false); setErr(null); }} style={{ ...btn('#52525b', false), alignSelf: 'flex-start' }}>Cancel</button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function EnabledConfig({ settings, pools, catchmentName, reload }:
+  { settings: CloudSettings; pools: DuckPool[]; catchmentName: string; reload: () => void }) {
   const [busy, setBusy] = useState(false);
   const [pName, setPName] = useState('');
   const [pProvider, setPProvider] = useState('fargate');
@@ -244,11 +319,8 @@ function EnabledConfig({ settings, pools, reload }: { settings: CloudSettings; p
   return (
     <>
       {settings.creds_valid === false && <FixCredentials reload={reload} />}
-      {settings.has_data && (
-        <div style={{ fontSize: 10, color: '#52525b', marginBottom: 10, lineHeight: 1.5 }}>
-          The data root is set-once — the Catchment has published data (switching would strand it).
-        </div>
-      )}
+      <DataPlaneSection settings={settings} catchmentName={catchmentName} reload={reload} />
+
 
       <div style={heading}>DUCK POOLS</div>
       {pools.map((p) => {

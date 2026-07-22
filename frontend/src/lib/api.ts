@@ -425,13 +425,14 @@ export function fetchCloudSettings(): Promise<CloudSettings> {
   return getJSON<CloudSettings>('/catchment/settings');
 }
 
-// Attach the data-plane target (set-once in practice). Returns the updated gate, or throws the 409/422
-// detail (already has data / already configured / unusable root).
-export async function setDataRoot(dataRoot: string): Promise<CloudSettings> {
+// Attach or SWITCH the data-plane target (empty string → back to local). Switching rebuilds into the new
+// location (the old one is kept as a backup) and needs `confirm` == the catchment name once a root / data
+// already exists. Returns the updated gate, or throws the 422/409 detail (needs confirm / in use / unusable).
+export async function setDataRoot(dataRoot: string, confirm?: string): Promise<CloudSettings> {
   const res = await fetch(`${apiBase()}/catchment/settings`, {
     method: 'PUT',
     headers: authHeaders({ 'content-type': 'application/json' }),
-    body: JSON.stringify({ data_root: dataRoot }),
+    body: JSON.stringify({ data_root: dataRoot, confirm: confirm ?? null }),
   });
   if (res.status === 401) throw new UnauthorizedError();
   if (!res.ok) throw new Error((await res.json().catch(() => null))?.detail ?? `set data root failed (${res.status})`);

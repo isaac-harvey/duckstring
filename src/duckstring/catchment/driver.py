@@ -675,6 +675,46 @@ class Driver:
             self._process(_now())
             return {"ponds": len(lines)}
 
+    def switch_data_root(self, new_root: str | None) -> dict:
+        """Re-point the data plane to ``new_root`` (``None`` = local, under the state root) and rebuild
+        into it. Stop-the-world: quiesce every Duck, re-point future spawns, and rewind all freshness to
+        ``NEVER`` with a cold refresh pending, so every line republishes into the new location from the
+        Inlets down (a plane switch = a reset that rebuilds, not a byte migration).
+
+        **NON-destructive**: the *old* location's published data is left completely intact — it stays a
+        readable backup / switch-back source (switching back rebuilds over it). Topology, deploys, and
+        operational config are untouched (only freshness rewinds). Returns ``{"ponds": n}``."""
+        with self.lock:
+            # 1. Quiesce: stop every Duck (wait, so the registry handles are free) and drop pending work.
+            for key in list(self.state.ponds):
+                self.launcher.terminate(key, wait=True)
+            self.jobs.clear()
+            self._pending_transfers.clear()
+            self._pending_egress.clear()
+            self._idle_since.clear()
+            lines = [(m["name"], m["major"]) for m in self.meta.values()
+                     if not m.get("is_draw") and not m.get("is_spout")]
+            # 2. Re-point future spawns (publish + read) at the new plane. NOTE: the OLD location is not
+            #    touched — no scrub — so it remains a switch-back backup.
+            self.data_root = new_root
+            if hasattr(self.launcher, "set_data_root"):
+                self.launcher.set_data_root(new_root)
+            else:
+                self.launcher.data_root = new_root
+            # 3. Rewind freshness + flag a cold rebuild so each line wipes its (stale, old-plane) registry
+            #    and republishes into the new location. Demand + topology + config are kept.
+            self.db.execute(
+                "UPDATE pond_state SET start_f=?, end_f=?, changed_f=?, d_ms=0, is_failed=0, is_blocked=0, "
+                "failed_f=?, failures=0, is_killed=0, refresh_pending=1",
+                (_iso(NEVER), _iso(NEVER), _iso(NEVER), _iso(NEVER)),
+            )
+            self.db.commit()
+            # 4. Rebuild the engine from the rewound DB, re-arm standing triggers, and kick demand.
+            self.reload()
+            self.state_version += 1
+            self._process(_now())
+            return {"ponds": len(lines)}
+
     def remove_pond(self, name: str, major: int, wipe: bool = False) -> dict:
         """Remove (retire) one deployed major line ``name@major`` — delete its live ``pond`` selection, its
         ``pond(id)``-keyed config, its on-disk runtime, and its **own** Spouts + alert channels — while

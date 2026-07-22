@@ -108,7 +108,12 @@ def test_put_settings_attaches_root_and_persists(tmp_path, monkeypatch):
     assert client.get("/api/catchment/settings").json()["cloud_enabled"] is False
 
 
-def test_put_settings_is_set_once_after_data(tmp_path, monkeypatch):
+def _confirm_token(client) -> str:
+    ident = client.get("/api/catchment/identity").json()
+    return ident.get("name") or ident.get("id") or "unknown"
+
+
+def test_put_settings_requires_confirm_once_data_exists(tmp_path):
     client, db = _client(tmp_path)
     # Simulate a published run against the registered pond_version.
     db.execute(
@@ -116,17 +121,51 @@ def test_put_settings_is_set_once_after_data(tmp_path, monkeypatch):
         "SELECT id, '2026-01-01T00:00:00+00:00', 'success' FROM pond_version LIMIT 1"
     )
     db.commit()
-    r = client.put("/api/catchment/settings", json={"data_root": str(tmp_path / "lake")})
-    assert r.status_code == 409 and "set-once" in r.json()["detail"]
+    lake = str(tmp_path / "lake")
+    # Switching now rebuilds, so it needs the catchment-name confirmation (was: refused outright).
+    r = client.put("/api/catchment/settings", json={"data_root": lake})
+    assert r.status_code == 422 and "confirm" in r.json()["detail"]
+    ok = client.put("/api/catchment/settings", json={"data_root": lake, "confirm": _confirm_token(client)})
+    assert ok.status_code == 200 and ok.json()["data_root"] == lake
+    assert client.app.state.driver.data_root == lake
 
 
-def test_put_settings_rejects_changing_configured_root(tmp_path):
+def test_switch_configured_root_needs_confirm_and_can_go_local(tmp_path):
     client, _ = _client(tmp_path, data_root="s3://bucket/a")
+    # No confirm → refused BEFORE any store access (so the reject needs no network).
     r = client.put("/api/catchment/settings", json={"data_root": "s3://bucket/b"})
-    assert r.status_code == 409
+    assert r.status_code == 422
     # Idempotent same-value set is fine.
     ok = client.put("/api/catchment/settings", json={"data_root": "s3://bucket/a"})
     assert ok.status_code == 200 and ok.json().get("unchanged") is True
+    # Switching back to local (empty data root) with the confirmation succeeds and re-points the driver.
+    back = client.put("/api/catchment/settings", json={"data_root": "", "confirm": _confirm_token(client)})
+    assert back.status_code == 200 and back.json()["data_root"] is None
+    assert client.app.state.driver.data_root is None
+
+
+def test_switch_data_root_rewinds_and_preserves_old(tmp_path):
+    from duckstring.catchment.driver import _iso
+    from duckstring.engine.core import NEVER
+
+    client, db = _client(tmp_path)
+    driver = client.app.state.driver
+    # Give the line a non-cold freshness and drop a file under the (local) old plane to prove it survives.
+    old_file = tmp_path / "ponds" / "src" / "backup.parquet"
+    old_file.parent.mkdir(parents=True, exist_ok=True)
+    old_file.write_text("published")
+    db.execute("UPDATE pond_state SET end_f='2026-01-01T00:00:00+00:00', refresh_pending=0")
+    db.commit()
+    driver.reload()
+
+    driver.switch_data_root(str(tmp_path / "plane2"))
+
+    assert driver.data_root == str(tmp_path / "plane2")   # re-pointed
+    (end_f,) = db.execute("SELECT end_f FROM pond_state").fetchone()
+    # Freshness rewound off the old value → rebuild into the new plane (the engine persists NEVER as NULL).
+    assert end_f != "2026-01-01T00:00:00+00:00"
+    assert end_f in (None, _iso(NEVER))
+    assert old_file.exists()           # NON-destructive: the old location's data is kept as a backup
 
 
 def test_status_carries_cloud_block(tmp_path, monkeypatch):

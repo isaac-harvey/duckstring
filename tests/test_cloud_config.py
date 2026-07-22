@@ -270,6 +270,22 @@ def test_refresh_attaches_remotes_at_runtime_then_resets(tmp_path, monkeypatch):
     assert app.state.launcher.remotes["fargate"]._client is None
 
 
+def test_dispatching_launcher_propagates_data_root(tmp_path, monkeypatch):
+    monkeypatch.setenv("DUCKSTRING_RELAY", "off")
+    from duckstring.catchment.cloud_backends import build_remote_backends
+    from duckstring.catchment.launcher import DispatchingLauncher, SubprocessLauncher
+    store = SecretStore(tmp_path)
+    store.set("AWS_ACCESS_KEY_ID", "AKIA")
+    remotes, dialback = build_remote_backends(tmp_path, "http://x:1", "tok", "s3://old", store)
+    disp = DispatchingLauncher(SubprocessLauncher(tmp_path, "http://x:1", data_root="s3://old"), remotes, dialback=dialback)
+
+    disp.set_data_root("s3://new")
+    # The switch must reach the actual backends (the local + every remote) — not just the dispatcher —
+    # or a live data-root switch wouldn't change where Ducks publish.
+    assert disp.local.data_root == "s3://new"
+    assert all(r.data_root == "s3://new" for r in disp.remotes.values())
+
+
 def test_refresh_is_a_noop_for_a_non_dispatching_launcher(tmp_path):
     from duckstring.catchment.cloud_backends import refresh_cloud_backends
     from duckstring.catchment.launcher import NoopLauncher
