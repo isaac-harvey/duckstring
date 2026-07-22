@@ -676,14 +676,18 @@ class Driver:
             return {"ponds": len(lines)}
 
     def switch_data_root(self, new_root: str | None) -> dict:
-        """Re-point the data plane to ``new_root`` (``None`` = local, under the state root) and rebuild
-        into it. Stop-the-world: quiesce every Duck, re-point future spawns, and rewind all freshness to
-        ``NEVER`` with a cold refresh pending, so every line republishes into the new location from the
-        Inlets down (a plane switch = a reset that rebuilds, not a byte migration).
+        """Re-point the data plane to ``new_root`` (``None`` = local, under the state root), leaving every
+        Pond **as if its data had been deleted** — and **dormant**. Stop-the-world: quiesce every Duck,
+        re-point future spawns, rewind all freshness to ``NEVER`` (cold refresh pending), and clear ALL
+        demand — pull, push, and standing Wave/Tide triggers — so **nothing auto-runs**.
 
-        **NON-destructive**: the *old* location's published data is left completely intact — it stays a
-        readable backup / switch-back source (switching back rebuilds over it). Topology, deploys, and
-        operational config are untouched (only freshness rewinds). Returns ``{"ponds": n}``."""
+        This is deliberately NOT an auto-rebuild: the switch leaves the pipeline idle so the operator can
+        drive it — re-trigger the lines that can be re-derived from Inlets, or **hand-copy** (e.g. S3→S3)
+        the published data of lines that *can't* be re-derived, into the new location, before anything runs.
+
+        **NON-destructive**: the *old* location's published data is left completely intact — a readable
+        backup / hand-migration source. Topology, deploys, and secrets are untouched (freshness + demand
+        are the only engine state reset). Returns ``{"ponds": n}``."""
         with self.lock:
             # 1. Quiesce: stop every Duck (wait, so the registry handles are free) and drop pending work.
             for key in list(self.state.ponds):
@@ -695,24 +699,27 @@ class Driver:
             lines = [(m["name"], m["major"]) for m in self.meta.values()
                      if not m.get("is_draw") and not m.get("is_spout")]
             # 2. Re-point future spawns (publish + read) at the new plane. NOTE: the OLD location is not
-            #    touched — no scrub — so it remains a switch-back backup.
+            #    touched — no scrub — so it remains a hand-migration source / switch-back backup.
             self.data_root = new_root
             if hasattr(self.launcher, "set_data_root"):
                 self.launcher.set_data_root(new_root)
             else:
                 self.launcher.data_root = new_root
-            # 3. Rewind freshness + flag a cold rebuild so each line wipes its (stale, old-plane) registry
-            #    and republishes into the new location. Demand + topology + config are kept.
+            # 3. "Delete the data": rewind freshness to NEVER + flag a cold refresh (a run, if the operator
+            #    triggers one, wipes the stale registry and rebuilds), AND clear every form of demand so the
+            #    pipeline stays idle — pull tokens, push targets, and standing Wave/Tide triggers.
             self.db.execute(
                 "UPDATE pond_state SET start_f=?, end_f=?, changed_f=?, d_ms=0, is_failed=0, is_blocked=0, "
-                "failed_f=?, failures=0, is_killed=0, refresh_pending=1",
+                "failed_f=?, failures=0, is_killed=0, refresh_pending=1, has_pull=0, has_received_pull=0",
                 (_iso(NEVER), _iso(NEVER), _iso(NEVER), _iso(NEVER)),
             )
+            self.db.execute("DELETE FROM pond_target")   # push demand
+            self.db.execute("DELETE FROM pond_trigger")  # standing Wave/Tide
             self.db.commit()
-            # 4. Rebuild the engine from the rewound DB, re-arm standing triggers, and kick demand.
+            # 4. Rebuild the engine from the rewound, demand-free DB. Do NOT kick a rebuild — stay dormant
+            #    until the operator triggers (or hand-copies data in).
             self.reload()
             self.state_version += 1
-            self._process(_now())
             return {"ponds": len(lines)}
 
     def remove_pond(self, name: str, major: int, wipe: bool = False) -> dict:

@@ -152,8 +152,9 @@ function EnableFlow({ settings, catchmentName, onEnabled }:
       {needsConfirm && (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
           <div style={{ fontSize: 10, color: '#f59e0b', lineHeight: 1.4 }}>
-            This Catchment has local data — attaching a bucket rebuilds the pipeline into it (your local
-            data is kept as a backup). Type the catchment name <b>{catchmentName}</b> to confirm.
+            This Catchment has local data — attaching a bucket empties the data plane: every Pond is left
+            with no data and idle (no auto-rebuild). Re-trigger to rebuild, or hand-copy data across first.
+            Your local data is kept as a backup. Type the catchment name <b>{catchmentName}</b> to confirm.
           </div>
           <input value={confirm} onChange={(e) => setConfirm(e.target.value)} placeholder={catchmentName} style={input} />
         </div>
@@ -257,8 +258,9 @@ function DataPlaneSection({ settings, catchmentName, reload }:
       ) : (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
           <div style={{ fontSize: 10, color: '#f59e0b', lineHeight: 1.4 }}>
-            Switching rebuilds the pipeline into the new location. The current location is left intact as a
-            backup — you can switch back to it. Type <b>{catchmentName}</b> to confirm.
+            Switching empties the data plane — every Pond is left with no data and idle (no auto-rebuild).
+            Re-trigger to rebuild, or hand-copy data across first. The current location is kept intact as a
+            backup (switch back anytime). Type <b>{catchmentName}</b> to confirm.
           </div>
           <input value={target} onChange={(e) => setTarget(e.target.value)} placeholder="s3://bucket/prefix (blank = local)" style={smallInput} />
           <input value={confirm} onChange={(e) => setConfirm(e.target.value)} placeholder={`type ${catchmentName}`} style={smallInput} />

@@ -144,28 +144,32 @@ def test_switch_configured_root_needs_confirm_and_can_go_local(tmp_path):
     assert client.app.state.driver.data_root is None
 
 
-def test_switch_data_root_rewinds_and_preserves_old(tmp_path):
+def test_switch_data_root_empties_and_stays_dormant(tmp_path):
     from duckstring.catchment.driver import _iso
     from duckstring.engine.core import NEVER
 
     client, db = _client(tmp_path)
     driver = client.app.state.driver
-    # Give the line a non-cold freshness and drop a file under the (local) old plane to prove it survives.
+    key = next(iter(driver.meta))
+    # Give the line a non-cold freshness + a standing Wave, and drop a file under the (local) old plane.
     old_file = tmp_path / "ponds" / "src" / "backup.parquet"
     old_file.parent.mkdir(parents=True, exist_ok=True)
     old_file.write_text("published")
-    db.execute("UPDATE pond_state SET end_f='2026-01-01T00:00:00+00:00', refresh_pending=0")
+    db.execute("UPDATE pond_state SET start_f='2026-01-01T00:00:00+00:00', end_f='2026-01-01T00:00:00+00:00', has_pull=1")
     db.commit()
     driver.reload()
+    driver.wave(key)  # a standing pull that must NOT survive the switch
+    assert db.execute("SELECT COUNT(*) FROM pond_trigger").fetchone()[0] == 1
 
     driver.switch_data_root(str(tmp_path / "plane2"))
 
     assert driver.data_root == str(tmp_path / "plane2")   # re-pointed
-    (end_f,) = db.execute("SELECT end_f FROM pond_state").fetchone()
-    # Freshness rewound off the old value → rebuild into the new plane (the engine persists NEVER as NULL).
-    assert end_f != "2026-01-01T00:00:00+00:00"
-    assert end_f in (None, _iso(NEVER))
-    assert old_file.exists()           # NON-destructive: the old location's data is kept as a backup
+    start_f, end_f, has_pull = db.execute("SELECT start_f, end_f, has_pull FROM pond_state").fetchone()
+    assert start_f in (None, _iso(NEVER)) and end_f in (None, _iso(NEVER))  # emptied (as if data deleted)
+    assert has_pull == 0                                                    # pull demand cleared
+    assert db.execute("SELECT COUNT(*) FROM pond_trigger").fetchone()[0] == 0  # standing trigger cleared
+    assert key not in driver.state.triggers                                # → dormant, no auto-run
+    assert old_file.exists()                                               # old location kept as a backup
 
 
 def test_status_carries_cloud_block(tmp_path, monkeypatch):

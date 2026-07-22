@@ -80,12 +80,13 @@ class _SettingsBody(BaseModel):
 
 @router.put("/catchment/settings", dependencies=[auth.full])
 def put_settings(request: Request, body: _SettingsBody):
-    """Attach or **switch** the data-plane target (empty ``data_root`` → back to local). Switching is a
-    **rebuild, not a byte migration**: the pipeline republishes into the new location from the Inlets
-    down, and the OLD location's data is left intact (a readable backup / switch-back source). Because it
-    rebuilds, a switch away from an existing root — or a Catchment that already has published data —
-    requires ``confirm`` == the catchment name (so it can't happen by accident). Applied live (future
-    Duck spawns use the new root) and persisted. Full-gated (it moves where all data lives)."""
+    """Attach or **switch** the data-plane target (empty ``data_root`` → back to local). Switching leaves
+    every Pond **as if its data had been deleted** and **dormant** — it does NOT auto-rebuild (so there is
+    a window to hand-copy non-rederivable data into the new location before anything runs); the OLD
+    location's data is left intact as a backup / hand-migration source. Because it empties + clears demand,
+    a switch away from an existing root — or a Catchment that already has published data — requires
+    ``confirm`` == the catchment name (so it can't happen by accident). Applied live (future Duck spawns
+    use the new root) and persisted. Full-gated (it moves where all data lives)."""
     from ...storage import get_storage
     from .. import cloud
     from ..data_lease import acquire_lease, release_lease
@@ -102,8 +103,9 @@ def put_settings(request: Request, body: _SettingsBody):
     name = _catchment_name(db)
     if (current is not None or cloud.has_published_data(db)) and (body.confirm or "") != name:
         raise HTTPException(status_code=422, detail=(
-            f"switching the data root rebuilds the pipeline into it (the old location is kept as a "
-            f"backup); confirm by passing the catchment name: {name!r}"))
+            f"switching the data root empties the data plane (every Pond is left with no data and idle — "
+            f"no auto-rebuild; the old location is kept as a backup); confirm by passing the catchment "
+            f"name: {name!r}"))
     owner_id = dict(db.execute("SELECT key, value FROM catchment_meta").fetchall()).get("id") or "unknown"
     # Take the single-writer lease on the new store (object stores only; local needs none). get_storage
     # validates the scheme.
