@@ -139,11 +139,13 @@ export const PondNode = memo(function PondNode({ data }: NodeProps) {
             </span>
           )}
           {pond.dbt && (
+            // The dbt wordmark logo (lowercase, dbt orange). Not the pictorial hood icon — that
+            // trademarked glyph would need the official SVG asset rather than an approximation.
             <span
               title="dbt-mode Pond — its Ripples are dbt models"
               style={{
-                fontSize: 9, fontWeight: 800, color: '#ff694b', letterSpacing: '0.02em', flexShrink: 0,
-                border: '1px solid #ff694b', borderRadius: 3, padding: '0 3px', lineHeight: 1.6, alignSelf: 'center',
+                fontSize: 13, fontWeight: 800, color: '#ff694b', flexShrink: 0, alignSelf: 'center',
+                fontFamily: '"Segoe UI", system-ui, -apple-system, sans-serif', letterSpacing: '-0.04em', lineHeight: 1,
               }}
             >
               dbt

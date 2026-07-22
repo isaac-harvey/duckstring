@@ -772,9 +772,11 @@ export function Sidebar({ mobile = false }: { mobile?: boolean }) {
                 The kind is implied (and shown on the meta line below), so it needs no label here. */}
             <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
               {selectedPond.dbt && (
+                // The dbt wordmark logo (lowercase, dbt orange) — see PondNode for the icon-asset note.
                 <span title="dbt-mode Pond — its Ripples are dbt models"
-                      style={{ fontSize: 10, fontWeight: 800, color: '#ff694b', border: '1px solid #ff694b',
-                               borderRadius: 3, padding: '1px 4px', lineHeight: 1.3, flexShrink: 0 }}>
+                      style={{ fontSize: 18, fontWeight: 800, color: '#ff694b', flexShrink: 0,
+                               fontFamily: '"Segoe UI", system-ui, -apple-system, sans-serif',
+                               letterSpacing: '-0.04em', lineHeight: 1 }}>
                   dbt
                 </span>
               )}
