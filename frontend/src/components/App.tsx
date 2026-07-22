@@ -6,7 +6,7 @@ import { useLiveStore } from '@/lib/store';
 import { BATCH_OPS, type BatchOp } from '@/lib/api';
 import { useIsMobile } from '@/lib/useIsMobile';
 import { DagCanvas } from './DagCanvas';
-import { Sidebar } from './Sidebar';
+import { Sidebar, TracePanel } from './Sidebar';
 import { RunHistory } from './RunHistory';
 import { RunDetail } from './RunDetail';
 import { DataViewerModal } from './DataViewerModal';
@@ -331,6 +331,10 @@ export function App() {
           </div>
           <div style={{ flex: 1, minWidth: 0 }}>
             <RunDetail />
+          </div>
+          {/* Bottom-right quadrant — aligned under the 320px sidebar: the selected node's run timing. */}
+          <div style={{ width: 320, minWidth: 320, borderLeft: '1px solid #27272a' }}>
+            <TracePanel />
           </div>
         </div>
       )}

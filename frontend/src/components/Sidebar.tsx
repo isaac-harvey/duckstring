@@ -465,6 +465,125 @@ function rippleTrace(runs: PondRun[], rippleName: string): { times: number[]; du
   return { times, durations };
 }
 
+// ─── Options modal: the rarely-needed per-Pond config, off the always-visible sidebar ───────────────
+
+const modalBackdrop: React.CSSProperties = {
+  position: 'fixed', inset: 0, zIndex: 1100, display: 'flex', alignItems: 'center', justifyContent: 'center',
+  background: 'rgba(9,9,11,0.78)', backdropFilter: 'blur(2px)', fontFamily: 'ui-monospace, SFMono-Regular, monospace',
+};
+
+function PondOptionsModal({ pond, canControl, onClose }: { pond: Pond; canControl: boolean; onClose: () => void }) {
+  const pondInfo = useLiveStore((s) => s.pondInfo);
+  const setBudget = useLiveStore((s) => s.setBudget);
+  const info = pondInfo[pond.id];
+  // Retry-budget inputs, seeded from the Pond's live config (the modal remounts per pond, so a plain
+  // initializer is enough — no re-seed-on-poll dance needed).
+  const [immRetries, setImmRetries] = useState(info ? String(info.immediateRetries) : '0');
+  const [srcRetries, setSrcRetries] = useState(info ? String(info.sourceRetries) : '0');
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => e.key === 'Escape' && onClose();
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose]);
+
+  return (
+    <div onClick={onClose} style={modalBackdrop}>
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          background: '#15151a', border: '1px solid #27272a', borderRadius: 10, width: 'min(460px, 92vw)',
+          maxHeight: '82vh', display: 'flex', flexDirection: 'column', overflow: 'hidden', color: '#e4e4e7',
+        }}
+      >
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '12px 16px', borderBottom: '1px solid #27272a', flexShrink: 0 }}>
+          <span style={{ fontSize: 13, fontWeight: 700, color: '#e4e4e7' }}>{pond.name}</span>
+          <span style={{ fontSize: 11, color: '#71717a' }}>Options</span>
+          <button
+            onClick={onClose}
+            title="Close (Esc)"
+            style={{ marginLeft: 'auto', background: 'transparent', border: '1px solid #3f3f46', borderRadius: 5,
+                     color: '#a1a1aa', fontSize: 13, lineHeight: 1, padding: '4px 9px', cursor: 'pointer', fontFamily: 'inherit' }}
+          >
+            ✕
+          </button>
+        </div>
+        <div style={{ overflowY: 'auto', padding: '0 16px 16px', minHeight: 0 }}>
+          {/* Retry budgets (full only). */}
+          {canControl && (
+            <Section>
+              <Label>Failures · retry budgets</Label>
+              {([
+                ['Immediate Retries', immRetries, setImmRetries],
+                ['On Change Retries', srcRetries, setSrcRetries],
+              ] as const).map(([label, value, setValue]) => (
+                <div key={label} style={{ display: 'flex', gap: 6, alignItems: 'center', marginBottom: 6 }}>
+                  <span style={{ flex: 1, fontSize: 11, color: '#a1a1aa' }}>{label}</span>
+                  <input type="number" min="0" step="1" value={value} onChange={(e) => setValue(e.target.value)} style={{ ...numInput, width: 48 }} />
+                  <Btn
+                    small
+                    color={THEME_WAKE}
+                    onClick={() => setBudget(pond.id, Math.max(0, parseInt(immRetries) || 0), Math.max(0, parseInt(srcRetries) || 0))}
+                  >
+                    Set
+                  </Btn>
+                </div>
+              ))}
+            </Section>
+          )}
+          {/* Compute config (full only; Draws/Spouts carry none). */}
+          {canControl && info?.duck && (
+            <Section>
+              <Label>Compute</Label>
+              <DuckSection pondId={pond.id} duck={info.duck} />
+            </Section>
+          )}
+          {/* Egress Spouts — a Draw can't be a source. */}
+          {!pond.isDraw && <SpoutEditor sourceId={pond.id} canControl={canControl} />}
+          {/* Observed lineage (read-visible) + alert channels scoped to this Pond. */}
+          {!pond.isDraw && <LineageSection key={`lin-${pond.id}`} pond={pond} />}
+          <AlertEditor key={pond.id} pond={pond} canControl={canControl} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Run-timing panel: the bottom-right quadrant (Pond sidebar column × the run-history bottom bar) ──
+
+export function TracePanel() {
+  const selectedPondId = useLiveStore((s) => s.selectedPondId);
+  const selectedRippleId = useLiveStore((s) => s.selectedRippleId);
+  const ripples = useLiveStore((s) => s.ripples);
+  const ponds = useLiveStore((s) => s.ponds);
+  const runs = useLiveStore((s) => s.selectedPondRuns);
+  const selectedRipple = selectedRippleId ? ripples[selectedRippleId] : null;
+  const pond = selectedPondId ? ponds[selectedPondId] : null;
+
+  let title: string | null = null;
+  let trace: { times: number[]; durations: number[] } | null = null;
+  if (selectedRipple) {
+    title = `${selectedRipple.name} · run timing`;
+    trace = rippleTrace(runs, selectedRipple.name);
+  } else if (pond) {
+    title = `${pond.name} · run timing`;
+    trace = pondTrace(runs);
+  }
+
+  return (
+    <div style={{ height: '100%', display: 'flex', flexDirection: 'column', padding: 14, boxSizing: 'border-box', overflow: 'hidden', background: '#15151a' }}>
+      <div style={{ fontSize: 10, fontWeight: 700, color: '#52525b', letterSpacing: '0.1em', textTransform: 'uppercase', marginBottom: 10, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+        {title ?? 'Run timing'}
+      </div>
+      {trace ? (
+        <TraceChart {...trace} />
+      ) : (
+        <div style={{ fontSize: 12, color: '#52525b', margin: 'auto', textAlign: 'center' }}>Select a Pond or Ripple</div>
+      )}
+    </div>
+  );
+}
+
 export function Sidebar({ mobile = false }: { mobile?: boolean }) {
   const ponds = useLiveStore((s) => s.ponds);
   const ripples = useLiveStore((s) => s.ripples);
@@ -489,7 +608,6 @@ export function Sidebar({ mobile = false }: { mobile?: boolean }) {
   const kill = useLiveStore((s) => s.kill);
   const removeTrigger = useLiveStore((s) => s.removeTrigger);
   const clearFailure = useLiveStore((s) => s.clearFailure);
-  const setBudget = useLiveStore((s) => s.setBudget);
 
   // Access level gates the action surface (the backend enforces it too — this just avoids dead buttons).
   // read: status/history/data only · demand: + the Triggers menu · full: + Control/Windows/Failures.
@@ -500,18 +618,9 @@ export function Sidebar({ mobile = false }: { mobile?: boolean }) {
   const [tideBound, setTideBound] = useState('2');
   const [tideUnit, setTideUnit] = useState<FreqUnit>('SECOND');
   const [showTideInput, setShowTideInput] = useState(false);
-
-  // Retry-budget inputs, seeded from the selected Pond's live config. Re-seed only when the selection
-  // changes (the "adjust state while rendering" pattern) so live polls don't clobber typing mid-edit.
-  const [immRetries, setImmRetries] = useState('0');
-  const [srcRetries, setSrcRetries] = useState('0');
-  const [budgetPond, setBudgetPond] = useState<string | null>(null);
-  if (selectedPondId !== budgetPond) {
-    setBudgetPond(selectedPondId);
-    const info = selectedPondId ? pondInfo[selectedPondId] : null;
-    setImmRetries(info ? String(info.immediateRetries) : '0');
-    setSrcRetries(info ? String(info.sourceRetries) : '0');
-  }
+  // The Options modal (retry budgets, Compute, Spouts, Alerts, Lineage) — opened by the Options bar
+  // beneath the always-visible sections.
+  const [optionsOpen, setOptionsOpen] = useState(false);
 
   const selectedPond = selectedPondId ? ponds[selectedPondId] : null;
   const selectedRipple = selectedRippleId ? ripples[selectedRippleId] : null;
@@ -529,6 +638,7 @@ export function Sidebar({ mobile = false }: { mobile?: boolean }) {
   const [prevSelectionKey, setPrevSelectionKey] = useState(selectionKey);
   if (selectionKey !== prevSelectionKey) {
     setPrevSelectionKey(selectionKey);
+    setOptionsOpen(false); // a new selection closes a stale Options modal
     if (mobile && selectionKey) setCollapsed(false);
   }
 
@@ -684,56 +794,35 @@ export function Sidebar({ mobile = false }: { mobile?: boolean }) {
           </Section>
           )}
 
-          {/* Failures: retry budgets + clearing a failed Pond. Full only — the failure *reason* is shown
-              above (Triggers StatusBox) and in Run Detail for every level; only remediation is gated. */}
-          {canControl && (
+          {/* Failure clearing stays visible (the remediation). The retry *budgets* moved to Options; the
+              failure reason is shown above (Triggers StatusBox) and in Run Detail for every level. */}
+          {canControl && selectedInfo?.isFailed && (
           <Section>
-            <Label>Failures</Label>
-            {([
-              ['Immediate Retries', immRetries, setImmRetries],
-              ['On Change Retries', srcRetries, setSrcRetries],
-            ] as const).map(([label, value, setValue]) => (
-              <div key={label} style={{ display: 'flex', gap: 6, alignItems: 'center', marginBottom: 6 }}>
-                <span style={{ flex: 1, fontSize: 11, color: '#a1a1aa' }}>{label}</span>
-                <input type="number" min="0" step="1" value={value} onChange={(e) => setValue(e.target.value)} style={{ ...numInput, width: 48 }} />
-                <Btn
-                  small
-                  color={THEME_WAKE}
-                  onClick={() => setBudget(selectedPond.id, Math.max(0, parseInt(immRetries) || 0), Math.max(0, parseInt(srcRetries) || 0))}
-                >
-                  Set
-                </Btn>
-              </div>
-            ))}
-            {pondInfo[selectedPond.id]?.isFailed && (
-              <div style={{ marginTop: 8 }}>
-                <Btn onClick={() => clearFailure(selectedPond.id)} color={THEME_SUCCESS}>Clear Failure</Btn>
-              </div>
-            )}
+            <Label>Failure</Label>
+            <Btn onClick={() => clearFailure(selectedPond.id)} color={THEME_SUCCESS}>Clear Failure</Btn>
           </Section>
           )}
 
-          {/* Compute config: Duck target/size + Flock posture. Operator-owned (coalesced over the
-              pond.toml-declared config), so full only; Draws/Spouts carry none (no Duck runs them). */}
-          {canControl && selectedInfo?.duck && (
-          <Section>
-            <Label>Compute</Label>
-            <DuckSection pondId={selectedPond.id} duck={selectedInfo.duck} />
-          </Section>
+          {/* Rarely-needed config lives behind Options: retry budgets, Compute, Spouts, Alerts, Lineage. */}
+          <div style={{ borderTop: '1px solid #27272a', marginTop: 14, paddingTop: 14 }}>
+            <button
+              onClick={() => setOptionsOpen(true)}
+              style={{
+                width: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8,
+                background: '#1a1a1f', border: '1px solid #3f3f46', borderRadius: 6, padding: '8px 12px',
+                color: '#a1a1aa', fontSize: 12, fontWeight: 600, cursor: 'pointer', fontFamily: 'inherit',
+              }}
+            >
+              ⚙ Options
+            </button>
+          </div>
+
+          {/* Desktop shows run timing in the bottom-right quadrant (TracePanel); mobile keeps it here. */}
+          {mobile && (
+            <Section>
+              <TraceChart {...pondTrace(selectedPondRuns)} />
+            </Section>
           )}
-
-          {/* Egress Spouts on this Pond — a Draw can't be a source (it has no local output). */}
-          {!selectedPond.isDraw && <SpoutEditor sourceId={selectedPond.id} canControl={canControl} />}
-
-          {/* Failure & freshness alert channels scoped to this Pond. Keyed by id so a pond switch remounts. */}
-          {!selectedPond.isSpout && !selectedPond.isDraw && (
-            <LineageSection key={`lin-${selectedPond.id}`} pond={selectedPond} />
-          )}
-          <AlertEditor key={selectedPond.id} pond={selectedPond} canControl={canControl} />
-
-          <Section>
-            <TraceChart {...pondTrace(selectedPondRuns)} />
-          </Section>
 
           </>
           )}
@@ -764,10 +853,17 @@ export function Sidebar({ mobile = false }: { mobile?: boolean }) {
             )}
           </Section>
 
-          <Section>
-            <TraceChart {...rippleTrace(selectedPondRuns, selectedRipple.name)} />
-          </Section>
+          {mobile && (
+            <Section>
+              <TraceChart {...rippleTrace(selectedPondRuns, selectedRipple.name)} />
+            </Section>
+          )}
         </>
+      )}
+
+      {/* Options modal — the moved config sections (regular Ponds only; a Spout has its own lean panel). */}
+      {selectedPond && !selectedPond.isSpout && !selectedRippleId && optionsOpen && (
+        <PondOptionsModal pond={selectedPond} canControl={canControl} onClose={() => setOptionsOpen(false)} />
       )}
     </>
   );
