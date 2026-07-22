@@ -56,10 +56,13 @@ def get_settings(request: Request):
     AWS creds) and its reasons, so the UI can grey out remote-compute options and explain why. Also
     ``has_data`` — once true the data root is set-once (see PUT)."""
     from .. import cloud
+    from ..cloud_backends import refresh_credential_status
 
     app = request.app
+    refresh_credential_status(app.state)  # TTL-throttled background STS check; reads the cache here
     status = cloud.cloud_status(getattr(app.state, "data_root", None),
-                                getattr(app.state, "secret_store", None))
+                                getattr(app.state, "secret_store", None),
+                                getattr(app.state, "cloud_creds", None))
     status["has_data"] = cloud.has_published_data(_db(request))
     return status
 
@@ -113,13 +116,15 @@ def put_settings(request: Request, body: _SettingsBody):
     if launcher is not None:
         launcher.data_root = new
     # Attaching the data root can flip the gate to enabled (creds may already be present) — build the
-    # remote backends live so remote compute works without a restart. Guarded: never fail the set.
+    # remote backends live so remote compute works without a restart, and re-validate the creds so the
+    # persistent banner reflects the newly-enabled gate. Guarded: never fail the set.
     try:
-        from ..cloud_backends import refresh_cloud_backends
+        from ..cloud_backends import refresh_cloud_backends, refresh_credential_status
         refresh_cloud_backends(app)
+        refresh_credential_status(app.state, force=True)
     except Exception:
         pass
-    return cloud.cloud_status(new, app.state.secret_store)
+    return cloud.cloud_status(new, app.state.secret_store, getattr(app.state, "cloud_creds", None))
 
 
 # ─── Duck Pools (Catchment-level named remote compute) ───────────────────────────
@@ -250,10 +255,14 @@ def verify_cloud(request: Request, body: _VerifyBody = _VerifyBody()):
         import boto3
     except Exception:
         return {"ok": False, "error": "boto3 is not installed on the Catchment"}
+    from ..cloud_backends import set_credential_status
     try:
         ident = boto3.client("sts", region_name=signing).get_caller_identity()
     except Exception as exc:
-        return {"ok": False, "region": region, "error": _aws_error(exc)}
+        err = _aws_error(exc)
+        set_credential_status(request.app.state, False, err)  # update the persistent banner immediately
+        return {"ok": False, "region": region, "error": err}
+    set_credential_status(request.app.state, True, None)
     result = {"ok": True, "account": ident.get("Account"), "arn": ident.get("Arn"), "region": region}
     root = (body.data_root or "").strip()
     if root and root.lower().startswith("s3://"):

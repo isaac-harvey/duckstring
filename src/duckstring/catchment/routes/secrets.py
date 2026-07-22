@@ -44,8 +44,9 @@ def set_secret(request: Request, body: _SecretBody):
         # Adding/rotating a credential must make remote compute usable (and pick up the new value)
         # without a restart — attach or refresh the remote backends live. Guarded so it never fails set.
         try:
-            from ..cloud_backends import refresh_cloud_backends
+            from ..cloud_backends import refresh_cloud_backends, refresh_credential_status
             refresh_cloud_backends(request.app)
+            refresh_credential_status(request.app.state, force=True)  # re-validate → update the banner
         except Exception:
             pass
     return {"ok": True, "name": body.name}

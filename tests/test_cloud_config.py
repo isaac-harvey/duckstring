@@ -189,6 +189,53 @@ def test_validate_credentials_reports_error(monkeypatch):
     assert cloud.validate_credentials() == "ExpiredToken"
 
 
+# ─── Credential-validity surface (the persistent-warning source) ─────────────────
+
+def test_cloud_status_merges_cred_status():
+    base = cloud.cloud_status("s3://b/p", None)
+    assert base["creds_valid"] is None and base["creds_error"] is None
+    merged = cloud.cloud_status("s3://b/p", None, {"valid": False, "error": "ExpiredToken"})
+    assert merged["creds_valid"] is False and merged["creds_error"] == "ExpiredToken"
+
+
+def test_refresh_credential_status_gate_off_clears(tmp_path):
+    from duckstring.catchment.cloud_backends import refresh_credential_status
+    st = types.SimpleNamespace(data_root=None, secret_store=SecretStore(tmp_path), cloud_creds={"valid": True})
+    refresh_credential_status(st)
+    assert st.cloud_creds is None  # gate off → no cred status (and no stale warning)
+
+
+def test_refresh_credential_status_validates_when_enabled(tmp_path, monkeypatch):
+    monkeypatch.setitem(sys.modules, "boto3", _make_boto3())
+    from duckstring.catchment.cloud_backends import refresh_credential_status
+    store = SecretStore(tmp_path)
+    store.set("AWS_ACCESS_KEY_ID", "AKIA")
+    st = types.SimpleNamespace(data_root="s3://b/p", secret_store=store)
+    refresh_credential_status(st, background=False)
+    assert st.cloud_creds["valid"] is True
+
+
+def test_refresh_credential_status_records_failure(tmp_path, monkeypatch):
+    monkeypatch.setitem(sys.modules, "boto3", _make_boto3(sts_error=RuntimeError("ExpiredToken")))
+    from duckstring.catchment.cloud_backends import refresh_credential_status
+    store = SecretStore(tmp_path)
+    store.set("AWS_ACCESS_KEY_ID", "AKIA")
+    st = types.SimpleNamespace(data_root="s3://b/p", secret_store=store)
+    refresh_credential_status(st, background=False)
+    assert st.cloud_creds["valid"] is False and st.cloud_creds["error"] == "ExpiredToken"
+
+
+def test_verify_updates_the_cred_cache(client, monkeypatch):
+    monkeypatch.setitem(sys.modules, "boto3", _make_boto3())
+    client.post("/api/catchment/cloud/verify", json={})
+    assert client.app.state.cloud_creds["valid"] is True
+
+
+def test_status_payload_carries_creds_field(client):
+    cloud_gate = client.get("/api/status").json()["cloud"]
+    assert "creds_valid" in cloud_gate and cloud_gate["creds_valid"] is None  # gate off in the open test app
+
+
 # ─── Runtime rebuild of the remote backends ─────────────────────────────────────
 
 def _dispatching_app(tmp_path, store, base_url="http://catchment.example:7474"):

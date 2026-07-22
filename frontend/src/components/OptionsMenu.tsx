@@ -87,6 +87,9 @@ export function TopBar() {
   const [open, setOpen] = useState(false);
   const [panel, setPanel] = useState<'secrets' | 'alerts' | 'cloud' | null>(null);
   const isMobile = useIsMobile();
+  // Cloud is enabled but its credentials are being rejected — remote compute is silently broken, so we
+  // flag it persistently (on the closed bar, and beside the Cloud menu item) not just inside the menu.
+  const credsInvalid = useLiveStore((s) => !!(s.cloud?.cloud_enabled && s.cloud?.creds_valid === false));
 
   const label = catchment?.name || (catchment?.id ? catchment.id.slice(0, 8) : 'Catchment');
   const isFull = accessLevel === 'full';
@@ -135,15 +138,23 @@ export function TopBar() {
           <AccessChips />
         </div>
         <button
-          aria-label="Options"
+          aria-label={credsInvalid ? 'Options — cloud credentials invalid' : 'Options'}
+          title={credsInvalid ? 'Cloud credentials are not authenticating — see Options → Cloud' : undefined}
           onClick={() => (open ? close() : setOpen(true))}
           style={{
-            marginLeft: 'auto', alignSelf: 'stretch', background: open ? '#27272a' : 'transparent',
-            border: '1px solid #27272a', borderRadius: 6, padding: '0 9px', color: open ? '#e4e4e7' : '#a1a1aa',
-            cursor: 'pointer', fontFamily: 'inherit', fontSize: 14, lineHeight: 1,
+            position: 'relative', marginLeft: 'auto', alignSelf: 'stretch',
+            background: open ? '#27272a' : 'transparent',
+            border: `1px solid ${credsInvalid ? '#f59e0b' : '#27272a'}`, borderRadius: 6, padding: '0 9px',
+            color: open ? '#e4e4e7' : '#a1a1aa', cursor: 'pointer', fontFamily: 'inherit', fontSize: 14, lineHeight: 1,
           }}
         >
           ☰
+          {credsInvalid && (
+            <span style={{
+              position: 'absolute', top: -4, right: -4, width: 9, height: 9, borderRadius: '50%',
+              background: '#f59e0b', border: '1px solid #15151a',
+            }} />
+          )}
         </button>
       </div>
 
@@ -189,7 +200,7 @@ export function TopBar() {
               style={{ ...menuItem, color: panel === 'cloud' ? '#e4e4e7' : '#d4d4d8' }}
               onClick={() => setPanel(panel === 'cloud' ? null : 'cloud')}
             >
-              <span>Cloud</span>
+              <span>Cloud {credsInvalid && <span style={{ color: '#f59e0b' }} title="Credentials invalid">⚠</span>}</span>
               <span style={{ color: '#71717a', fontSize: 11 }}>›</span>
             </button>
           )}

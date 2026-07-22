@@ -55,6 +55,20 @@ export function CloudMenu({ onClose }: { onClose: () => void }) {
         <div>cloud: <span style={{ color: enabled ? '#22c55e' : '#71717a' }}>{enabled ? 'enabled' : 'disabled'}</span></div>
       </div>
 
+      {/* Persistent warning: enabled but the creds are being rejected — remote compute is broken. */}
+      {enabled && settings?.creds_valid === false && (
+        <div style={{
+          fontSize: 11, lineHeight: 1.5, color: '#f59e0b', border: '1px solid #f59e0b66',
+          background: '#f59e0b14', borderRadius: 5, padding: '6px 8px', marginBottom: 8,
+        }}>
+          <div style={{ fontWeight: 700 }}>⚠ AWS credentials are not authenticating</div>
+          <div style={{ color: '#d4d4d8', marginTop: 2 }}>
+            Remote Duck launches will fail. {settings.creds_error && <span style={{ color: '#a1a1aa' }}>({settings.creds_error})</span>}
+          </div>
+          <div style={{ color: '#a1a1aa', marginTop: 2 }}>Update the credentials below, then Verify.</div>
+        </div>
+      )}
+
       {settings && !enabled && <EnableFlow settings={settings} onEnabled={load} />}
       {enabled && <EnabledConfig settings={settings!} pools={pools} reload={load} />}
     </div>
@@ -153,6 +167,44 @@ function EnableFlow({ settings, onEnabled }: { settings: CloudSettings; onEnable
 
 // ─── Enabled config (data root + Duck Pools with real dropdowns) ─────────────
 
+function FixCredentials({ reload }: { reload: () => void }) {
+  const [akid, setAkid] = useState('');
+  const [secret, setSecret_] = useState('');
+  const [region, setRegion] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [result, setResult] = useState<CloudVerifyResult | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+
+  const save = async () => {
+    setErr(null); setResult(null); setBusy(true);
+    try {
+      if (akid.trim()) await setSecret('AWS_ACCESS_KEY_ID', akid.trim());
+      if (secret.trim()) await setSecret('AWS_SECRET_ACCESS_KEY', secret.trim());
+      if (region.trim()) await setSecret('AWS_DEFAULT_REGION', region.trim());
+      const res = await verifyCloud();
+      setResult(res);
+      if (res.ok) { setAkid(''); setSecret_(''); reload(); }
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : 'failed');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const canSave = !busy && akid.trim() !== '' && secret.trim() !== '';
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginBottom: 12 }}>
+      <div style={heading}>UPDATE CREDENTIALS</div>
+      <input value={akid} onChange={(e) => setAkid(e.target.value)} placeholder="AWS access key ID" style={smallInput} autoComplete="off" />
+      <input value={secret} onChange={(e) => setSecret_(e.target.value)} placeholder="AWS secret access key" type="password" style={smallInput} autoComplete="off" />
+      <input value={region} onChange={(e) => setRegion(e.target.value)} placeholder="region (optional — leave to keep)" style={smallInput} />
+      {result && !result.ok && <div style={{ fontSize: 11, color: '#ef4444', wordBreak: 'break-word' }}>still failing: {result.error}</div>}
+      {err && <div style={{ fontSize: 11, color: '#ef4444', wordBreak: 'break-word' }}>{err}</div>}
+      <button onClick={save} disabled={!canSave} style={btn('#f59e0b', !canSave)}>{busy ? 'Verifying…' : 'Save & verify'}</button>
+    </div>
+  );
+}
+
 function EnabledConfig({ settings, pools, reload }: { settings: CloudSettings; pools: DuckPool[]; reload: () => void }) {
   const [busy, setBusy] = useState(false);
   const [pName, setPName] = useState('');
@@ -191,6 +243,7 @@ function EnabledConfig({ settings, pools, reload }: { settings: CloudSettings; p
 
   return (
     <>
+      {settings.creds_valid === false && <FixCredentials reload={reload} />}
       {settings.has_data && (
         <div style={{ fontSize: 10, color: '#52525b', marginBottom: 10, lineHeight: 1.5 }}>
           The data root is set-once — the Catchment has published data (switching would strand it).

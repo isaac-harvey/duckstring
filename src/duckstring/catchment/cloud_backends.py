@@ -8,8 +8,15 @@ creds — without a Catchment restart (plans/cloud-config.md).
 
 from __future__ import annotations
 
+import logging
 import os
+import threading
+import time
 from pathlib import Path
+
+_log = logging.getLogger("duckstring.catchment")
+_CRED_TTL = 300.0        # seconds — re-validate credentials at most this often (in the background)
+_cred_lock = threading.Lock()  # guards kicking a single background validation at a time
 
 
 def build_remote_backends(root: Path, base_url: str | None, token: str, data_root: str | None,
@@ -76,3 +83,55 @@ def refresh_cloud_backends(app) -> bool:
     if remotes:
         launcher.attach_remotes(remotes, dialback)
     return bool(remotes)
+
+
+# ─── Credential validity (the persistent-warning source) ─────────────────────────
+
+def _gate_enabled(app_state) -> bool:
+    from . import cloud
+    return (cloud.is_remote(getattr(app_state, "data_root", None))
+            and cloud.aws_configured(getattr(app_state, "secret_store", None)))
+
+
+def _validate_and_store(app_state) -> None:
+    """Run the live STS check and cache the result on ``app_state.cloud_creds``; log a warning when the
+    gate is enabled but the creds are rejected (so a rejected key is never silent)."""
+    from . import cloud
+    try:
+        err = cloud.validate_credentials()
+        app_state.cloud_creds = {"valid": err is None, "error": err, "checked_at": time.time()}
+        if err:
+            _log.warning(
+                "cloud is enabled but the AWS credentials did not validate (STS GetCallerIdentity): %s "
+                "— remote Duck launches will fail until this is fixed (Options → Cloud → Verify).", err)
+    finally:
+        with _cred_lock:
+            app_state._cred_check_running = False
+
+
+def refresh_credential_status(app_state, *, force: bool = False, background: bool = True) -> None:
+    """Keep ``app_state.cloud_creds`` (``{valid, error, checked_at}`` | None) reasonably fresh WITHOUT
+    ever blocking the request: when the gate is on and the cache is stale/unknown, kick a single
+    background STS check; the request reads the cache. When the gate is off, clear the cache (no warning).
+    ``force`` re-checks now (used right after creds / the data root change)."""
+    if not _gate_enabled(app_state):
+        app_state.cloud_creds = None
+        return
+    cur = getattr(app_state, "cloud_creds", None)
+    fresh = bool(cur) and (time.time() - cur.get("checked_at", 0.0) < _CRED_TTL)
+    if fresh and not force:
+        return
+    if not background:
+        _validate_and_store(app_state)
+        return
+    with _cred_lock:
+        if getattr(app_state, "_cred_check_running", False):
+            return  # one background check at a time — avoid a thread storm from the 1 s status poll
+        app_state._cred_check_running = True
+    threading.Thread(target=_validate_and_store, args=(app_state,), daemon=True).start()
+
+
+def set_credential_status(app_state, valid: bool, error: str | None) -> None:
+    """Record an out-of-band validity result (the Verify button already made a live STS call), so the
+    persistent banner updates immediately instead of waiting for the next background refresh."""
+    app_state.cloud_creds = {"valid": valid, "error": error, "checked_at": time.time()}

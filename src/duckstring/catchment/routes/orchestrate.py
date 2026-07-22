@@ -71,10 +71,15 @@ async def status(
     payload = await run_in_threadpool(driver.status)
     payload["access_level"] = auth.LEVEL_TO_NAME[principal.level]
     # The cloud-enable gate (remote data root + AWS creds) — the UI greys out remote-compute options
-    # until both hold (plans/cloud-config.md).
+    # until both hold (plans/cloud-config.md) — plus the cached credential-validity result so the UI can
+    # persistently warn when the gate is on but the creds are rejected. The refresh is a non-blocking,
+    # TTL-throttled background STS check (never in the request path).
     from .. import cloud
+    from ..cloud_backends import refresh_credential_status
+    refresh_credential_status(request.app.state)
     payload["cloud"] = cloud.cloud_status(getattr(request.app.state, "data_root", None),
-                                          getattr(request.app.state, "secret_store", None))
+                                          getattr(request.app.state, "secret_store", None),
+                                          getattr(request.app.state, "cloud_creds", None))
     return payload
 
 

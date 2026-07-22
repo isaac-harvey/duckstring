@@ -169,6 +169,10 @@ export interface CloudGate {
   data_root_remote: boolean;
   aws_configured: boolean;
   cloud_enabled: boolean;
+  // Live credential validity (STS GetCallerIdentity), cached server-side. null = not yet checked / gate
+  // off (no warning); false = enabled but the creds are rejected → the UI warns persistently.
+  creds_valid: boolean | null;
+  creds_error: string | null;
 }
 
 // The caller's access level — a total order read ⊂ demand ⊂ full. The UI gates its controls on it.

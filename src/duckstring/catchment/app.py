@@ -72,21 +72,12 @@ async def _lifespan(app: FastAPI):
 
     # Boot credential check: the cloud gate is presence-based (deterministic, network-free), so a
     # present-but-rejected key would show "enabled" while every remote launch fails. Validate the creds
-    # actually authenticate and WARN if not — non-blocking (a daemon thread), never fails boot. Validity
-    # is surfaced, not folded into the gate (a transient STS blip must not strand a running setup).
-    from . import cloud as _cloud
-    if _cloud.is_remote(app.state.data_root) and _cloud.aws_configured(app.state.secret_store):
-        import logging
-        import threading
-
-        def _probe_credentials():
-            err = _cloud.validate_credentials()
-            if err:
-                logging.getLogger("duckstring.catchment").warning(
-                    "cloud is enabled but the AWS credentials did not validate (STS GetCallerIdentity): "
-                    "%s — remote Duck launches will fail until this is fixed (Options → Cloud → Verify).", err)
-
-        threading.Thread(target=_probe_credentials, daemon=True).start()
+    # actually authenticate in the background — the result caches on app.state.cloud_creds (surfaced on
+    # /api/status so the UI can persistently warn) and logs a warning. Non-blocking, never fails boot.
+    # Validity is surfaced, not folded into the gate (a transient STS blip must not strand a running setup).
+    from .cloud_backends import refresh_credential_status
+    app.state.cloud_creds = None
+    refresh_credential_status(app.state, force=True)
 
     # Restore: resume any Pond Runs that were in flight when the Catchment last stopped.
     driver.resume_incomplete()

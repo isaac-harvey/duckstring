@@ -126,14 +126,23 @@ def validate_credentials(region: str | None = None) -> str | None:
         return str(exc) or exc.__class__.__name__
 
 
-def cloud_status(data_root: str | None, secret_store=None) -> dict:
+def cloud_status(data_root: str | None, secret_store=None, cred_status: dict | None = None) -> dict:
     """The gate + its reasons — surfaced on /api/status and the settings endpoint so the UI can grey
-    out remote-compute options and explain why."""
+    out remote-compute options and explain why. ``cred_status`` (the cached live-validation result, see
+    cloud_backends) adds ``creds_valid``/``creds_error`` so the UI can persistently warn when the gate is
+    enabled but the credentials don't authenticate (``creds_valid is None`` = not yet checked / gate off
+    → no warning)."""
     remote = is_remote(data_root)
     aws = aws_configured(secret_store)
-    return {
+    out = {
         "data_root": data_root,
         "data_root_remote": remote,
         "aws_configured": aws,
         "cloud_enabled": remote and aws,
+        "creds_valid": None,
+        "creds_error": None,
     }
+    if cred_status is not None:
+        out["creds_valid"] = cred_status.get("valid")
+        out["creds_error"] = cred_status.get("error")
+    return out

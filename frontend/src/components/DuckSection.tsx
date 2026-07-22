@@ -47,6 +47,7 @@ export function DuckSection({ pondId, duck }: { pondId: string; duck: DuckConfig
 
   const target = duck.duck_target;
   const cloudEnabled = cloud?.cloud_enabled ?? false;
+  const credsInvalid = cloudEnabled && cloud?.creds_valid === false;
   const remoteSelected = target !== 'catchment';
   const hasOverride = Object.values(duck.override).some((v) => v != null);
 
@@ -54,6 +55,15 @@ export function DuckSection({ pondId, duck }: { pondId: string; duck: DuckConfig
 
   return (
     <div>
+      {/* Persistent warning: remote targets here won't launch while the creds are rejected. */}
+      {credsInvalid && (
+        <div style={{
+          fontSize: 10, lineHeight: 1.4, color: '#f59e0b', border: '1px solid #f59e0b66',
+          background: '#f59e0b14', borderRadius: 5, padding: '5px 7px', marginBottom: 8,
+        }}>
+          ⚠ AWS credentials are not authenticating — a remote target won&apos;t launch. Fix in Options → Cloud.
+        </div>
+      )}
       {/* Where the Duck runs. 'catchment' = the Catchment's own box; a pool / 'dedicated' = remote. */}
       <div style={row}>
         <span style={lbl}>Duck <Tag from={src(duck, 'duck_target')} /></span>
