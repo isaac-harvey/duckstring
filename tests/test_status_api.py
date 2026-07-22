@@ -235,19 +235,22 @@ def test_run_history_nests_ripple_runs_when_requested(tmp_path):
 
 
 def test_run_history_date_range_filters_started_at(tmp_path):
-    # The plot's date-range navigation bounds a run's started_at (UTC ISO).
+    # The plot's range navigation bounds a run's started_at at second granularity. Stored values are
+    # Python isoformat (UTC, +00:00); the bounds arrive as the frontend sends them (JS toISOString → Z).
     d = _driver(tmp_path)
     d.pulse("src@1")
     f = _complete_run(d, "src@1")
-    d.db.execute("UPDATE pond_run SET started_at = '2020-06-15T10:00:00+00:00' WHERE f = ?", (f,))
+    d.db.execute("UPDATE pond_run SET started_at = '2026-07-22T14:35:40.500000+00:00' WHERE f = ?", (f,))
     d.db.commit()
 
     def hist(**kw):
         return d.run_history("src@1", lineage=False, ripples=False, limit=100, **kw)
 
-    assert [r["f"] for r in hist(after="2020-06-01T00:00:00+00:00", before="2020-07-01T00:00:00+00:00")] == [f]
-    assert hist(before="2020-06-01T00:00:00+00:00") == []  # the run is after the upper bound
-    assert hist(after="2020-07-01T00:00:00+00:00") == []   # the run is before the lower bound
+    # A tight window around the run (Z-suffixed bounds vs +00:00-stored) selects it…
+    assert [r["f"] for r in hist(after="2026-07-22T14:35:30.000Z", before="2026-07-22T14:36:00.000Z")] == [f]
+    # …and a window seconds off — same day — excludes it (granularity is seconds, not days).
+    assert hist(after="2026-07-22T14:35:45.000Z") == []
+    assert hist(before="2026-07-22T14:35:35.000Z") == []
 
 
 # ─── HTTP layer ──────────────────────────────────────────────────────────────────

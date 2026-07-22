@@ -601,9 +601,9 @@ export function TracePanel() {
   useEffect(() => {
     if (!rangeActive || !selectedPondId) return;
     let cancelled = false;
-    const after = from ? new Date(`${from}T00:00:00`).toISOString() : undefined;
-    const before = to ? new Date(`${to}T23:59:59.999`).toISOString() : undefined;
-    fetchRuns({ pond: selectedPondId, lineage: false, ripples: true, limit: RUN_CAP, after, before })
+    // datetime-local values are local wall-clock — toISOString converts to the UTC the backend stores.
+    const iso = (v: string) => { const d = new Date(v); return v && !isNaN(d.getTime()) ? d.toISOString() : undefined; };
+    fetchRuns({ pond: selectedPondId, lineage: false, ripples: true, limit: RUN_CAP, after: iso(from), before: iso(to) })
       .then((rows) => { if (!cancelled) setRangeRuns(rows.map(mapRun)); })
       .catch(() => { if (!cancelled) setRangeRuns([]); });
     return () => { cancelled = true; };
@@ -621,18 +621,25 @@ export function TracePanel() {
         {title ?? 'Run timing'}
       </div>
       {active && (
-        <div style={{ display: 'flex', alignItems: 'center', gap: 5, marginBottom: 8 }}>
-          <input type="date" value={from} max={to || undefined} onChange={(e) => setFrom(e.target.value)} title="from" style={dateInput} />
-          <span style={{ color: '#52525b', fontSize: 10 }}>→</span>
-          <input type="date" value={to} min={from || undefined} onChange={(e) => setTo(e.target.value)} title="to" style={dateInput} />
-          <button
-            onClick={() => { setFrom(''); setTo(''); setRangeRuns(null); }}
-            disabled={!rangeActive}
-            title="Clear range — show the last 50 runs"
-            style={{ background: 'transparent', border: 'none', color: rangeActive ? '#a1a1aa' : '#3f3f46', cursor: rangeActive ? 'pointer' : 'default', fontSize: 12, padding: '0 2px', fontFamily: 'inherit' }}
-          >
-            ✕
-          </button>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 4, marginBottom: 8 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+            <span style={{ width: 26, fontSize: 10, color: '#52525b' }}>from</span>
+            <input type="datetime-local" step="1" value={from} max={to || undefined}
+                   onChange={(e) => setFrom(e.target.value)} style={dateInput} />
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+            <span style={{ width: 26, fontSize: 10, color: '#52525b' }}>to</span>
+            <input type="datetime-local" step="1" value={to} min={from || undefined}
+                   onChange={(e) => setTo(e.target.value)} style={dateInput} />
+            <button
+              onClick={() => { setFrom(''); setTo(''); setRangeRuns(null); }}
+              disabled={!rangeActive}
+              title="Clear range — show the last 50 runs"
+              style={{ background: 'transparent', border: 'none', color: rangeActive ? '#a1a1aa' : '#3f3f46', cursor: rangeActive ? 'pointer' : 'default', fontSize: 12, padding: '0 2px', fontFamily: 'inherit' }}
+            >
+              ✕
+            </button>
+          </div>
         </div>
       )}
       {points ? (
@@ -640,7 +647,7 @@ export function TracePanel() {
           <RunTrace points={points} />
           <div style={{ fontSize: 10, color: '#3f3f46', marginTop: 4 }}>
             {rangeActive ? `${points.length} in range` : `last ${points.length}`}
-            {!rangeActive && selectedPondRuns.length > RUN_CAP ? ' · pick a date range for older' : ''}
+            {!rangeActive && selectedPondRuns.length > RUN_CAP ? ' · set a time range for older' : ''}
           </div>
         </>
       ) : (
