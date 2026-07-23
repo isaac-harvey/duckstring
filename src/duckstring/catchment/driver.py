@@ -275,6 +275,11 @@ class Driver:
         # Monotonic counter bumped on every state change — the UI long-polls /api/status against it, so
         # the display updates the instant the engine state moves rather than on a fixed timer.
         self.state_version = 0
+        # A counter that bumps ONLY when the published data / served catalog changes (a run publishes, a
+        # deploy/reset/remove, a data-root switch) — NOT on every engine tick like state_version. The
+        # serving connection cache keys on this so it stays warm across ticks instead of rebuilding (and,
+        # for read users, re-materialising the whole catalog from S3) on nearly every query.
+        self.data_version = 0
         # In-flight/last data-plane migration progress (None until one runs); see migrate().
         self.migration: dict | None = None
         self.reload()
@@ -307,6 +312,7 @@ class Driver:
     def reload(self) -> None:
         """(Re)build the engine + metadata from the database (selected Ponds only)."""
         with self.lock:
+            self.data_version = getattr(self, "data_version", 0) + 1  # topology/catalog changed → refresh serving
             db = self.db
             ponds: dict[str, Pond] = {}
             pond_states: dict[str, PondState] = {}
@@ -2133,6 +2139,7 @@ class Driver:
                     self._process(now)
             elif kind == "run_completed":
                 self.state = clear_missing_asset(self.state, pond)  # a clean read → the wait (if any) is over
+                self.data_version += 1  # the Pond published new output → the serving surface changed
                 self._finish_pond_run(pond, f, now, changed=payload.get("changed", True))
                 # Freeze the published output schema as the version's contract (the substrate the
                 # additive gate and min_version enforcement build on).
@@ -2244,6 +2251,7 @@ class Driver:
             rs.start_f = datetime.fromisoformat(f)
             self.state = complete_ripple(self.state, eid, now)
             self._record_ripple_run(pond, "draw", f, "success", started_at=started, finished_at=_iso(now))
+            self.data_version += 1  # the Draw landed new data → the serving surface changed
             self._finish_pond_run(pond, f, now)
             self._process(now, notify=False)  # poller-driven
 

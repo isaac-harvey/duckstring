@@ -64,6 +64,19 @@ def _client(tmp_path, monkeypatch):
     return TestClient(app), driver, db
 
 
+def test_serving_connection_warm_across_ticks(tmp_path, monkeypatch):
+    from duckstring.catchment.serving import _cache
+
+    _client(tmp_path, monkeypatch)  # registers a served pond
+    _, driver, _db = _client(tmp_path, monkeypatch)
+    cache = _cache(driver)
+    con1 = cache.connection(driver, sandboxed=False)
+    driver.state_version += 5  # the engine ticked (freshness/demand) — must NOT rebuild the serving con
+    assert cache.connection(driver, sandboxed=False) is con1
+    driver.data_version += 1  # new data published / catalog changed → rebuild
+    assert cache.connection(driver, sandboxed=False) is not con1
+
+
 def test_catalog_lists_ponds_and_exposure(tmp_path, monkeypatch):
     client, _, _ = _client(tmp_path, monkeypatch)
     cat = client.get("/api/serve").json()

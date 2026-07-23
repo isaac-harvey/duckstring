@@ -105,7 +105,9 @@ class ServingCache:
         self._cache: dict[bool, tuple[int, object]] = {}
 
     def connection(self, driver, *, sandboxed: bool):
-        version = driver.state_version
+        # Keyed on data_version (bumps on publish / catalog change), NOT state_version (bumps every engine
+        # tick) — so the warm connection isn't rebuilt (read users: re-materialised from S3) on every query.
+        version = driver.data_version
         entry = self._cache.get(sandboxed)
         if entry is not None and entry[0] == version:
             return entry[1]
