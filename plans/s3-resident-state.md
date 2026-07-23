@@ -1,10 +1,27 @@
 # Plan: S3-resident state — hydrate nothing, read what you touch
 
-> **Status: not implemented — design.** The target is a Duck that holds no persistent state on its own disk:
-> all durable tiers (merge base, changelog, warm bands, agg/acc accumulators) live on the data plane (S3),
-> and a run reads only the slice its delta touches, predicate-pushed, rather than copying history down. The
+> **Status: step 2 (base-as-view) IMPLEMENTED and verified; steps 1/3/4 designed, not built.** The target is
+> a Duck that holds no persistent state on its own disk: all durable tiers (merge base, changelog, warm bands,
+> agg/acc accumulators) live on the data plane (S3), and a run reads only the slice its delta touches. The
 > registry becomes per-run scratch. This supersedes the narrower "base as a reference" idea — the same
 > principle applies to every tier, so the plan covers all of them, sequenced by payoff.
+>
+> **Done (the headline win — the TB-base concern that motivated this):** a merge main's **cold base** is now a
+> **view** over the published S3 chunks, never a hydrated copy. `hydrate_registry` registers the base as a
+> view; a checkpoint materialises it locally, publishes chunks, then `_review_base` re-points it at S3;
+> `_table_exists` recognises views; `checkpoint` drops a base view before rebuilding the base table. Verified
+> against a real ap-southeast-2 bucket: a checkpointed base hydrates as `view=1/table=0`, reconstruction
+> correct. Tests: `test_base_hydrates_as_a_view_not_a_copy`, and a pre-existing Iceberg crash fixed on the way
+> (`_is_incremental` now excludes warm bands — `test_merge_export_survives_warm_fold_then_checkpoint`). This
+> alone solves the stated scenario — a fresh Duck facing a TB base + a small delta no longer downloads the
+> base (a steady-state run never reads it).
+>
+> **Deferred, with reasons found during implementation (see "Implementation note" below):** the warm tier,
+> the changelog, and the accumulators all use **append/accumulate** write patterns (an in-place `INSERT`
+> every fold/run), unlike the base's single **replace** at checkpoint. A view can't be appended to, and the
+> compute engine (`trickle/io.py`) is deliberately data-plane-agnostic (it can't read/write S3), so making
+> those tiers S3-resident is a genuine restructure of their write path + the retention coupling — not the
+> clean table→view swap the base allowed. They are real follow-ons, not quick wins.
 
 ## The problem
 
@@ -177,12 +194,43 @@ tables, reference large ones) is a reasonable safety valve if the crossover prov
 - **Log-structured accumulators**: an incremental aggregate over a large group space reads/writes only
   affected groups; reconstruction of a group equals the wholesale rebuild.
 
-## Sequencing
+## Implementation note (what building step 2 taught us)
 
-1. **Retention decoupling** — the keystone; unblocks everything and is self-contained.
-2. **Base as a reference** — the largest single win (TB-scale), contained once step 1 lands.
-3. **Changelog + warm no-hydration** — small once steps 1–2 are in.
-4. **Log-structured accumulators** — the deep change; land last, behind the others' wins.
+The base swapped table→view cleanly because a merge base is **only ever replaced** — `checkpoint` rewrites it
+wholesale, nothing appends to it, and a steady-state run never reads it. So "hold it as a view, materialise it
+only inside the rare checkpoint" was a contained change: `hydrate_registry` makes the view, `checkpoint` drops
+the view and builds a fresh base table, `_review_base` re-views it after publishing. No retention change was
+needed, because the base is published by `_publish_base_chunks` (token-swap), never by the registry-mirroring
+`_export_parts` prune — so the retention coupling never touched it.
 
-Steps 1–3 make a fresh Duck O(delta) for everything except large-cardinality aggregates; step 4 closes that
-last gap. Each step is independently shippable and independently valuable.
+The **other three tiers are harder for a concrete reason**: they are written by **append/accumulate**, not
+replace.
+
+- **Warm** — `fold_warm` does `INSERT INTO {warm}` (bands accumulate); `_export_bands` publishes each new band
+  incrementally. A view can't be `INSERT`ed into, so warm-as-view needs `fold_warm` to stage the new band
+  elsewhere and the data plane to publish it, with the view over S3 bands covering it — a restructure of the
+  fold path, in the dependency-free `trickle/io.py`.
+- **Changelog** — `apply_zset` appends **every run**, and mid-run **chained** reads (`read_registry_delta`)
+  read those just-appended rows back from the registry. Moving the changelog to S3-only would have the compute
+  engine write S3 (it can't — data-plane-agnostic), or split it into an S3 view + a registry "pending" table
+  with lifecycle/dedup/clear-after-publish — and this is the tier that **forces the retention decoupling**
+  (clearing the pending table after publish is only safe once `_export_parts` stops pruning parts the registry
+  no longer holds).
+- **Accumulators** — snapshot-per-run today; read-affected-groups + write-changed-groups needs them
+  log-structured like the merge main (a deep change to `apply_aggregate`).
+
+So the original sequencing (retention first) is right *for the changelog*, but the base did not need it and was
+the far larger win — hence it shipped first. The remaining order stands:
+
+1. **Retention decoupling** — the keystone for the changelog; self-contained but changes prune semantics
+   (correctness-sensitive: a wrong prune is data loss), so it wants its own careful pass + tests.
+2. **Warm as a reference** — extends the base pattern once `fold_warm` stages-not-accumulates.
+3. **Changelog no-hydration** — the involved one (retention + S3-view/pending split + mid-run reads).
+4. **Log-structured accumulators** — the deep change; only large-cardinality aggregates need it.
+
+**Practical read:** step 2 removes the unbounded cost (the cold base is the only tier that grows without
+bound between the rare checkpoints). What remains hydrated after step 2 — the hot changelog (bounded by the
+compact threshold before it folds) and the accumulators — is bounded, so a fresh Duck is already
+O(bounded-hot), not O(history), for the motivating case. Steps 1–4 drive that last bounded cost toward zero
+and are worth doing, but each is a deliberate, independently-tested change to the core incremental engine, not
+a mechanical follow-through — they should land one at a time behind their own verification, not in a rush.
