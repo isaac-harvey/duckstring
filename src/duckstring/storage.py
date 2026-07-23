@@ -336,7 +336,12 @@ class ObjectStorage(Storage):
 
             scheme = urlsplit(self.base).scheme
             protocol = _FSSPEC_PROTOCOL.get(scheme, scheme)
-            opts: dict = {}
+            # NEVER cache directory listings. The Catchment and each Duck are SEPARATE processes writing to
+            # the same object store; a Duck publishes a table's parts and the Catchment must see them on the
+            # very next read. fsspec's default listings cache serves a stale PARENT listing — so `isdir` of a
+            # freshly-written child returns False, `parquet_names` comes back empty, and a merge read raises
+            # FileNotFoundError (an opaque 500 on the data viewer). Correctness across processes forbids it.
+            opts: dict = {"use_listings_cache": False}
             for k, v in self.params.items():
                 if k == "region":
                     # s3fs/aiobotocore takes the region under client_kwargs.region_name, NOT a bare
@@ -381,32 +386,34 @@ class ObjectStorage(Storage):
         except FileNotFoundError:
             return 0
 
-    def parquet_names(self, *parts: str) -> list[str]:
-        key = self._key(*parts)
-        if not self.fs.isdir(key):
+    def _ls(self, key: str) -> list[dict]:
+        """``fs.ls(key)`` returning ``[]`` for a missing prefix. Deliberately does NOT pre-check ``isdir``:
+        that consults a (now-disabled) cached parent listing and can falsely report a freshly-written child
+        absent — the very staleness that surfaced as a 500 on the data viewer. Listing the key directly is
+        both correct and one S3 round-trip cheaper."""
+        try:
+            return self.fs.ls(key, detail=True)
+        except FileNotFoundError:
             return []
+
+    def parquet_names(self, *parts: str) -> list[str]:
         return sorted(
-            k.rstrip("/").rsplit("/", 1)[-1]
-            for k in self.fs.ls(key, detail=False)
-            if k.endswith(".parquet")
+            e["name"].rstrip("/").rsplit("/", 1)[-1]
+            for e in self._ls(self._key(*parts))
+            if e.get("type") == "file" and e["name"].endswith(".parquet")
         )
 
     def names(self, *parts: str) -> list[str]:
-        key = self._key(*parts)
-        if not self.fs.isdir(key):
-            return []
         return sorted(
             e["name"].rstrip("/").rsplit("/", 1)[-1]
-            for e in self.fs.ls(key, detail=True)
+            for e in self._ls(self._key(*parts))
             if e.get("type") == "file"
         )
 
     def subdir_names(self) -> list[str]:
-        if not self.fs.isdir(self.base):
-            return []
         return sorted(
             e["name"].rstrip("/").rsplit("/", 1)[-1]
-            for e in self.fs.ls(self.base, detail=True)
+            for e in self._ls(self.base)
             if e.get("type") == "directory"
         )
 

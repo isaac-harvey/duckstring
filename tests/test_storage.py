@@ -201,7 +201,8 @@ def test_object_storage_region_goes_to_client_kwargs(monkeypatch):
 
     _ = get_storage("s3://bucket/p?region=ap-southeast-2").fs
     assert captured["protocol"] == "s3"
-    assert captured["kwargs"] == {"client_kwargs": {"region_name": "ap-southeast-2"}}
+    # Listings cache is always disabled (cross-process write/read correctness — see ObjectStorage.fs).
+    assert captured["kwargs"] == {"use_listings_cache": False, "client_kwargs": {"region_name": "ap-southeast-2"}}
     assert "region" not in captured["kwargs"]
 
     captured.clear()
