@@ -545,3 +545,36 @@ class ObjectStorage(Storage):
 # fsspec protocol / option-name remaps for the schemes we accept.
 _FSSPEC_PROTOCOL = {"gs": "gcs", "s3a": "s3", "az": "abfs", "wasb": "abfs", "wasbs": "abfs", "dbfs": "databricks"}
 _FSSPEC_OPT = {"key_id": "key", "account_key": "account_key"}
+
+
+# ─── cross-store tree copy (data-plane migration) ────────────────────────────────
+
+def _copy_file(src: "Storage", dst: "Storage", name: str) -> None:
+    """Copy one file src/name → dst/name. **Server-side** when both are object stores sharing one fsspec
+    filesystem (same provider + credentials → an S3 ``CopyObject``, no bytes through this process); a
+    streamed byte-copy otherwise (local↔object, cross-provider)."""
+    if isinstance(src, ObjectStorage) and isinstance(dst, ObjectStorage) and src.fs is dst.fs:
+        src.fs.copy(src._key(name), dst._key(name))
+    else:
+        dst.write_bytes(src.read_bytes(name), name)
+
+
+def copy_tree(src: "Storage", dst: "Storage", *, skip_top: "frozenset[str]" = frozenset()) -> int:
+    """Recursively copy every file under ``src`` into ``dst``, returning the file count. ``skip_top`` names
+    (files or dirs) are skipped **at the top level only** — the data-plane migration passes the Iceberg
+    ``catalog.json`` + ``pond.db`` namespace here (self-contained flat Parquet is carried; the absolute-
+    pathed Iceberg metadata is left behind and regenerated at the target). Uses :func:`_copy_file`, so it
+    is server-side for same-provider object stores. A missing/empty source is a no-op."""
+    if not src.exists() or not src.is_dir():
+        return 0
+    count = 0
+    for name in src.names():
+        if name in skip_top:
+            continue
+        _copy_file(src, dst, name)
+        count += 1
+    for sub in src.subdir_names():
+        if sub in skip_top:
+            continue
+        count += copy_tree(src.child(sub), dst.child(sub))  # skip only applies at the top
+    return count

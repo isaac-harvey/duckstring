@@ -428,7 +428,7 @@ export function fetchCloudSettings(): Promise<CloudSettings> {
 // Attach or SWITCH the data-plane target (empty string → back to local). Switching rebuilds into the new
 // location (the old one is kept as a backup) and needs `confirm` == the catchment name once a root / data
 // already exists. Returns the updated gate, or throws the 422/409 detail (needs confirm / in use / unusable).
-export async function setDataRoot(dataRoot: string, confirm?: string, mode: 'empty' | 'adopt' = 'empty'): Promise<CloudSettings> {
+export async function setDataRoot(dataRoot: string, confirm?: string, mode: 'empty' | 'adopt' | 'migrate' = 'empty'): Promise<CloudSettings> {
   const res = await fetch(`${apiBase()}/catchment/settings`, {
     method: 'PUT',
     headers: authHeaders({ 'content-type': 'application/json' }),

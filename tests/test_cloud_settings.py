@@ -222,6 +222,39 @@ def test_switch_data_root_adopt_empty_target_is_cold(tmp_path):
     assert end_f in (None, _iso(NEVER))  # empty target → cold (nothing to adopt)
 
 
+def test_switch_data_root_migrate_copies_then_adopts(tmp_path):
+    import json
+
+    from duckstring.catchment.registry import pond_data_dir
+
+    client, db = _client(tmp_path, data_root=str(tmp_path / "planeA"))
+    driver = client.app.state.driver
+    key = next(iter(driver.meta))
+    m = driver.meta[key]
+    name, major, pond_id = m["name"], m["major"], m["pond_id"]
+    driver.wave(key)  # demand that must survive the migrate
+
+    # Populate plane A: the flat, self-contained files (carried) + Iceberg catalog/namespace (skipped).
+    F = "2026-06-06T00:00:00+00:00"
+    a = pond_data_dir(tmp_path, name, major, str(tmp_path / "planeA"))
+    a.write_text(json.dumps({"orders": {"mode": "overwrite", "f": F}}), "_trickle.json")
+    a.write_bytes(b"parquet-bytes", "orders.parquet")
+    a.write_text("{}", "catalog.json")                       # Iceberg pointer — must NOT travel
+    a.child("pond.db").write_bytes(b"meta", "v1.metadata.json")  # Iceberg namespace — must NOT travel
+
+    driver.switch_data_root(str(tmp_path / "planeB"), mode="migrate")
+
+    b = pond_data_dir(tmp_path, name, major, str(tmp_path / "planeB"))
+    assert b.read_bytes("orders.parquet") == b"parquet-bytes"   # flat data copied
+    assert b.read_text("_trickle.json") is not None             # sidecar copied
+    assert not b.exists("catalog.json")                         # Iceberg catalog skipped
+    assert not b.exists("pond.db")                              # Iceberg namespace skipped
+    assert a.read_bytes("orders.parquet") == b"parquet-bytes"   # old location left intact (backup)
+    start_f, end_f = db.execute("SELECT start_f, end_f FROM pond_state WHERE pond_id=?", (pond_id,)).fetchone()
+    assert start_f == F and end_f == F                          # adopted the migrated freshness
+    assert db.execute("SELECT COUNT(*) FROM pond_trigger").fetchone()[0] == 1  # demand kept → resumes
+
+
 def test_status_carries_cloud_block(tmp_path, monkeypatch):
     monkeypatch.delenv("AWS_ACCESS_KEY_ID", raising=False)
     client, _ = _client(tmp_path, data_root="s3://bucket/p", secret_names=["AWS_ACCESS_KEY_ID"])

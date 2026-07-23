@@ -1,10 +1,13 @@
 # Switching the data-plane target (empty, adopt, migrate)
 
-Status: **empty+dormant switch + adopt built** (`Driver.switch_data_root(new, mode="empty"|"adopt")`,
-`PUT /api/catchment/settings` with `confirm`+`mode`, the Cloud-menu Data Plane switcher with the
-Empty/Adopt choice). Adopt restores each line's freshness from the target's `_trickle.json` sidecar
+Status: **built — all three modes.** `Driver.switch_data_root(new, mode="empty"|"adopt"|"migrate")`,
+`PUT /api/catchment/settings` with `confirm`+`mode`, the Cloud-menu Data Plane switcher (Empty / Adopt /
+Migrate). Adopt restores each line's freshness from the target's `_trickle.json` sidecar
 (`_plane_freshness`), drops the local hot state to re-hydrate from the target, and keeps demand/triggers.
-Tested in `tests/test_cloud_settings.py`. **Migrate (built-in server-side copy) still to build** — step 2.
+Migrate copies the flat data first via `storage.copy_tree` (server-side for same-fsspec object stores;
+skips the Iceberg `catalog.json`/`pond.db` — reads fall back to the flat sidecars, Iceberg regenerates),
+then adopts. Tested in `tests/test_cloud_settings.py` (adopt + empty-target + migrate copy/skip/adopt).
+Deferred: a real-AWS e2e of the server-side s3→s3 copy path; per-object migration progress.
 
 The data root was set-once (refused once a Catchment had published data or an existing root). It's now
 switchable, but only in one shape: an **empty + dormant** reset. This plan adds the two shapes that make

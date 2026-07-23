@@ -76,7 +76,7 @@ def _catchment_name(db) -> str:
 class _SettingsBody(BaseModel):
     data_root: str = ""       # an object-store URI (s3://…, gs://…) / path; empty → local (the state root)
     confirm: str | None = None  # must equal the catchment name to SWITCH once a root / data already exists
-    mode: str = "empty"       # "empty" (reset + dormant) | "adopt" (pick up data already in the target)
+    mode: str = "empty"       # "empty" (reset+dormant) | "adopt" (pick up the target) | "migrate" (copy+adopt)
 
 
 @router.put("/catchment/settings", dependencies=[auth.full])
@@ -94,8 +94,8 @@ def put_settings(request: Request, body: _SettingsBody):
 
     app = request.app
     db = _db(request)
-    if body.mode not in ("empty", "adopt"):
-        raise HTTPException(status_code=422, detail="mode must be 'empty' or 'adopt'")
+    if body.mode not in ("empty", "adopt", "migrate"):
+        raise HTTPException(status_code=422, detail="mode must be 'empty', 'adopt', or 'migrate'")
     new = (body.data_root or "").strip() or None  # empty → local
     current = getattr(app.state, "data_root", None)
     if new == current:
