@@ -148,24 +148,68 @@ def test_query_unknown_catchment_exits(runner):
     assert result.exit_code != 0
 
 
-def test_browse_con_caches_per_data_version(monkeypatch):
-    """The merge browse cache materialises the reconstruction once (a local ``_ds_browse`` table), reuses
-    the warm connection while the publish version is unchanged, and rebuilds when it changes."""
-    import types
+def _seed_checkpointed_merge(dd, table, n):
+    """Hand-build a **checkpointed** merge Trickle layout — a large cold base (``{table}__base/``, all
+    present rows stamped at ``f_base``) plus a tiny hot changelog above it (one update) plus the sidecar.
+    Driving the real LSM ``checkpoint()`` in isolation is degenerate; the published *layout* is what the
+    browse reconstruction reads, so we write it directly to get a genuinely large base without the machinery."""
+    import json
 
     import duckdb
 
-    from duckstring.catchment.routes import data as datamod
+    (dd / f"{table}__base").mkdir(parents=True)
+    (dd / f"{table}__changelog").mkdir()
+    con = duckdb.connect()
+    con.execute("SET TimeZone='UTC'")
+    con.execute(f"""COPY (SELECT range AS id, 'v'||range AS v, 1 AS _duckstring_d,
+        TIMESTAMPTZ '2026-06-16T01:00:00+00:00' AS _duckstring_f FROM range({n}))
+        TO '{dd}/{table}__base/2026-06-16T01_00_00+00_00__0.parquet' (FORMAT PARQUET)""")
+    con.execute(f"""COPY (SELECT * FROM (VALUES
+        (5, 'v5', -1, TIMESTAMPTZ '2026-06-16T02:00:00+00:00'),
+        (5, 'X',   1, TIMESTAMPTZ '2026-06-16T02:00:00+00:00'))
+        t(id, v, _duckstring_d, _duckstring_f))
+        TO '{dd}/{table}__changelog/2026-06-16T02_00_00+00_00__0.parquet' (FORMAT PARQUET)""")
+    con.close()
+    (dd / "_trickle.json").write_text(json.dumps({table: {
+        "mode": "merge", "pk": ["id"], "floor": "2026-06-16T01:00:00+00:00",
+        "f": "2026-06-16T02:00:00+00:00", "f_base": "2026-06-16T01:00:00+00:00", "format": 2}}))
 
-    driver = types.SimpleNamespace(data_version=1)
-    req = types.SimpleNamespace(app=types.SimpleNamespace(state=types.SimpleNamespace(driver=driver)))
-    monkeypatch.setattr(datamod, "_open_pond", lambda request, pond, major: duckdb.connect())
 
-    c1 = datamod._browse_con(req, "p", 1, "t", "SELECT 42 AS x")
-    assert c1.execute("SELECT x FROM _ds_browse").fetchone()[0] == 42
-    assert datamod._browse_con(req, "p", 1, "t", "SELECT 42 AS x") is c1  # warm reuse (same publish)
-    driver.data_version = 2
-    assert datamod._browse_con(req, "p", 1, "t", "SELECT 42 AS x") is not c1  # rebuilt on publish
+def test_merge_browse_limit_pushes_down_through_the_base(tmp_path, monkeypatch):
+    """A merge main's default browse reconstructs latest-per-PK over base ⊎ changelog, but with the base
+    checkpointed and the changelog clamped to ``> f_base``, a ``LIMIT`` must push down to the **base**
+    Parquet scan — so browsing a huge (TB-cold) table reads a page, not the whole base. Guards against a
+    regression that reintroduces a full base scan (a materialised reconstruction, a blocking sort/agg on
+    the base side). Also asserts the reconstruction is still correct (the update is applied)."""
+    import re
+
+    import duckdb
+
+    from duckstring.catchment.routes.data import _trickle_base_sql
+    from duckstring.dataplane import ParquetDataPlane
+    from duckstring.storage import LocalStorage
+
+    monkeypatch.setenv("DUCKSTRING_DATA_PLANE", "parquet")
+    n = 200_000
+    dd = tmp_path / "d"
+    _seed_checkpointed_merge(dd, "dim", n)
+    dp = ParquetDataPlane()
+    dds = LocalStorage(dd)
+    con = duckdb.connect()
+    con.execute("SET TimeZone='UTC'")
+    con.execute('CREATE SCHEMA "p"')
+    for t in dp.list_tables(dds):
+        con.execute(f'CREATE VIEW "p"."{t}" AS {dp.read_select(dds, t)}')
+    base = _trickle_base_sql("p", "dim", "merge", ["id"], None, None, f_base="2026-06-16T01:00:00+00:00")
+
+    # Correct current state: N rows, the update applied.
+    assert con.execute(f"SELECT count(*) FROM ({base})").fetchone()[0] == n
+    assert con.execute(f"SELECT v FROM ({base}) WHERE id = 5").fetchone()[0] == "X"
+
+    # Pushdown: no operator in the analysed plan touches anywhere near the whole base.
+    plan = con.execute(f"EXPLAIN ANALYZE SELECT * FROM ({base}) AS _p LIMIT 5").fetchall()[0][1]
+    cardinalities = [int(x.replace(",", "")) for x in re.findall(r"(\d[\d,]*)\s+[Rr]ows?", plan)]
+    assert max(cardinalities) < n // 2, f"LIMIT did not push down; max operator cardinality={max(cardinalities)}"
 
 
 # ── /api/query/page (the data viewer's paged read) ──────────────────────────────

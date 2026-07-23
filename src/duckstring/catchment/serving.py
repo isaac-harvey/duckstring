@@ -50,6 +50,15 @@ def build_serving_con(driver, *, sandboxed: bool):
     from .registry import pond_data_dir
 
     con = duckdb.connect()
+    # Spill instead of OOM (materialising a large serviceable table over S3) + keep Parquet footers warm.
+    # Set before the sandbox freezes configuration below.
+    import tempfile
+
+    try:
+        con.execute(f"SET temp_directory='{tempfile.gettempdir()}'")
+        con.execute("SET enable_object_cache=true")
+    except Exception:
+        pass
     dp = get_data_plane()
     dp.prepare(con)
     root = Path(driver.root)

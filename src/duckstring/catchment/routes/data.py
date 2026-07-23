@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import io
 import tempfile
-import threading
 import zipfile
 from pathlib import Path
 from typing import Optional
@@ -73,6 +72,20 @@ def _data_dir(request: Request, pond_name: str, major: int):
     return pond_data_dir(Path(request.app.state.root), pond_name, major, data_root)
 
 
+def _tune_read_con(con) -> None:
+    """Configure an in-memory read connection so a large reconstruction (a big merge main over S3) **spills
+    to disk instead of OOM-crashing** the worker into an opaque 500, and so repeated S3 reads don't re-fetch
+    Parquet metadata. In-memory DuckDB has no ``temp_directory`` by default, so it *cannot* spill — one
+    unbounded window/aggregate over a multi-GB changelog would abort the process; pointing it at a temp dir
+    (with a bounded memory limit) turns that into a slow-but-correct query. ``enable_object_cache`` keeps
+    Parquet footers warm across the many small scans a reconstruction issues."""
+    try:
+        con.execute(f"SET temp_directory='{tempfile.gettempdir()}'")
+        con.execute("SET enable_object_cache=true")
+    except Exception:
+        pass  # tuning is best-effort — never fail a read because a PRAGMA was rejected
+
+
 def _open_pond(request: Request, pond_name: str, major: int):
     """An in-memory DuckDB connection with the Pond's exported tables registered as views — under a
     schema named after the Pond, and in ``main`` — so queries can name them ``"pond"."table"`` or
@@ -85,6 +98,7 @@ def _open_pond(request: Request, pond_name: str, major: int):
     data_dir = _data_dir(request, pond_name, major)
     con = duckdb.connect()  # in-memory: no file, no lock, no contention
     con.execute("SET TimeZone='UTC'")  # Trickle freshness is UTC; read/compare/render consistently
+    _tune_read_con(con)  # spill instead of OOM (a big merge reconstruction) + cache Parquet footers over S3
     dp.prepare(con)  # ready the connection to read the published format (e.g. load the iceberg ext)
     data_dir.duckdb_setup(con)  # object store → httpfs + credentials (no-op for local)
     con.execute(f'CREATE SCHEMA IF NOT EXISTS "{pond_name}"')
@@ -511,65 +525,6 @@ def _merge_deleted_count_sql(pond: str, table: str, pk: list, f_base) -> str:
     )
 
 
-# ─── merge browse cache: materialise the reconstruction once, page it locally ────
-#
-# The default (unwindowed, current-state) view of a merge Trickle RECONSTRUCTS latest-per-PK over the whole
-# base ⊎ changelog — an aggregate a LIMIT can't push past, so every page rebuilt it from S3 (slow, worse
-# cross-region). For a table small enough to hold locally, materialise the reconstruction ONCE per publish
-# (keyed on driver.data_version) and page from the local copy. Above the cap, keep streaming (avoid a
-# gigabyte spill).
-_BROWSE_LOCK = threading.Lock()
-_BROWSE_CAP = 2_000_000  # only materialise a merge browse this many rows or fewer
-_BROWSE_MAX = 6          # cached materialised browse tables (LRU)
-
-
-def _merge_active_count(con, request: Request, body, major: int) -> int:
-    """A merge main's active (current-state) row count — metadata-fast (cold-base count + changelog net
-    Z-set weight + deleted tombstones), no base scan. Sizes the scrollbar AND gates the browse cache."""
-    from ...dataplane import get_data_plane
-
-    meta = _sidecar(request, body.pond, major).get(body.table) or {}
-    active_sql = get_data_plane().consolidated_count_select(_data_dir(request, body.pond, major), body.table, meta)
-    active = con.execute(active_sql).fetchone()[0]
-    deleted = con.execute(_merge_deleted_count_sql(body.pond, body.table, body.pk, meta.get("f_base"))).fetchone()[0]
-    return int(active) + int(deleted)
-
-
-def _browse_con(request: Request, pond: str, major: int, table: str, base_sql: str):
-    """A warm in-memory DuckDB connection holding the reconstructed current state MATERIALISED as a regular
-    table ``_ds_browse``, cached per (pond, major, table) and keyed on ``driver.data_version`` — so paging /
-    re-opening reconstructs from S3 ONCE per publish, not per page. Query via ``.cursor()`` (thread-safe; a
-    regular table is visible to cursors, unlike a TEMP one)."""
-    driver = request.app.state.driver
-    dv = driver.data_version
-    with _BROWSE_LOCK:
-        cache = getattr(driver, "_browse_cache", None)
-        if cache is None:
-            cache = driver._browse_cache = {}
-        key = (pond, major, table)
-        entry = cache.get(key)
-        if entry is not None and entry[0] == dv:
-            cache[key] = cache.pop(key)  # LRU bump
-            return entry[1]
-        if entry is not None:  # stale (data changed) → drop it
-            try:
-                entry[1].close()
-            except Exception:
-                pass
-            cache.pop(key, None)
-        con = _open_pond(request, pond, major)  # S3 creds configured; views over the plane
-        con.execute(f"CREATE TABLE _ds_browse AS {base_sql}")  # reconstruct once → local
-        while len(cache) >= _BROWSE_MAX:  # evict the oldest
-            old_key = next(iter(cache))
-            try:
-                cache[old_key][1].close()
-            except Exception:
-                pass
-            cache.pop(old_key, None)
-        cache[key] = (dv, con)
-        return con
-
-
 @router.post("/query/count", dependencies=[auth.read])
 def query_count(body: CountRequest, request: Request,
                 principal: auth.Principal = Depends(auth.get_principal)):
@@ -664,7 +619,6 @@ def query_page(body: PageRequest, request: Request,
             raise HTTPException(status_code=400, detail=str(exc)) from exc
     m = _resolve_major(request, body.pond, body.major, body.version)
     _require_serviceable(request, body.pond, m, body.table, full)
-    con = _open_pond(request, body.pond, m)
     order = f" ORDER BY {_qi(body.order_by)} {'DESC' if body.order_desc else 'ASC'}" if body.order_by else ""
 
     def _page(rel):
@@ -673,35 +627,27 @@ def query_page(body: PageRequest, request: Request,
         return {"columns": cols, "rows": [[_json_safe(c) for c in row] for row in fetched[:limit]],
                 "has_more": len(fetched) > limit}
 
-    # Default (unwindowed, current-state) merge browse: reconstructing latest-per-PK on every page is the
-    # slow bit (a LIMIT can't push past it) — so for a table small enough, materialise the reconstruction
-    # once (cached, keyed on the publish version) and page it locally. Large tables keep the streaming path.
-    if body.trickle == "merge" and body.pk and not body.f_lo and not body.f_hi:
-        try:
-            cacheable = _merge_active_count(con, request, body, m) <= _BROWSE_CAP
-        except Exception:
-            cacheable = False
-        if cacheable:
-            base = _base_sql(body, f_base=_merge_f_base(request, body, m))
-            bcon = _browse_con(request, body.pond, m, body.table, base)
-            con.close()
-            cur = bcon.cursor()  # thread-safe over the shared warm connection
-            try:
-                return _page(cur.execute(f"SELECT * FROM _ds_browse{order} LIMIT {limit + 1} OFFSET {offset}"))
-            except Exception as exc:
-                raise HTTPException(status_code=400, detail=str(exc)) from exc
-            finally:
-                cur.close()
-
-    # Streaming path. With no ORDER BY the LIMIT/OFFSET pushes down to the Parquet scan (O(page)); an
-    # explicit column sort pays the Top-N it genuinely needs.
-    base = _base_sql(body, f_base=_merge_f_base(request, body, m))
+    # The whole read is wrapped: opening the pond (Parquet/Iceberg views over the data plane), building the
+    # base query, and executing it can all fail — over S3 a listing/credentials/scan error must surface its
+    # MESSAGE to the caller (a 400), never a bare, opaque 500. The connection spills to disk (`_tune_read_con`)
+    # so a large merge reconstruction is slow, not fatal.
+    #
+    # A merge main's default view reconstructs latest-per-PK over base ⊎ changelog — an aggregate a LIMIT can't
+    # push past — but the changelog is clamped to `> f_base` (the rest is already folded into the base), so a
+    # checkpointed table reads only its small hot tier + a LIMIT-pushed base scan. With no ORDER BY the
+    # LIMIT/OFFSET pushes to the Parquet scan (O(page)); an explicit column sort pays the Top-N it needs.
+    con = None
     try:
+        con = _open_pond(request, body.pond, m)
+        base = _base_sql(body, f_base=_merge_f_base(request, body, m))
         return _page(con.execute(f"SELECT * FROM ({base}) AS _ds_page{order} LIMIT {limit + 1} OFFSET {offset}"))
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     finally:
-        con.close()
+        if con is not None:
+            con.close()
 
 
 class HistoryRequest(BaseModel):
