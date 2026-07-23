@@ -96,7 +96,12 @@ class FargateLauncher:
         if self._registered:
             return self._registered
         if not self.image:
-            log.error("fargate: no image (DUCKSTRING_FARGATE_IMAGE) or task definition — cannot launch")
+            log.error(
+                "fargate: cannot launch — no container image or task definition configured. A Fargate pool "
+                "needs the Duck image + VPC + IAM set as Catchment env: DUCKSTRING_FARGATE_IMAGE (or "
+                "DUCKSTRING_FARGATE_TASK_DEF), DUCKSTRING_FARGATE_SUBNETS, DUCKSTRING_FARGATE_SECURITY_GROUPS, "
+                "DUCKSTRING_FARGATE_EXECUTION_ROLE, DUCKSTRING_FARGATE_TASK_ROLE, DUCKSTRING_FARGATE_CLUSTER. "
+                "Without them, set the Pond's compute to the Catchment (local) target.")
             return None
         container = {
             "name": _CONTAINER, "image": self.image,
