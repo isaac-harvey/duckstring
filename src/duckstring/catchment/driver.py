@@ -2503,7 +2503,10 @@ class Driver:
             dead = not self.launcher.is_running(pond)
             silent = last is not None and (now - last) > _DUCK_DEAD_AFTER
             if dead:
-                self._fail_whole_pond(pond, now, "Duck process is not running (it crashed or exited)")
+                # Prefer the launcher's specific spawn-failure reason (e.g. a remote pool missing its
+                # image/AMI/IAM) over the generic crash message, so the operator sees the real cause.
+                reason = getattr(self.launcher, "launch_error", lambda _k: None)(pond)
+                self._fail_whole_pond(pond, now, reason or "Duck process is not running (it crashed or exited)")
             elif silent:
                 self._fail_whole_pond(pond, now, "Lost contact with the Duck (no events received)")
 

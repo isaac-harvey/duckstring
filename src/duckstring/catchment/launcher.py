@@ -185,6 +185,14 @@ class DispatchingLauncher:
             for remote in self.remotes.values():
                 remote.set_base_url(url)
 
+    def launch_error(self, pond_key: str) -> str | None:
+        """The owning backend's spawn-failure reason (remote backends only), for the driver to attribute a
+        Pond failure to a real cause (missing config / an AWS error) rather than a generic crash."""
+        owner = self._owner.get(pond_key)
+        if owner is not None and hasattr(owner, "launch_error"):
+            return owner.launch_error(pond_key)
+        return None
+
     def is_running(self, pond_key: str) -> bool:
         owner = self._owner.get(pond_key)
         if owner is not None:

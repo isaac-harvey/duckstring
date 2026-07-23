@@ -32,6 +32,10 @@ from ..keys import split_pond_key
 log = logging.getLogger("duckstring.ec2")
 
 _REMOTE_ROOT = "/var/lib/duckstring"  # the Duck's local hot-state root on the EC2 box
+_EC2_NO_AMI = (
+    "EC2 cannot launch — no AMI configured (DUCKSTRING_EC2_AMI). An EC2 pool needs the Duck AMI + IAM set "
+    "as Catchment env: DUCKSTRING_EC2_AMI, DUCKSTRING_EC2_INSTANCE_PROFILE. Without them, set the Pond's "
+    "compute to the Catchment (local) target.")
 
 
 def _userdata(*, pond: str, major: int, version: str, source_path: str, catchment_url: str,
@@ -78,6 +82,7 @@ class Ec2Launcher:
         self._client = ec2_client
         self._instances: dict[str, dict] = {}   # pond_key → {"instance_id", "pool"}
         self._pending: dict[str, tuple] = {}     # spawns deferred until a reachable URL is known
+        self._launch_errors: dict[str, str] = {}  # pond key → last spawn-failure reason (surfaced by the driver)
 
     # ─── client ──────────────────────────────────────────────────────────────────
 
@@ -128,7 +133,8 @@ class Ec2Launcher:
         ) or os.environ.get("DUCKSTRING_EC2_INSTANCE_TYPE") or "m6i.large"
         region = pool.get("region") or self.region
         if not self.ami:
-            log.error("ec2: no AMI configured (DUCKSTRING_EC2_AMI) — cannot launch a Duck for %s", pond_key)
+            log.error("%s (pond %s)", _EC2_NO_AMI, pond_key)
+            self._launch_errors[pond_key] = _EC2_NO_AMI  # surfaced to the Pond failure via the driver
             return
         userdata = _userdata(
             pond=name, major=major, version=version, source_path=source_path,
@@ -157,14 +163,22 @@ class Ec2Launcher:
         try:
             resp = self._ec2().run_instances(**kwargs)
             instance_id = resp["Instances"][0]["InstanceId"]
-        except Exception:
+        except Exception as exc:
             log.exception("ec2: failed to launch a Duck instance for %s", pond_key)
+            self._launch_errors[pond_key] = f"ec2: failed to launch a Duck instance: {exc}"
             return
+        self._launch_errors.pop(pond_key, None)  # launched cleanly
         self._instances[pond_key] = {"instance_id": instance_id, "pool": target}
         log.info("ec2: launched %s for %s (%s)", instance_id, pond_key, instance_type)
 
+    def launch_error(self, pond_key: str) -> str | None:
+        """The reason the last spawn attempt for ``pond_key`` failed (missing config / an AWS error), so
+        the driver can attribute the Pond failure to it instead of a generic "process not running"."""
+        return self._launch_errors.get(pond_key)
+
     def terminate(self, pond_key: str, wait: bool = False) -> None:
         self._pending.pop(pond_key, None)
+        self._launch_errors.pop(pond_key, None)
         rec = self._instances.pop(pond_key, None)
         if rec is None:
             return

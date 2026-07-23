@@ -22,6 +22,12 @@ log = logging.getLogger("duckstring.fargate")
 
 _REMOTE_ROOT = "/var/lib/duckstring"
 _CONTAINER = "duck"
+_FARGATE_NO_IMAGE = (
+    "Fargate cannot launch — no container image or task definition configured. A Fargate pool needs the "
+    "Duck image + VPC + IAM set as Catchment env: DUCKSTRING_FARGATE_IMAGE (or DUCKSTRING_FARGATE_TASK_DEF), "
+    "DUCKSTRING_FARGATE_SUBNETS, DUCKSTRING_FARGATE_SECURITY_GROUPS, DUCKSTRING_FARGATE_EXECUTION_ROLE, "
+    "DUCKSTRING_FARGATE_TASK_ROLE, DUCKSTRING_FARGATE_CLUSTER. Without them, set the Pond's compute to the "
+    "Catchment (local) target.")
 _TASK_FAMILY = "duckstring-duck"
 
 
@@ -60,6 +66,7 @@ class FargateLauncher:
         self._registered = None   # the task-def family:revision once ensured
         self._tasks: dict[str, str] = {}   # pond key → task ARN
         self._pending: dict[str, tuple] = {}
+        self._launch_errors: dict[str, str] = {}  # pond key → last spawn-failure reason (surfaced by the driver)
 
     @property
     def remote_base_url(self) -> str | None:
@@ -96,12 +103,7 @@ class FargateLauncher:
         if self._registered:
             return self._registered
         if not self.image:
-            log.error(
-                "fargate: cannot launch — no container image or task definition configured. A Fargate pool "
-                "needs the Duck image + VPC + IAM set as Catchment env: DUCKSTRING_FARGATE_IMAGE (or "
-                "DUCKSTRING_FARGATE_TASK_DEF), DUCKSTRING_FARGATE_SUBNETS, DUCKSTRING_FARGATE_SECURITY_GROUPS, "
-                "DUCKSTRING_FARGATE_EXECUTION_ROLE, DUCKSTRING_FARGATE_TASK_ROLE, DUCKSTRING_FARGATE_CLUSTER. "
-                "Without them, set the Pond's compute to the Catchment (local) target.")
+            log.error("%s", _FARGATE_NO_IMAGE)
             return None
         container = {
             "name": _CONTAINER, "image": self.image,
@@ -136,6 +138,7 @@ class FargateLauncher:
             return
         task_def = self._task_def()
         if task_def is None:
+            self._launch_errors[pond_key] = _FARGATE_NO_IMAGE  # surfaced to the Pond failure via the driver
             return
         name, major = split_pond_key(pond_key)
         pool = (duck or {}).get("pool") or {}
@@ -167,16 +170,25 @@ class FargateLauncher:
             resp = self._ecs().run_task(**kwargs)
             if resp.get("failures"):
                 log.error("fargate: run_task failed for %s: %s", pond_key, resp["failures"])
+                self._launch_errors[pond_key] = f"fargate: run_task failed: {resp['failures']}"
                 return
             task_arn = resp["tasks"][0]["taskArn"]
-        except Exception:
+        except Exception as exc:
             log.exception("fargate: failed to run a Duck task for %s", pond_key)
+            self._launch_errors[pond_key] = f"fargate: failed to run a Duck task: {exc}"
             return
+        self._launch_errors.pop(pond_key, None)  # launched cleanly
         self._tasks[pond_key] = task_arn
         log.info("fargate: started %s for %s (%s/%s)", task_arn, pond_key, cpu, memory)
 
+    def launch_error(self, pond_key: str) -> str | None:
+        """The reason the last spawn attempt for ``pond_key`` failed (missing config / an AWS error), so
+        the driver can attribute the Pond failure to it instead of a generic "process not running"."""
+        return self._launch_errors.get(pond_key)
+
     def terminate(self, pond_key: str, wait: bool = False) -> None:
         self._pending.pop(pond_key, None)
+        self._launch_errors.pop(pond_key, None)
         task_arn = self._tasks.pop(pond_key, None)
         if task_arn is None:
             return

@@ -161,3 +161,9 @@ def test_missing_ami_does_not_launch(tmp_path):
     lch = Ec2Launcher(tmp_path, "http://cat:7474", token="t", data_root="s3://b/d", ec2_client=ec2)
     lch.ensure("a@1", "1", "ponds/a/1", duck=_duck("heavy", pool={"instance_type": "m6i.large"}))
     assert not ec2.launched
+    # The spawn-failure reason is recorded so the driver can attribute the Pond failure to it (not a
+    # generic crash), and it reaches through the dispatcher.
+    assert "DUCKSTRING_EC2_AMI" in (lch.launch_error("a@1") or "")
+    disp = DispatchingLauncher(RecordingBackend("local"), {"_any": lch})
+    disp.ensure("a@1", "1", "ponds/a/1", duck=_duck("heavy", pool={"instance_type": "m6i.large"}))
+    assert "DUCKSTRING_EC2_AMI" in (disp.launch_error("a@1") or "")
