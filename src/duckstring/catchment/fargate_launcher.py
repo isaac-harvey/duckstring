@@ -63,7 +63,7 @@ class FargateLauncher:
         # Region drives the ecs client + the awslogs config (so a Duck's output is visible in CloudWatch).
         self.region = region or os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
         self._client = ecs_client
-        self._registered = None   # the task-def family:revision once ensured
+        self._registered: dict = {}   # config signature → the registered task-def family:revision
         self._tasks: dict[str, str] = {}   # pond key → task ARN
         self._pending: dict[str, tuple] = {}
         self._launch_errors: dict[str, str] = {}  # pond key → last spawn-failure reason (surfaced by the driver)
@@ -96,38 +96,41 @@ class FargateLauncher:
     def is_running(self, pond_key: str) -> bool:
         return pond_key in self._pending or pond_key in self._tasks
 
-    def _task_def(self) -> str | None:
-        """The task-definition to run: an explicit one, else register one from the image (once)."""
-        if self.task_definition:
-            return self.task_definition
-        if self._registered:
-            return self._registered
-        if not self.image:
+    def _task_def(self, *, image, task_definition, execution_role, task_role, cpu_arch, region) -> str | None:
+        """The task-definition to run for the effective config: an explicit one, else register one from the
+        image (cached per (image, roles, arch) signature so distinct pools/images get distinct task-defs)."""
+        if task_definition:
+            return task_definition
+        sig = (image, execution_role, task_role, cpu_arch)
+        if sig in self._registered:
+            return self._registered[sig]
+        if not image:
             log.error("%s", _FARGATE_NO_IMAGE)
             return None
         container = {
-            "name": _CONTAINER, "image": self.image,
+            "name": _CONTAINER, "image": image,
             "entryPoint": ["python", "-m"],
             "logConfiguration": {"logDriver": "awslogs", "options": {
-                "awslogs-group": "/duckstring/duck", "awslogs-region": self.region or "",
+                "awslogs-group": "/duckstring/duck", "awslogs-region": region or "",
                 "awslogs-stream-prefix": "duck", "awslogs-create-group": "true",
-            }} if self.region else None,
+            }} if region else None,
         }
         container = {k: v for k, v in container.items() if v is not None}
         kwargs = {
             "family": _TASK_FAMILY, "networkMode": "awsvpc",
             "requiresCompatibilities": ["FARGATE"], "cpu": "1024", "memory": "4096",
-            "runtimePlatform": {"cpuArchitecture": self.cpu_arch, "operatingSystemFamily": "LINUX"},
+            "runtimePlatform": {"cpuArchitecture": cpu_arch, "operatingSystemFamily": "LINUX"},
             "containerDefinitions": [container],
         }
-        if self.execution_role:
-            kwargs["executionRoleArn"] = self.execution_role
-        if self.task_role:
-            kwargs["taskRoleArn"] = self.task_role
+        if execution_role:
+            kwargs["executionRoleArn"] = execution_role
+        if task_role:
+            kwargs["taskRoleArn"] = task_role
         resp = self._ecs().register_task_definition(**kwargs)
         td = resp["taskDefinition"]
-        self._registered = f"{td['family']}:{td['revision']}"
-        return self._registered
+        tdid = f"{td['family']}:{td['revision']}"
+        self._registered[sig] = tdid
+        return tdid
 
     def ensure(self, pond_key: str, version: str, source_path: str, duck: dict | None = None) -> None:
         if self.remote_base_url is None:
@@ -136,29 +139,44 @@ class FargateLauncher:
             return
         if pond_key in self._tasks:
             return
-        task_def = self._task_def()
-        if task_def is None:
-            self._launch_errors[pond_key] = _FARGATE_NO_IMAGE  # surfaced to the Pond failure via the driver
-            return
         name, major = split_pond_key(pond_key)
         pool = (duck or {}).get("pool") or {}
         target = (duck or {}).get("duck_target")
-        cpu = str(pool.get("cpu") or os.environ.get("DUCKSTRING_FARGATE_CPU") or 1024)
-        memory = str(pool.get("memory") or os.environ.get("DUCKSTRING_FARGATE_MEMORY") or 4096)
+        # The per-spawn deployment config (a dedicated Duck's, else the pool's) coalesced over the env
+        # defaults the launcher holds (plans/compute-config-ui.md).
+        dc = (duck or {}).get("deploy_config") or pool.get("deploy_config") or {}
+        region = dc.get("region") or self.region
+        task_def = self._task_def(
+            image=dc.get("image") or self.image,
+            task_definition=dc.get("task_definition") or self.task_definition,
+            execution_role=dc.get("execution_role") or self.execution_role,
+            task_role=dc.get("task_role") or self.task_role,
+            cpu_arch=(dc.get("cpu_arch") or self.cpu_arch or "X86_64").upper(),
+            region=region,
+        )
+        if task_def is None:
+            self._launch_errors[pond_key] = _FARGATE_NO_IMAGE  # surfaced to the Pond failure via the driver
+            return
+        cluster = dc.get("cluster") or self.cluster
+        subnets = _csv(dc.get("subnets")) or self.subnets
+        security_groups = _csv(dc.get("security_groups")) or self.security_groups
+        assign_public_ip = dc.get("assign_public_ip") or self.assign_public_ip
+        cpu = str(pool.get("cpu") or dc.get("cpu") or os.environ.get("DUCKSTRING_FARGATE_CPU") or 1024)
+        memory = str(pool.get("memory") or dc.get("memory") or os.environ.get("DUCKSTRING_FARGATE_MEMORY") or 4096)
         command = [
             "duckstring.duck", "--pond", name, "--major", str(major), "--version", version,
             "--catchment", self.remote_base_url, f"--token={self.token}",
             "--root", _REMOTE_ROOT, "--source-path", source_path, f"--data-root={self.data_root or ''}",
         ]
         kwargs = {
-            "cluster": self.cluster, "launchType": "FARGATE", "taskDefinition": task_def, "count": 1,
+            "cluster": cluster, "launchType": "FARGATE", "taskDefinition": task_def, "count": 1,
             "overrides": {
                 "cpu": cpu, "memory": memory,
                 "containerOverrides": [{"name": _CONTAINER, "command": command}],
             },
             "networkConfiguration": {"awsvpcConfiguration": {
-                "subnets": self.subnets, "securityGroups": self.security_groups,
-                "assignPublicIp": self.assign_public_ip,
+                "subnets": subnets, "securityGroups": security_groups,
+                "assignPublicIp": assign_public_ip,
             }},
             "tags": [
                 {"key": "duckstring:pond", "value": f"{name}@{major}"},

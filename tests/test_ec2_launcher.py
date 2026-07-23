@@ -111,6 +111,18 @@ def _launcher(tmp_path, client, **kw):
                        ami="ami-123", ec2_client=client, **kw)
 
 
+def test_pool_deploy_config_supplies_ami_and_profile(tmp_path):
+    # No env AMI/profile on the launcher — the pool's deploy_config supplies them (plans/compute-config-ui).
+    ec2 = FakeEc2()
+    lch = Ec2Launcher(tmp_path, "http://cat:7474", token="t", data_root="s3://b/d", ec2_client=ec2)
+    pool = {"instance_type": "m6i.large", "provider": "ec2",
+            "deploy_config": {"ami": "ami-xyz", "instance_profile": "prof"}}
+    lch.ensure("a@1", "1", "ponds/a/1", duck=_duck("heavy", pool=pool))
+    assert len(ec2.launched) == 1
+    _iid, kw = ec2.launched[0]
+    assert kw["ImageId"] == "ami-xyz" and kw["IamInstanceProfile"] == {"Name": "prof"}
+
+
 def test_ensure_launches_with_pool_instance_type_and_tags(tmp_path):
     ec2 = FakeEc2()
     lch = _launcher(tmp_path, ec2, instance_profile="ds-worker")

@@ -207,6 +207,7 @@ class _PoolBody(BaseModel):
     idle_timeout: int | None = None   # seconds before scale-down
     keep_warm: int | None = None      # spare capacity beyond current load
     region: str | None = None
+    deploy_config: dict | None = None  # provider AWS deployment config (image/AMI/VPC/IAM); validated
 
 
 @router.get("/catchment/duck-pools", dependencies=[auth.read])
@@ -216,14 +217,31 @@ def list_duck_pools(request: Request):
     return {"pools": request.app.state.driver.list_pools()}
 
 
+@router.get("/catchment/compute-defaults", dependencies=[auth.read])
+def compute_defaults(request: Request):
+    """The deployment config each provider's launcher already reads from the environment, plus the field +
+    required-field lists — so the UI can show what's inherited from env and validate what's still needed
+    (plans/compute-config-ui.md)."""
+    from .. import cloud_deploy
+
+    return {
+        "fargate": {"fields": list(cloud_deploy.FARGATE_FIELDS), "env": cloud_deploy.env_defaults("fargate"),
+                    "missing_without_input": cloud_deploy.missing_fields("fargate", None)},
+        "ec2": {"fields": list(cloud_deploy.EC2_FIELDS), "env": cloud_deploy.env_defaults("ec2"),
+                "missing_without_input": cloud_deploy.missing_fields("ec2", None)},
+    }
+
+
 @router.post("/catchment/duck-pools", dependencies=[auth.full])
 def upsert_duck_pool(request: Request, body: _PoolBody):
-    """Create or update a named Duck Pool (it provisions billable infra, so full-gated)."""
+    """Create or update a named Duck Pool (it provisions billable infra, so full-gated). Rejected if the
+    provider's deployment config (UI ?? env) is inadequate to launch."""
     try:
         return request.app.state.driver.add_pool(
             body.name, provider=body.provider, instance_type=body.instance_type, cpu=body.cpu,
             memory=body.memory, min_instances=body.min_instances, max_instances=body.max_instances,
-            idle_timeout=body.idle_timeout, keep_warm=body.keep_warm, region=body.region)
+            idle_timeout=body.idle_timeout, keep_warm=body.keep_warm, region=body.region,
+            deploy_config=body.deploy_config)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from None
 

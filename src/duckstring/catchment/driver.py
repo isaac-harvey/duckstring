@@ -192,18 +192,31 @@ def _preset_pool(name: str) -> dict:
     p = PRESET_POOLS[name]
     return {"name": name, "provider": "fargate", "instance_type": None, "cpu": p["cpu"],
             "memory": p["memory"], "min_instances": 0, "max_instances": 1, "idle_timeout": None,
-            "keep_warm": 0, "region": None, "managed": True}
+            "keep_warm": 0, "region": None, "deploy_config": None, "managed": True}
+
+
+def _load_json(s):
+    """A stored JSON TEXT column → a dict/None (tolerant of NULL / bad JSON)."""
+    if not s:
+        return None
+    try:
+        return json.loads(s)
+    except (ValueError, TypeError):
+        return None
 
 
 def _duck_override_row(row) -> dict:
     """A pond_duck row → the nullable override dict (plans/cloud-config.md). Sizing is concrete now
-    (a pool / dedicated instance type), so there is no abstract size field."""
+    (a pool / dedicated instance type), so there is no abstract size field. ``deploy_config`` is a Pond's
+    dedicated-Duck deployment config (JSON; plans/compute-config-ui.md), carrying its provider + AWS
+    image/AMI/VPC/IAM settings."""
     keys = ("duck_target", "dedicated_instance_type", "dedicated_auto_stop",
-            "flock_mode", "flock_engine", "oom_policy")
+            "flock_mode", "flock_engine", "oom_policy", "deploy_config")
     if row is None:
         return {k: None for k in keys}
     o = dict(zip(keys, row, strict=True))
     o["dedicated_auto_stop"] = None if o["dedicated_auto_stop"] is None else bool(o["dedicated_auto_stop"])
+    o["deploy_config"] = _load_json(o["deploy_config"])
     return o
 
 
@@ -348,7 +361,8 @@ class Driver:
                 imm, onc = retry if retry else (0, 0)
                 duck_row = db.execute(
                     "SELECT duck_target, dedicated_instance_type, dedicated_auto_stop, "
-                    "flock_mode, flock_engine, oom_policy FROM pond_duck WHERE pond_id = ?", (pond_id,)
+                    "flock_mode, flock_engine, oom_policy, deploy_config FROM pond_duck WHERE pond_id = ?",
+                    (pond_id,)
                 ).fetchone()
                 self.duck_overrides[key] = _duck_override_row(duck_row)
                 declared = db.execute(
@@ -1163,7 +1177,7 @@ class Driver:
             "oom_policy": (os.environ.get("DUCKSTRING_FLOCK_OOM_POLICY") or "fail_up").lower(),
         }
 
-    _DUCK_OVERRIDE_FIELDS = ("duck_target", "dedicated_instance_type", "dedicated_auto_stop",
+    _DUCK_OVERRIDE_FIELDS = ("duck_target", "dedicated_instance_type", "dedicated_auto_stop", "deploy_config",
                              "flock_mode", "flock_engine", "oom_policy")
 
     def set_duck(self, pond: str, clear: bool = False, **fields) -> None:
@@ -1184,21 +1198,37 @@ class Driver:
                 cur = self.duck_overrides.get(pond) or _duck_override_row(None)
                 new = dict(cur)
                 new.update(fields)
+                # A dedicated Duck is a remote Duck of one — when its deployment config (provider + AWS
+                # image/AMI/VPC/IAM) is being set via the UI, it must be adequate to launch (validated over
+                # the env defaults). A dedicated target with NO blob keeps relying on the env (the CLI /
+                # hosted-platform path), surfacing a clear launch error if the env is also unset.
+                if new["duck_target"] == "dedicated" and new.get("deploy_config"):
+                    dc = new["deploy_config"]
+                    provider = dc.get("provider") or "fargate"
+                    from . import cloud_deploy
+                    miss = cloud_deploy.missing_fields(provider, dc)
+                    if miss:
+                        raise ValueError(
+                            f"dedicated {provider} Duck is missing required deployment config: "
+                            f"{', '.join(miss)} — set them (or the DUCKSTRING_{provider.upper()}_* env)")
+                    new["deploy_config"] = {"provider": provider, **cloud_deploy.clean(provider, dc)}
                 self.db.execute(
                     "INSERT INTO pond_duck (pond_id, duck_target, dedicated_instance_type, "
-                    "dedicated_auto_stop, flock_mode, flock_engine, oom_policy) "
+                    "dedicated_auto_stop, flock_mode, flock_engine, oom_policy, deploy_config) "
                     "VALUES (:id, :duck_target, :dedicated_instance_type, :dedicated_auto_stop, "
-                    ":flock_mode, :flock_engine, :oom_policy) "
+                    ":flock_mode, :flock_engine, :oom_policy, :deploy_config) "
                     "ON CONFLICT(pond_id) DO UPDATE SET duck_target = excluded.duck_target, "
                     "dedicated_instance_type = excluded.dedicated_instance_type, "
                     "dedicated_auto_stop = excluded.dedicated_auto_stop, flock_mode = excluded.flock_mode, "
-                    "flock_engine = excluded.flock_engine, oom_policy = excluded.oom_policy",
+                    "flock_engine = excluded.flock_engine, oom_policy = excluded.oom_policy, "
+                    "deploy_config = excluded.deploy_config",
                     {"id": pond_id, "duck_target": new["duck_target"],
                      "dedicated_instance_type": new["dedicated_instance_type"],
                      "dedicated_auto_stop": (None if new["dedicated_auto_stop"] is None
                                              else int(new["dedicated_auto_stop"])),
                      "flock_mode": new["flock_mode"], "flock_engine": new["flock_engine"],
-                     "oom_policy": new["oom_policy"]},
+                     "oom_policy": new["oom_policy"],
+                     "deploy_config": (json.dumps(new["deploy_config"]) if new.get("deploy_config") else None)},
                 )
                 self.duck_overrides[pond] = new
             self.db.commit()
@@ -1229,6 +1259,7 @@ class Driver:
             "pool": pool,
             "dedicated_instance_type": o["dedicated_instance_type"],
             "dedicated_auto_stop": o["dedicated_auto_stop"],
+            "deploy_config": o["deploy_config"],  # dedicated Duck's provider deployment config (JSON dict)
             "flock_mode": pick("flock_mode"),
             "flock_engine": pick("flock_engine"),
             "oom_policy": pick("oom_policy"),
@@ -1245,12 +1276,13 @@ class Driver:
     def _user_pools(self) -> list[dict]:
         rows = self.db.execute(
             "SELECT name, provider, instance_type, cpu, memory, min_instances, max_instances, "
-            "idle_timeout, keep_warm, region FROM duck_pool ORDER BY name"
+            "idle_timeout, keep_warm, region, deploy_config FROM duck_pool ORDER BY name"
         ).fetchall()
-        cols = ("name", *self._POOL_FIELDS)
+        cols = ("name", *self._POOL_FIELDS, "deploy_config")
         pools = [dict(zip(cols, r, strict=True)) for r in rows]
         for p in pools:
             p["provider"] = p["provider"] or "fargate"  # NULL → the default provider
+            p["deploy_config"] = _load_json(p["deploy_config"])
             p["managed"] = False
         return pools
 
@@ -1274,18 +1306,27 @@ class Driver:
         mn, mx = vals["min_instances"], vals["max_instances"]
         if mn is not None and mx is not None and int(mn) > int(mx):
             raise ValueError("min_instances must be <= max_instances")
+        # The pool's deployment config (provider AWS image/AMI/VPC/IAM) must be adequate to launch,
+        # validated over the env defaults — a pool that can't launch is rejected up front.
+        from . import cloud_deploy
+        deploy_config = cloud_deploy.clean(vals["provider"], fields.get("deploy_config"))
+        miss = cloud_deploy.missing_fields(vals["provider"], deploy_config)
+        if miss:
+            raise ValueError(
+                f"{vals['provider']} pool is missing required deployment config: {', '.join(miss)} — set "
+                f"them (or the DUCKSTRING_{vals['provider'].upper()}_* env)")
         with self.lock:
             self.db.execute(
                 "INSERT INTO duck_pool (name, provider, instance_type, cpu, memory, min_instances, "
-                "max_instances, idle_timeout, keep_warm, region) VALUES (:name, :provider, "
+                "max_instances, idle_timeout, keep_warm, region, deploy_config) VALUES (:name, :provider, "
                 ":instance_type, :cpu, :memory, COALESCE(:min_instances, 0), COALESCE(:max_instances, 1), "
-                ":idle_timeout, COALESCE(:keep_warm, 0), :region) "
+                ":idle_timeout, COALESCE(:keep_warm, 0), :region, :deploy_config) "
                 "ON CONFLICT(name) DO UPDATE SET provider = excluded.provider, "
                 "instance_type = excluded.instance_type, cpu = excluded.cpu, memory = excluded.memory, "
                 "min_instances = excluded.min_instances, max_instances = excluded.max_instances, "
                 "idle_timeout = excluded.idle_timeout, keep_warm = excluded.keep_warm, "
-                "region = excluded.region",
-                {"name": name, **vals},
+                "region = excluded.region, deploy_config = excluded.deploy_config",
+                {"name": name, **vals, "deploy_config": (json.dumps(deploy_config) if deploy_config else None)},
             )
             self.db.commit()
             self.duck_pool_names.add(name)

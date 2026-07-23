@@ -127,22 +127,28 @@ class Ec2Launcher:
         name, major = split_pond_key(pond_key)
         pool = (duck or {}).get("pool") or {}
         target = (duck or {}).get("duck_target")
+        # The per-spawn deployment config (a dedicated Duck's, else the pool's) coalesced over the env
+        # defaults the launcher holds (plans/compute-config-ui.md).
+        dc = (duck or {}).get("deploy_config") or pool.get("deploy_config") or {}
         instance_type = (
             (duck or {}).get("dedicated_instance_type") if target == "dedicated"
             else pool.get("instance_type")
-        ) or os.environ.get("DUCKSTRING_EC2_INSTANCE_TYPE") or "m6i.large"
-        region = pool.get("region") or self.region
-        if not self.ami:
+        ) or dc.get("instance_type") or os.environ.get("DUCKSTRING_EC2_INSTANCE_TYPE") or "m6i.large"
+        region = pool.get("region") or dc.get("region") or self.region
+        ami = dc.get("ami") or self.ami
+        instance_profile = dc.get("instance_profile") or self.instance_profile
+        pip_spec = dc.get("pip_spec") if dc.get("pip_spec") is not None else self.pip_spec
+        if not ami:
             log.error("%s (pond %s)", _EC2_NO_AMI, pond_key)
             self._launch_errors[pond_key] = _EC2_NO_AMI  # surfaced to the Pond failure via the driver
             return
         userdata = _userdata(
             pond=name, major=major, version=version, source_path=source_path,
             catchment_url=self.remote_base_url, token=self.token, data_root=self.data_root,
-            pip_spec=self.pip_spec,
+            pip_spec=pip_spec,
         )
         kwargs = {
-            "ImageId": self.ami,
+            "ImageId": ami,
             "InstanceType": instance_type,
             "MinCount": 1, "MaxCount": 1,
             "UserData": base64.b64encode(userdata.encode()).decode(),
@@ -156,8 +162,8 @@ class Ec2Launcher:
                 ],
             }],
         }
-        if self.instance_profile:  # worker-side IAM (never the Catchment's keys on the box)
-            kwargs["IamInstanceProfile"] = {"Name": self.instance_profile}
+        if instance_profile:  # worker-side IAM (never the Catchment's keys on the box)
+            kwargs["IamInstanceProfile"] = {"Name": instance_profile}
         if region and self.region is None:
             self.region = region
         try:

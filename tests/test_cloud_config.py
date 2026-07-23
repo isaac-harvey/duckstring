@@ -286,6 +286,45 @@ def test_dispatching_launcher_propagates_data_root(tmp_path, monkeypatch):
     assert all(r.data_root == "s3://new" for r in disp.remotes.values())
 
 
+def test_cloud_deploy_missing_fields():
+    from duckstring.catchment import cloud_deploy
+
+    # An empty EC2 config (and no env) is missing the required launch fields.
+    assert set(cloud_deploy.missing_fields("ec2", {})) == {"ami", "instance_profile"}
+    assert cloud_deploy.missing_fields("ec2", {"ami": "ami-1", "instance_profile": "p"}) == []
+    # Fargate needs an image (or task-def) + subnets + both roles.
+    assert "image" in cloud_deploy.missing_fields("fargate", {"subnets": "s", "execution_role": "e", "task_role": "t"})
+    assert cloud_deploy.missing_fields("fargate",
+                                       {"image": "i", "subnets": "s", "execution_role": "e", "task_role": "t"}) == []
+
+
+def test_cloud_deploy_effective_coalesces_over_env(monkeypatch):
+    from duckstring.catchment import cloud_deploy
+
+    monkeypatch.setenv("DUCKSTRING_EC2_AMI", "ami-env")
+    monkeypatch.setenv("DUCKSTRING_EC2_INSTANCE_PROFILE", "prof-env")
+    # With env supplying the required fields, an empty blob is adequate; the blob overrides the env.
+    assert cloud_deploy.missing_fields("ec2", None) == []
+    assert cloud_deploy.effective("ec2", {"ami": "ami-ui"})["ami"] == "ami-ui"
+
+
+def test_add_pool_rejects_and_accepts_by_deploy_config(tmp_path, monkeypatch):
+    for k in ("DUCKSTRING_EC2_AMI", "DUCKSTRING_EC2_INSTANCE_PROFILE"):
+        monkeypatch.delenv(k, raising=False)
+    from duckstring.catchment.db import connect, migrate
+    from duckstring.catchment.driver import Driver
+    from duckstring.catchment.launcher import NoopLauncher
+
+    db = connect(tmp_path / "duck.db")
+    migrate(db)
+    driver = Driver(db, tmp_path, "http://x", NoopLauncher())
+    with pytest.raises(ValueError, match="ami"):  # an EC2 pool with no ami/profile (nor env) is rejected
+        driver.add_pool("heavy", provider="ec2", instance_type="m6i.large")
+    pool = driver.add_pool("heavy", provider="ec2", instance_type="m6i.large",
+                           deploy_config={"ami": "ami-1", "instance_profile": "prof"})
+    assert pool["deploy_config"] == {"ami": "ami-1", "instance_profile": "prof"}
+
+
 def test_refresh_is_a_noop_for_a_non_dispatching_launcher(tmp_path):
     from duckstring.catchment.cloud_backends import refresh_cloud_backends
     from duckstring.catchment.launcher import NoopLauncher
