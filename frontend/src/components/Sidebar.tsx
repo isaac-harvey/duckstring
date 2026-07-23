@@ -506,6 +506,9 @@ function PondOptionsModal({ pond, canControl, onClose }: { pond: Pond; canContro
   const [immRetries, setImmRetries] = useState(info ? String(info.immediateRetries) : '0');
   const [srcRetries, setSrcRetries] = useState(info ? String(info.sourceRetries) : '0');
 
+  // The cloud gate is event-driven — freshen it when this modal opens (its Compute section reads it).
+  useEffect(() => { void useLiveStore.getState().refreshCloud(); }, []);
+
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => e.key === 'Escape' && onClose();
     window.addEventListener('keydown', onKey);

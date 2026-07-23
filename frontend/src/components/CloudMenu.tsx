@@ -394,7 +394,10 @@ export function CloudMenu({ onClose }: { onClose: () => void }) {
   const catchmentName = catchment?.name || catchment?.id || '';
 
   const load = () => {
-    void fetchCloudSettings().then(setSettings).catch(() => setSettings(null));
+    // Opening / acting in the Cloud menu also freshens the global gate (store.cloud) the rest of the UI
+    // reads — the cloud gate is event-driven, not polled.
+    void fetchCloudSettings().then((cs) => { setSettings(cs); useLiveStore.setState({ cloud: cs }); })
+      .catch(() => setSettings(null));
     void fetchDuckPools().then(setPools).catch(() => setPools([]));
   };
   useEffect(load, []);

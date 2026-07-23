@@ -299,14 +299,13 @@ export function App() {
     })();
     // A separate lightweight clock so freshness "age" keeps counting up between state changes.
     const clock = setInterval(() => useLiveStore.setState({ now: Date.now() }), POLL_MS);
-    // The cloud gate on its own slow poll (off the ~1 s status loop) — it changes rarely.
-    const cloud = useLiveStore.getState();
-    void cloud.refreshCloud();
-    const cloudPoll = setInterval(() => void useLiveStore.getState().refreshCloud(), 15000);
+    // The cloud gate is EVENT-DRIVEN, not polled: fetched once on load, then only when a surface that
+    // uses it opens (the Cloud menu, a Pond's Options modal). It changes on user actions the Cloud menu
+    // sees live, or a rare external creds-expiry that a menu-open (or a Duck launch failure) catches.
+    void useLiveStore.getState().refreshCloud();
     return () => {
       alive = false;
       clearInterval(clock);
-      clearInterval(cloudPoll);
     };
   }, [refresh]);
 
