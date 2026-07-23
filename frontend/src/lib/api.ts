@@ -182,6 +182,10 @@ export interface CloudGate {
   data_root_remote: boolean;
   aws_configured: boolean;
   cloud_enabled: boolean;
+  // Provider readiness (Cloud enabled + the provider's env deployment config is adequate). fargate_enabled
+  // gates the S/M/L/XL presets — they rely on the env, so they aren't offered until Fargate is ready.
+  fargate_enabled: boolean;
+  ec2_enabled: boolean;
   // Live credential validity (STS GetCallerIdentity), cached server-side. null = not yet checked / gate
   // off (no warning); false = enabled but the creds are rejected → the UI warns persistently.
   creds_valid: boolean | null;

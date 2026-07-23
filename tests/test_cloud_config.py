@@ -286,6 +286,27 @@ def test_dispatching_launcher_propagates_data_root(tmp_path, monkeypatch):
     assert all(r.data_root == "s3://new" for r in disp.remotes.values())
 
 
+def test_cloud_status_provider_readiness(monkeypatch):
+    for k in ("DUCKSTRING_FARGATE_IMAGE", "DUCKSTRING_FARGATE_SUBNETS", "DUCKSTRING_FARGATE_EXECUTION_ROLE",
+              "DUCKSTRING_FARGATE_TASK_ROLE", "DUCKSTRING_EC2_AMI", "DUCKSTRING_EC2_INSTANCE_PROFILE"):
+        monkeypatch.delenv(k, raising=False)
+
+    class _Secrets:
+        def names(self):
+            return [{"name": "AWS_ACCESS_KEY_ID", "set_at": "t"}]
+
+    st = cloud.cloud_status("s3://b/p", _Secrets())
+    assert st["cloud_enabled"] is True and st["fargate_enabled"] is False and st["ec2_enabled"] is False
+    # Configuring the Fargate env flips fargate_enabled (which gates the presets), not ec2_enabled.
+    for k, v in {"DUCKSTRING_FARGATE_IMAGE": "i", "DUCKSTRING_FARGATE_SUBNETS": "s",
+                 "DUCKSTRING_FARGATE_EXECUTION_ROLE": "e", "DUCKSTRING_FARGATE_TASK_ROLE": "t"}.items():
+        monkeypatch.setenv(k, v)
+    st = cloud.cloud_status("s3://b/p", _Secrets())
+    assert st["fargate_enabled"] is True and st["ec2_enabled"] is False
+    # Not cloud-enabled (local root) → neither provider is enabled regardless of env.
+    assert cloud.cloud_status(None, _Secrets())["fargate_enabled"] is False
+
+
 def test_cloud_deploy_missing_fields():
     from duckstring.catchment import cloud_deploy
 

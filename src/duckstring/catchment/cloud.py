@@ -132,13 +132,21 @@ def cloud_status(data_root: str | None, secret_store=None, cred_status: dict | N
     cloud_backends) adds ``creds_valid``/``creds_error`` so the UI can persistently warn when the gate is
     enabled but the credentials don't authenticate (``creds_valid is None`` = not yet checked / gate off
     → no warning)."""
+    from . import cloud_deploy
+
     remote = is_remote(data_root)
     aws = aws_configured(secret_store)
+    enabled = remote and aws
     out = {
         "data_root": data_root,
         "data_root_remote": remote,
         "aws_configured": aws,
-        "cloud_enabled": remote and aws,
+        "cloud_enabled": enabled,
+        # Provider readiness — Cloud enabled AND the provider's env deployment config is adequate to launch
+        # WITHOUT per-pool input. Fargate readiness is what gates the S/M/L/XL presets (they rely on the
+        # env); a per-pool/dedicated Duck can still carry its own config independently of these.
+        "fargate_enabled": bool(enabled and not cloud_deploy.missing_fields("fargate", None)),
+        "ec2_enabled": bool(enabled and not cloud_deploy.missing_fields("ec2", None)),
         "creds_valid": None,
         "creds_error": None,
     }

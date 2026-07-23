@@ -52,11 +52,15 @@ export function DuckSection({ pondId, duck }: { pondId: string; duck: DuckConfig
 
   const target = duck.duck_target;
   const cloudEnabled = cloud?.cloud_enabled ?? false;
+  const fargateEnabled = cloud?.fargate_enabled ?? false;
   const credsInvalid = cloudEnabled && cloud?.creds_valid === false;
   const remoteSelected = target !== 'catchment';
   const hasOverride = Object.values(duck.override).some((v) => v != null);
 
-  const targets = ['catchment', ...pools.map((p) => p.name), 'dedicated'];
+  // The S/M/L/XL Fargate presets (managed) aren't an option until Fargate is enabled — they rely on the
+  // Catchment's Fargate env config.
+  const targets = ['catchment', ...pools.filter((p) => !p.managed || fargateEnabled).map((p) => p.name), 'dedicated'];
+  const onUnavailablePreset = !fargateEnabled && !!pools.find((p) => p.name === target)?.managed;
 
   return (
     <div>
@@ -79,6 +83,13 @@ export function DuckSection({ pondId, duck }: { pondId: string; duck: DuckConfig
         ))}
       </div>
 
+      {/* Its declared target is a Fargate preset, but Fargate isn't enabled — it won't launch until it is. */}
+      {onUnavailablePreset && (
+        <div style={{ fontSize: 10, color: THEME_PULL, marginBottom: 6, lineHeight: 1.4 }}>
+          This Pond targets the <b>{target}</b> Fargate preset, but Fargate isn&apos;t enabled — add the
+          Fargate deployment config in Options → Cloud, or pick another target.
+        </div>
+      )}
       {/* A remote target is valid config anywhere, but only runs remotely once cloud is enabled. */}
       {remoteSelected && !cloudEnabled && (
         <div style={{ fontSize: 10, color: THEME_PULL, marginBottom: 6, lineHeight: 1.4 }}>

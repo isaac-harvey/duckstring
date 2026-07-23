@@ -29,6 +29,16 @@ const btn = (color: string, disabled: boolean): React.CSSProperties => ({
 const heading: React.CSSProperties = { fontSize: 10, fontWeight: 700, color: '#a1a1aa', letterSpacing: '0.08em' };
 const err = (m: string) => <div style={{ fontSize: 11, color: '#ef4444', wordBreak: 'break-word' }}>{m}</div>;
 
+// A provider-readiness pill — green when the provider's deployment config is adequate to launch.
+export function StateChip({ label, on }: { label: string; on: boolean }) {
+  return (
+    <span title={on ? `${label} ready` : `${label} not configured`} style={{
+      fontSize: 9, fontWeight: 700, letterSpacing: '0.04em', padding: '1px 5px', borderRadius: 4,
+      border: `1px solid ${on ? '#22c55e66' : '#3f3f46'}`, color: on ? '#22c55e' : '#52525b',
+    }}>{on ? '✓ ' : ''}{label}</span>
+  );
+}
+
 const modalBackdrop: React.CSSProperties = {
   position: 'fixed', inset: 0, zIndex: 1100, display: 'flex', alignItems: 'center', justifyContent: 'center',
   background: 'rgba(9,9,11,0.78)', backdropFilter: 'blur(2px)', fontFamily: 'ui-monospace, SFMono-Regular, monospace',
@@ -280,7 +290,8 @@ function CredentialsPanel({ settings, reload }: { settings: CloudSettings; reloa
 
 // ─── Duck pools ──────────────────────────────────────────────────────────────
 
-function PoolsPanel({ pools, reload, defaults }: { pools: DuckPool[]; reload: () => void; defaults: ComputeDefaults | null }) {
+function PoolsPanel({ pools, reload, defaults, fargateReady }:
+  { pools: DuckPool[]; reload: () => void; defaults: ComputeDefaults | null; fargateReady: boolean }) {
   const [busy, setBusy] = useState(false);
   const [pName, setPName] = useState('');
   const [pProvider, setPProvider] = useState<'fargate' | 'ec2'>('fargate');
@@ -316,15 +327,22 @@ function PoolsPanel({ pools, reload, defaults }: { pools: DuckPool[]; reload: ()
 
   return (
     <Section title="DUCK POOLS">
+      {!fargateReady && (
+        <div style={{ fontSize: 10, color: '#71717a', marginBottom: 8, lineHeight: 1.4 }}>
+          The S/M/L/XL Fargate presets are unavailable until Fargate is enabled — add the Fargate deployment
+          config (image + VPC + IAM) via the env or a pool below.
+        </div>
+      )}
       {pools.map((p) => {
         const spec = (p.provider || 'fargate') === 'fargate'
           ? (p.cpu || p.memory ? `${p.cpu ?? '?'}cpu / ${p.memory ?? '?'}MiB` : '—')
           : (p.instance_type || '—');
+        const unavailable = p.managed && !fargateReady;  // a preset with no Fargate env behind it
         return (
-          <div key={p.name} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
+          <div key={p.name} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4, opacity: unavailable ? 0.5 : 1 }}>
             <span style={{ fontSize: 12, color: '#a1a1aa' }}>
               {p.name}
-              <span style={{ color: '#52525b', fontSize: 10 }}> [{p.provider || 'fargate'}] {spec}{p.managed ? ' · preset' : ''}</span>
+              <span style={{ color: '#52525b', fontSize: 10 }}> [{p.provider || 'fargate'}] {spec}{p.managed ? (unavailable ? ' · preset · needs Fargate' : ' · preset') : ''}</span>
             </span>
             {!p.managed && (
               <span role="button" title="Remove" onClick={() => removeDuckPool(p.name).then(reload).catch(() => undefined)}
@@ -403,6 +421,12 @@ export function CloudMenu({ onClose }: { onClose: () => void }) {
         <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '12px 16px', borderBottom: '1px solid #27272a', flexShrink: 0 }}>
           <span style={{ fontSize: 13, fontWeight: 700 }}>Cloud</span>
           {statusBadge}
+          {enabled && settings && (
+            <span style={{ display: 'flex', gap: 5, marginLeft: 2 }}>
+              <StateChip label="Fargate" on={settings.fargate_enabled} />
+              <StateChip label="EC2" on={settings.ec2_enabled} />
+            </span>
+          )}
           {!enabled && settings && (
             <span style={{ fontSize: 10, color: '#52525b' }}>needs a remote data root + AWS credentials</span>
           )}
@@ -416,7 +440,7 @@ export function CloudMenu({ onClose }: { onClose: () => void }) {
           <MigrationBanner onDone={load} />
           {settings && <DataPlanePanel settings={settings} catchmentName={catchmentName} reload={load} />}
           {settings && <CredentialsPanel settings={settings} reload={load} />}
-          {enabled && <PoolsPanel pools={pools} reload={load} defaults={computeDefaults} />}
+          {enabled && <PoolsPanel pools={pools} reload={load} defaults={computeDefaults} fargateReady={!!settings?.fargate_enabled} />}
         </div>
       </div>
     </div>
