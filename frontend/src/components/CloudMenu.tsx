@@ -27,6 +27,19 @@ const btn = (color: string, disabled: boolean): React.CSSProperties => ({
 });
 const heading: React.CSSProperties = { fontSize: 10, fontWeight: 700, color: '#a1a1aa', letterSpacing: '0.08em', marginBottom: 6 };
 
+// A data root must be an object URI (s3://…) or an absolute path — a bare name would resolve to a LOCAL
+// relative folder (the backend rejects it; this soft-warns in the form first).
+const looksBareRoot = (v: string) => {
+  const t = v.trim();
+  return t !== '' && !/^[a-z0-9]+:\/\//i.test(t) && !t.startsWith('/') && !t.startsWith('~');
+};
+const bareRootHint = (v: string) =>
+  looksBareRoot(v) ? (
+    <div style={{ fontSize: 10, color: '#ee9333', lineHeight: 1.4 }}>
+      Add <b>s3://</b> for a bucket, or use an absolute path — a bare name becomes a local folder.
+    </div>
+  ) : null;
+
 function fmtBytes(n: number): string {
   if (n >= 1e9) return `${(n / 1e9).toFixed(1)} GB`;
   if (n >= 1e6) return `${(n / 1e6).toFixed(1)} MB`;
@@ -134,8 +147,13 @@ export function CloudMenu({ onClose }: { onClose: () => void }) {
         </div>
       )}
 
-      {settings && !enabled && <EnableFlow settings={settings} catchmentName={catchmentName} onEnabled={load} />}
-      {enabled && <EnabledConfig settings={settings!} pools={pools} catchmentName={catchmentName} reload={load} />}
+      {/* The data-plane switcher is available whenever a root is set — even if cloud is disabled (a local
+          path, or a mis-typed root), so you can always re-point or revert to local and are never stranded. */}
+      {settings?.data_root && <DataPlaneSection settings={settings} catchmentName={catchmentName} reload={load} />}
+      {/* First attach (no root yet): capture creds + the root together. */}
+      {settings && !settings.data_root && <EnableFlow settings={settings} catchmentName={catchmentName} onEnabled={load} />}
+      {/* Remote compute config (pools + cred fixup) — only meaningful once cloud is enabled. */}
+      {enabled && <EnabledConfig settings={settings!} pools={pools} reload={load} />}
     </div>
   );
 }
@@ -242,7 +260,10 @@ function EnableFlow({ settings, catchmentName, onEnabled }:
       )}
 
       {needsRoot ? (
-        <input value={root} onChange={(e) => setRoot(e.target.value)} placeholder="s3://bucket/prefix" style={input} />
+        <>
+          <input value={root} onChange={(e) => setRoot(e.target.value)} placeholder="s3://bucket/prefix" style={input} />
+          {bareRootHint(root)}
+        </>
       ) : (
         <div style={{ fontSize: 11, color: '#22c55e' }}>data root set: {settings.data_root} ✓</div>
       )}
@@ -357,6 +378,7 @@ function DataPlaneSection({ settings, catchmentName, reload }:
         <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
           <SwitchModeChoice mode={mode} setMode={setMode} catchmentName={catchmentName} />
           <input value={target} onChange={(e) => setTarget(e.target.value)} placeholder="s3://bucket/prefix (blank = local)" style={smallInput} />
+          {bareRootHint(target)}
           <input value={confirm} onChange={(e) => setConfirm(e.target.value)} placeholder={`type ${catchmentName}`} style={smallInput} />
           {err && <div style={{ fontSize: 11, color: '#ef4444', wordBreak: 'break-word' }}>{err}</div>}
           <div style={{ display: 'flex', gap: 6 }}>
@@ -375,8 +397,8 @@ function DataPlaneSection({ settings, catchmentName, reload }:
   );
 }
 
-function EnabledConfig({ settings, pools, catchmentName, reload }:
-  { settings: CloudSettings; pools: DuckPool[]; catchmentName: string; reload: () => void }) {
+function EnabledConfig({ settings, pools, reload }:
+  { settings: CloudSettings; pools: DuckPool[]; reload: () => void }) {
   const [busy, setBusy] = useState(false);
   const [pName, setPName] = useState('');
   const [pProvider, setPProvider] = useState('fargate');
@@ -415,7 +437,6 @@ function EnabledConfig({ settings, pools, catchmentName, reload }:
   return (
     <>
       {settings.creds_valid === false && <FixCredentials reload={reload} />}
-      <DataPlaneSection settings={settings} catchmentName={catchmentName} reload={reload} />
 
 
       <div style={heading}>DUCK POOLS</div>

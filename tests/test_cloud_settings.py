@@ -172,6 +172,16 @@ def test_switch_data_root_empties_and_stays_dormant(tmp_path):
     assert old_file.exists()                                               # old location kept as a backup
 
 
+def test_put_settings_rejects_bare_relative_root(tmp_path):
+    client, _ = _client(tmp_path)
+    # A bare bucket name (no scheme) would become a local relative dir — reject it up front.
+    r = client.put("/api/catchment/settings", json={"data_root": "mybucket"})
+    assert r.status_code == 422 and "s3://" in r.json()["detail"]
+    # An absolute path is a valid (local) root.
+    ok = client.put("/api/catchment/settings", json={"data_root": str(tmp_path / "lake")})
+    assert ok.status_code == 200
+
+
 def test_switch_data_root_adopt_restores_freshness_from_plane(tmp_path):
     import json
 

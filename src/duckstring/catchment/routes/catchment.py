@@ -109,6 +109,20 @@ def put_settings(request: Request, body: _SettingsBody):
     if new == current:
         return {**cloud.cloud_status(current, app.state.secret_store, getattr(app.state, "cloud_creds", None)),
                 "unchanged": True}
+    # Guard against a bare/relative value (e.g. a bucket name with no scheme): it would resolve to a LOCAL
+    # relative directory (created in the process cwd), not the intended object store. Require a recognised
+    # object-store URI (s3://…, gs://…) or an absolute path.
+    if new is not None:
+        import os
+        from urllib.parse import urlsplit
+
+        from ...storage import is_object_uri
+
+        candidate = urlsplit(new).path if new.startswith("file://") else new
+        if not is_object_uri(new) and not os.path.isabs(os.path.expanduser(candidate)):
+            raise HTTPException(status_code=422, detail=(
+                f"data_root must be an object-store URI (s3://…, gs://…) or an absolute path — got {new!r}. "
+                f"A bare name is treated as a LOCAL relative directory; an S3 bucket needs the s3:// prefix."))
     # A switch rebuilds the pipeline — gate it behind the catchment name once there's an existing root or
     # any published data, so it isn't done by accident (a first attach on an empty Catchment is free).
     name = _catchment_name(db)
