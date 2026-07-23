@@ -140,6 +140,37 @@ export function CloudMenu({ onClose }: { onClose: () => void }) {
   );
 }
 
+type SwitchMode = 'empty' | 'adopt' | 'migrate';
+
+// The empty/adopt/migrate choice + a mode-aware explanation, shared by the first-time enable flow and the
+// Data Plane switcher. All three keep the CURRENT location intact as a backup.
+function SwitchModeChoice({ mode, setMode, catchmentName }: { mode: SwitchMode; setMode: (m: SwitchMode) => void; catchmentName: string }) {
+  const chip = (m: SwitchMode, label: string, hint: string) => (
+    <button key={m} onClick={() => setMode(m)} title={hint} style={{
+      flex: 1, background: 'transparent', border: `1px solid ${mode === m ? '#f59e0b' : '#3f3f46'}`,
+      color: mode === m ? '#f59e0b' : '#a1a1aa', borderRadius: 5, padding: '3px 5px', fontSize: 10,
+      cursor: 'pointer', fontFamily: 'inherit',
+    }}>{label}</button>
+  );
+  const blurb = mode === 'empty'
+    ? <>Empties the data plane — every Pond is left with no data and idle (no auto-rebuild). Re-trigger to rebuild, or hand-copy data across first.</>
+    : mode === 'adopt'
+      ? <>Picks up data already in the target (you copied it in, or a plane you&apos;re returning to) and resumes with no rebuild. Use only if the target already holds this Catchment&apos;s data.</>
+      : <>Copies the current data to the target (server-side where possible), then resumes with no rebuild. May take a while for large data.</>;
+  return (
+    <>
+      <div style={{ display: 'flex', gap: 4 }}>
+        {chip('empty', 'Empty + reset', 'Leave every Pond with no data and idle (no auto-rebuild).')}
+        {chip('adopt', 'Adopt existing', 'The target already holds this Catchment’s data — pick it up and resume, no rebuild.')}
+        {chip('migrate', 'Migrate (copy)', 'Copy the current data to the target (server-side where possible), then resume — no rebuild.')}
+      </div>
+      <div style={{ fontSize: 10, color: '#f59e0b', lineHeight: 1.4 }}>
+        {blurb}{' '}The current location is kept intact as a backup. Type <b>{catchmentName}</b> to confirm.
+      </div>
+    </>
+  );
+}
+
 // ─── Enable flow (shown while cloud is disabled) ─────────────────────────────
 
 function EnableFlow({ settings, catchmentName, onEnabled }:
@@ -149,14 +180,15 @@ function EnableFlow({ settings, catchmentName, onEnabled }:
   const [region, setRegion] = useState('');
   const [root, setRoot] = useState('');
   const [confirm, setConfirm] = useState('');
+  const [mode, setMode] = useState<SwitchMode>('migrate');  // moving local data up → carry it by default
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [result, setResult] = useState<CloudVerifyResult | null>(null);
 
   const needsCreds = !settings.aws_configured;
   const needsRoot = !settings.data_root;
-  // Attaching a data plane to a Catchment that already published locally is a plane SWITCH → it rebuilds,
-  // so the backend requires the catchment name as confirmation.
+  // Attaching a data plane to a Catchment that already published locally is a plane SWITCH — the backend
+  // requires the catchment name as confirmation, and the operator picks what happens to the local data.
   const needsConfirm = needsRoot && settings.has_data;
 
   const run = async () => {
@@ -171,8 +203,12 @@ function EnableFlow({ settings, catchmentName, onEnabled }:
       const res = await verifyCloud(probeRoot || undefined);
       setResult(res);
       if (!res.ok) return;
-      // 3. Commit the data root only once creds check out and the bucket is writable.
-      if (probeRoot && res.bucket_ok !== false) await setDataRoot(probeRoot, needsConfirm ? confirm.trim() : undefined);
+      // 3. Commit the data root only once creds check out and the bucket is writable. When the Catchment
+      //    already has local data, honour the chosen mode (migrate carries it up; empty resets; adopt
+      //    picks up a pre-populated bucket).
+      if (probeRoot && res.bucket_ok !== false) {
+        await setDataRoot(probeRoot, needsConfirm ? confirm.trim() : undefined, needsConfirm ? mode : 'empty');
+      }
       onEnabled();
     } catch (e) {
       setErr(e instanceof Error ? e.message : 'failed');
@@ -213,11 +249,10 @@ function EnableFlow({ settings, catchmentName, onEnabled }:
 
       {needsConfirm && (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-          <div style={{ fontSize: 10, color: '#f59e0b', lineHeight: 1.4 }}>
-            This Catchment has local data — attaching a bucket empties the data plane: every Pond is left
-            with no data and idle (no auto-rebuild). Re-trigger to rebuild, or hand-copy data across first.
-            Your local data is kept as a backup. Type the catchment name <b>{catchmentName}</b> to confirm.
+          <div style={{ fontSize: 10, color: '#a1a1aa', lineHeight: 1.4 }}>
+            This Catchment has local data — choose what happens to it when the bucket is attached:
           </div>
+          <SwitchModeChoice mode={mode} setMode={setMode} catchmentName={catchmentName} />
           <input value={confirm} onChange={(e) => setConfirm(e.target.value)} placeholder={catchmentName} style={input} />
         </div>
       )}
@@ -292,7 +327,7 @@ function DataPlaneSection({ settings, catchmentName, reload }:
   const [open, setOpen] = useState(false);
   const [target, setTarget] = useState('');   // new data root ('' = local)
   const [confirm, setConfirm] = useState('');
-  const [mode, setMode] = useState<'empty' | 'adopt' | 'migrate'>('empty');
+  const [mode, setMode] = useState<SwitchMode>('empty');
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
@@ -310,18 +345,6 @@ function DataPlaneSection({ settings, catchmentName, reload }:
   };
 
   const confirmed = confirm.trim() === catchmentName && catchmentName !== '';
-  const modeChip = (m: 'empty' | 'adopt' | 'migrate', label: string, hint: string) => (
-    <button onClick={() => setMode(m)} title={hint} style={{
-      flex: 1, background: 'transparent', border: `1px solid ${mode === m ? '#f59e0b' : '#3f3f46'}`,
-      color: mode === m ? '#f59e0b' : '#a1a1aa', borderRadius: 5, padding: '3px 5px', fontSize: 10,
-      cursor: 'pointer', fontFamily: 'inherit',
-    }}>{label}</button>
-  );
-  const modeBlurb = mode === 'empty'
-    ? <>Empties the data plane — every Pond is left with no data and idle (no auto-rebuild). Re-trigger to rebuild, or hand-copy data across first.</>
-    : mode === 'adopt'
-      ? <>Picks up data already in the target (you copied it in, or a plane you&apos;re returning to) and resumes with no rebuild. Use only if the target already holds this Catchment&apos;s data.</>
-      : <>Copies the current data to the target (server-side where possible), then resumes with no rebuild. May take a while for large data; the copy runs before anything else.</>;
   return (
     <div style={{ marginBottom: 12 }}>
       <div style={heading}>DATA PLANE</div>
@@ -332,14 +355,7 @@ function DataPlaneSection({ settings, catchmentName, reload }:
         <button onClick={() => setOpen(true)} style={btn('#f59e0b', false)}>Switch data plane…</button>
       ) : (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-          <div style={{ display: 'flex', gap: 4 }}>
-            {modeChip('empty', 'Empty + reset', 'Leave every Pond with no data and idle (no auto-rebuild).')}
-            {modeChip('adopt', 'Adopt existing', 'The target already holds this Catchment’s data — pick it up and resume, no rebuild.')}
-            {modeChip('migrate', 'Migrate (copy)', 'Copy the current data to the target (server-side where possible), then resume — no rebuild.')}
-          </div>
-          <div style={{ fontSize: 10, color: '#f59e0b', lineHeight: 1.4 }}>
-            {modeBlurb}{' '}The current location is kept intact as a backup. Type <b>{catchmentName}</b> to confirm.
-          </div>
+          <SwitchModeChoice mode={mode} setMode={setMode} catchmentName={catchmentName} />
           <input value={target} onChange={(e) => setTarget(e.target.value)} placeholder="s3://bucket/prefix (blank = local)" style={smallInput} />
           <input value={confirm} onChange={(e) => setConfirm(e.target.value)} placeholder={`type ${catchmentName}`} style={smallInput} />
           {err && <div style={{ fontSize: 11, color: '#ef4444', wordBreak: 'break-word' }}>{err}</div>}
