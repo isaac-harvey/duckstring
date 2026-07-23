@@ -134,14 +134,17 @@ class IcebergDataPlane(DataPlane):
 
     @staticmethod
     def _is_incremental(table: str, meta: dict) -> bool:
-        """A Trickle append history, or a Trickle's ``__changelog`` / ``__droplog`` companion — the
-        append-only tables. A merge *main* (``meta[table]['mode'] == 'merge'``) is overwrite, not
-        incremental."""
-        from .trickle_io import CHANGELOG_SUFFIX, DROPLOG_SUFFIX
+        """A Trickle append history, or a merge main's ``__changelog`` / ``__band`` (warm tier) / ``__droplog``
+        companion — the append-only, flat-parts tables. None of these go to Iceberg (an append-only snapshot
+        would reference every file ever written); they are served from the flat layer. A merge *main*
+        (``meta[table]['mode'] == 'merge'``) is handled separately in ``export``. The **warm band** must be
+        here too: it is dropped when a checkpoint folds it into the cold base, and if a fold-then-checkpoint
+        straddles a run the commit loop would otherwise reference the now-gone ``__band`` table."""
+        from .trickle_io import CHANGELOG_SUFFIX, DROPLOG_SUFFIX, WARM_SUFFIX
 
         if meta.get(table, {}).get("mode") == "append":
             return True
-        for suffix in (CHANGELOG_SUFFIX, DROPLOG_SUFFIX):
+        for suffix in (CHANGELOG_SUFFIX, WARM_SUFFIX, DROPLOG_SUFFIX):
             if table.endswith(suffix) and table[: -len(suffix)] in meta:
                 return True
         return False

@@ -114,6 +114,30 @@ def test_append_history_served_from_flat_parts_not_iceberg(tmp_path, monkeypatch
     assert rcon.sql(f"SELECT count(*) FROM ({dp.read_select(tmp_path, 'hist')})").fetchone() == (60,)
 
 
+def test_merge_export_survives_warm_fold_then_checkpoint(tmp_path, monkeypatch):
+    """A merge main's warm band (``__band``) must never be handed to the Iceberg commit loop. It is dropped
+    when a checkpoint folds it into the cold base; if a run both holds a warm band (from an earlier fold) and
+    checkpoints, the commit loop would otherwise reference the now-gone ``__band`` table and crash. Drive many
+    small merge runs at a tiny compact threshold so folds + checkpoints straddle runs, and assert every export
+    succeeds and the reconstructed state stays correct."""
+    from duckstring import trickle_io as T
+
+    monkeypatch.setenv("DUCKSTRING_COMPACT_THRESHOLD", "1")  # tiny → eager warm folds + cold compactions
+    dp = IcebergDataPlane()
+    con = duckdb.connect()
+    con.execute("SET TimeZone='UTC'")
+    for k in range(8):
+        state = con.sql(f"SELECT i AS id, '{k}'||i AS v FROM range(50) x(i)")  # full-rewrite each run
+        T.merge_table(con, "dim", state, datetime(2026, 6, 16, k, tzinfo=UTC), ("id",))
+        dp.export(con, tmp_path, f=datetime(2026, 6, 16, k, tzinfo=UTC))  # must not raise
+
+    assert dp._load(tmp_path, "dim__band") is None, "a warm band must never be committed to Iceberg"
+    rcon = duckdb.connect()
+    dp.prepare(rcon)
+    rcon.execute("SET TimeZone='UTC'")
+    assert rcon.sql(f"SELECT count(*) FROM ({dp.read_select(tmp_path, 'dim')})").fetchone() == (50,)
+
+
 def test_as_of_reads_the_snapshot_for_that_freshness(tmp_path):
     dp = IcebergDataPlane()
     con = _con("CREATE TABLE event AS SELECT * FROM (VALUES (1,'a'),(2,'b')) t(id,val)")

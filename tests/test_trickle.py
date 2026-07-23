@@ -171,6 +171,39 @@ def test_merge_main_checkpoint_folds_into_base(reg, tmp_path, monkeypatch):
     assert sc["f_base"] >= ts(1).isoformat() and sc["floor"] is not None
 
 
+def test_base_hydrates_as_a_view_not_a_copy(reg, tmp_path, monkeypatch):
+    """A checkpointed merge main's cold base is registered on a fresh Duck as a **view** over the published
+    chunks — never copied into the registry (plans/s3-resident-state.md). The base can be arbitrarily large;
+    a spawned Duck must not download it to run a small delta. Reconstruction stays correct over the view."""
+    from duckstring.dataplane import hydrate_registry
+
+    monkeypatch.setenv("DUCKSTRING_COMPACT_THRESHOLD", "1")  # tiny → the base is folded + chunk-published
+    snk_dir = tmp_path / "data"
+    T.merge_table(reg, "dim", _state(reg, [(1, "a"), (2, "b")]), ts(1), ("id",))
+    publish(reg, snk_dir, f=ts(1))
+    T.merge_table(reg, "dim", _state(reg, [(1, "A"), (3, "c")]), ts(2), ("id",))  # update + insert + delete 2
+    publish(reg, snk_dir, f=ts(2))
+    assert T.base_chunks(snk_dir, "dim")  # a cold base exists on disk
+
+    # A fresh Duck: empty registry, hydrate from the published state.
+    fresh = duckdb.connect(str(tmp_path / "fresh.duckdb"))
+    try:
+        hydrate_registry(fresh, snk_dir)
+        # The base "dim" is a VIEW, not a materialised table.
+        assert fresh.execute("SELECT count(*) FROM duckdb_views() WHERE view_name = 'dim'").fetchone()[0] == 1
+        assert fresh.execute("SELECT count(*) FROM duckdb_tables() WHERE table_name = 'dim'").fetchone()[0] == 0
+        # Reconstruction over the view is correct (current state after the update/insert/delete).
+        rel = T.reconstruct_current(fresh, "dim")
+        assert sorted(fresh.sql(f"SELECT id, v FROM ({rel.sql_query()})").fetchall()) == [(1, "A"), (3, "c")]
+        # And a further checkpoint on the hydrated Duck (base is a view) still works — it replaces the view
+        # with a fresh base and re-views it, never erroring on the view/table mismatch.
+        T.merge_table(fresh, "dim", _state(fresh, [(1, "A"), (3, "C"), (4, "d")]), ts(3), ("id",))
+        publish(fresh, snk_dir, f=ts(3))
+        assert rows(fresh, snk_dir, "dim", "id, v") == [(1, "A"), (3, "C"), (4, "d")]
+    finally:
+        fresh.close()
+
+
 def test_per_table_compact_threshold_overrides_catchment_default(reg, tmp_path, monkeypatch):
     """A per-table ``compact_threshold`` (recorded at the merge write) overrides the catchment env default
     for that main's checkpoint trigger: a huge env default would never checkpoint these tiny tables, but a

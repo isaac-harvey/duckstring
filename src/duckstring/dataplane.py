@@ -594,11 +594,16 @@ def hydrate_registry(con, data_dir, tables=None) -> list[str]:
         mode = entry.get("mode", "overwrite")
         loaded = False
         if mode == "merge":
-            # The registry main is the COLD BASE (a young merge main pre-checkpoint has none) —
-            # never the reconstruction; reconstruct happens at read time over base ⊎ changelog.
+            # The registry main is the COLD BASE (a young merge main pre-checkpoint has none) — never the
+            # reconstruction; reconstruct happens at read time over base ⊎ changelog. Register it as a VIEW over
+            # the published S3 chunks, NOT a materialised copy: the base can be arbitrarily large (TB), a fresh
+            # Duck must not copy it down to run a small delta, and a steady-state incremental run never reads it
+            # (only a checkpoint / comprehensive fallback does, and they read on demand). See
+            # plans/s3-resident-state.md. The changelog/warm below stay materialised for now (later steps).
             if trickle.base_chunks(store, table) or store.exists(f"{table}.parquet"):
                 sql = plane._raw_read_select(store, table)
-                con.execute(f'CREATE OR REPLACE TABLE {trickle._q(table)} AS {sql}')
+                trickle._drop_relation(con, table)
+                con.execute(f'CREATE VIEW {trickle._q(table)} AS {sql}')
                 loaded = True
         else:  # append parts dir, or the overwrite wholesale file
             if trickle.table_parts(store, table) or store.exists(f"{table}.parquet"):
@@ -698,9 +703,10 @@ def _publish_tiered_main(con, data_dir: Path, main: str, f) -> None:
     # changelog (no warm tier yet) so a fresh main folds straight to cold rather than via a warm round-trip.
     bootstrap = cold_bytes == 0 and (warm_bytes + hot_bytes) >= threshold
     if warm_bytes >= max(cold_bytes, threshold) or bootstrap:  # cold compaction (k=1: warm ≥ cold)
-        trickle.checkpoint(con, main, f)  # fold base+warm+hot≤f → clean base; clear warm; advance f_base/f_warm
+        trickle.checkpoint(con, main, f)  # fold base+warm+hot≤f → clean base (a local table); clear warm
         if trickle._table_exists(con, main):
             _publish_base_chunks(con, data_dir, main, f, threshold)
+            _review_base(con, data_dir, main)  # drop the local base; point the registry at the published S3 chunks
         if data_dir.is_dir(warm):
             data_dir.rmtree(warm)  # the warm bands are now folded into the cold base
         _export_parts(con, data_dir, clog, f)  # re-sync the hot parts after retention trim
@@ -717,6 +723,22 @@ def _publish_tiered_main(con, data_dir: Path, main: str, f) -> None:
             trickle.fold_warm(con, main, warm_target)
             _export_bands(con, data_dir, main)
             _export_parts(con, data_dir, clog, f)  # drop the folded hot parts (now in the warm band)
+
+
+def _review_base(con, data_dir: Path, main: str) -> None:
+    """After a checkpoint materialised the new base as a registry table and published it as S3 chunks, drop the
+    local table and re-register ``main`` as a **view** over those chunks — so the (possibly huge) base is not
+    held in the registry between checkpoints. Symmetric with :func:`hydrate_registry`'s base branch; a
+    steady-state run never reads it, and a later checkpoint / comprehensive read hits S3 on demand. See
+    plans/s3-resident-state.md."""
+    from . import trickle_io as trickle
+
+    data_dir = _as_storage(data_dir)
+    if not trickle.base_chunks(data_dir, main):  # nothing published (shouldn't happen post-publish) → leave as-is
+        return
+    sql = ParquetDataPlane()._raw_read_select(data_dir, main)  # the base chunks glob (flat layer)
+    trickle._drop_relation(con, main)
+    con.execute(f'CREATE VIEW {trickle._q(main)} AS {sql}')
 
 
 def _export_bands(con, data_dir: Path, main: str) -> None:
