@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import io
 import tempfile
+import threading
 import zipfile
 from pathlib import Path
 from typing import Optional
@@ -510,6 +511,65 @@ def _merge_deleted_count_sql(pond: str, table: str, pk: list, f_base) -> str:
     )
 
 
+# ─── merge browse cache: materialise the reconstruction once, page it locally ────
+#
+# The default (unwindowed, current-state) view of a merge Trickle RECONSTRUCTS latest-per-PK over the whole
+# base ⊎ changelog — an aggregate a LIMIT can't push past, so every page rebuilt it from S3 (slow, worse
+# cross-region). For a table small enough to hold locally, materialise the reconstruction ONCE per publish
+# (keyed on driver.data_version) and page from the local copy. Above the cap, keep streaming (avoid a
+# gigabyte spill).
+_BROWSE_LOCK = threading.Lock()
+_BROWSE_CAP = 2_000_000  # only materialise a merge browse this many rows or fewer
+_BROWSE_MAX = 6          # cached materialised browse tables (LRU)
+
+
+def _merge_active_count(con, request: Request, body, major: int) -> int:
+    """A merge main's active (current-state) row count — metadata-fast (cold-base count + changelog net
+    Z-set weight + deleted tombstones), no base scan. Sizes the scrollbar AND gates the browse cache."""
+    from ...dataplane import get_data_plane
+
+    meta = _sidecar(request, body.pond, major).get(body.table) or {}
+    active_sql = get_data_plane().consolidated_count_select(_data_dir(request, body.pond, major), body.table, meta)
+    active = con.execute(active_sql).fetchone()[0]
+    deleted = con.execute(_merge_deleted_count_sql(body.pond, body.table, body.pk, meta.get("f_base"))).fetchone()[0]
+    return int(active) + int(deleted)
+
+
+def _browse_con(request: Request, pond: str, major: int, table: str, base_sql: str):
+    """A warm in-memory DuckDB connection holding the reconstructed current state MATERIALISED as a regular
+    table ``_ds_browse``, cached per (pond, major, table) and keyed on ``driver.data_version`` — so paging /
+    re-opening reconstructs from S3 ONCE per publish, not per page. Query via ``.cursor()`` (thread-safe; a
+    regular table is visible to cursors, unlike a TEMP one)."""
+    driver = request.app.state.driver
+    dv = driver.data_version
+    with _BROWSE_LOCK:
+        cache = getattr(driver, "_browse_cache", None)
+        if cache is None:
+            cache = driver._browse_cache = {}
+        key = (pond, major, table)
+        entry = cache.get(key)
+        if entry is not None and entry[0] == dv:
+            cache[key] = cache.pop(key)  # LRU bump
+            return entry[1]
+        if entry is not None:  # stale (data changed) → drop it
+            try:
+                entry[1].close()
+            except Exception:
+                pass
+            cache.pop(key, None)
+        con = _open_pond(request, pond, major)  # S3 creds configured; views over the plane
+        con.execute(f"CREATE TABLE _ds_browse AS {base_sql}")  # reconstruct once → local
+        while len(cache) >= _BROWSE_MAX:  # evict the oldest
+            old_key = next(iter(cache))
+            try:
+                cache[old_key][1].close()
+            except Exception:
+                pass
+            cache.pop(old_key, None)
+        cache[key] = (dv, con)
+        return con
+
+
 @router.post("/query/count", dependencies=[auth.read])
 def query_count(body: CountRequest, request: Request,
                 principal: auth.Principal = Depends(auth.get_principal)):
@@ -605,20 +665,39 @@ def query_page(body: PageRequest, request: Request,
     m = _resolve_major(request, body.pond, body.major, body.version)
     _require_serviceable(request, body.pond, m, body.table, full)
     con = _open_pond(request, body.pond, m)
-    base = _base_sql(body, f_base=_merge_f_base(request, body, m))
-    # Order (if asked) + page at this single level. The default is the **cheap scan order**: with no ORDER BY
-    # the LIMIT/OFFSET pushes down to the Parquet scan (row groups skipped by count), so a page reads only its
-    # ~CHUNK rows and the changelog join touches only those — O(page), not O(table). An explicit column sort
-    # (the user clicking a header — quoted → injection-safe; unknown column → 400) pays the full-scan Top-N it
-    # genuinely needs. So a merge Trickle no longer force-sorts its (gigabyte-scale) base by PK on every page.
     order = f" ORDER BY {_qi(body.order_by)} {'DESC' if body.order_desc else 'ASC'}" if body.order_by else ""
-    try:
-        rel = con.execute(f"SELECT * FROM ({base}) AS _ds_page{order} LIMIT {limit + 1} OFFSET {offset}")
+
+    def _page(rel):
         cols = [d[0] for d in rel.description] if rel.description else []
         fetched = rel.fetchall()
-        has_more = len(fetched) > limit
-        rows = [[_json_safe(c) for c in row] for row in fetched[:limit]]
-        return {"columns": cols, "rows": rows, "has_more": has_more}
+        return {"columns": cols, "rows": [[_json_safe(c) for c in row] for row in fetched[:limit]],
+                "has_more": len(fetched) > limit}
+
+    # Default (unwindowed, current-state) merge browse: reconstructing latest-per-PK on every page is the
+    # slow bit (a LIMIT can't push past it) — so for a table small enough, materialise the reconstruction
+    # once (cached, keyed on the publish version) and page it locally. Large tables keep the streaming path.
+    if body.trickle == "merge" and body.pk and not body.f_lo and not body.f_hi:
+        try:
+            cacheable = _merge_active_count(con, request, body, m) <= _BROWSE_CAP
+        except Exception:
+            cacheable = False
+        if cacheable:
+            base = _base_sql(body, f_base=_merge_f_base(request, body, m))
+            bcon = _browse_con(request, body.pond, m, body.table, base)
+            con.close()
+            cur = bcon.cursor()  # thread-safe over the shared warm connection
+            try:
+                return _page(cur.execute(f"SELECT * FROM _ds_browse{order} LIMIT {limit + 1} OFFSET {offset}"))
+            except Exception as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            finally:
+                cur.close()
+
+    # Streaming path. With no ORDER BY the LIMIT/OFFSET pushes down to the Parquet scan (O(page)); an
+    # explicit column sort pays the Top-N it genuinely needs.
+    base = _base_sql(body, f_base=_merge_f_base(request, body, m))
+    try:
+        return _page(con.execute(f"SELECT * FROM ({base}) AS _ds_page{order} LIMIT {limit + 1} OFFSET {offset}"))
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     finally:

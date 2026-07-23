@@ -148,6 +148,26 @@ def test_query_unknown_catchment_exits(runner):
     assert result.exit_code != 0
 
 
+def test_browse_con_caches_per_data_version(monkeypatch):
+    """The merge browse cache materialises the reconstruction once (a local ``_ds_browse`` table), reuses
+    the warm connection while the publish version is unchanged, and rebuilds when it changes."""
+    import types
+
+    import duckdb
+
+    from duckstring.catchment.routes import data as datamod
+
+    driver = types.SimpleNamespace(data_version=1)
+    req = types.SimpleNamespace(app=types.SimpleNamespace(state=types.SimpleNamespace(driver=driver)))
+    monkeypatch.setattr(datamod, "_open_pond", lambda request, pond, major: duckdb.connect())
+
+    c1 = datamod._browse_con(req, "p", 1, "t", "SELECT 42 AS x")
+    assert c1.execute("SELECT x FROM _ds_browse").fetchone()[0] == 42
+    assert datamod._browse_con(req, "p", 1, "t", "SELECT 42 AS x") is c1  # warm reuse (same publish)
+    driver.data_version = 2
+    assert datamod._browse_con(req, "p", 1, "t", "SELECT 42 AS x") is not c1  # rebuilt on publish
+
+
 # ── /api/query/page (the data viewer's paged read) ──────────────────────────────
 
 
