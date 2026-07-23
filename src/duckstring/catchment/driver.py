@@ -317,6 +317,8 @@ class Driver:
             self._incomplete: list[tuple[str, datetime]] = []  # (pond, F) runs to resume
 
             self.duck_pool_names = set(PRESET_POOLS) | {r[0] for r in db.execute("SELECT name FROM duck_pool")}
+            self._pool_cache = None  # user-pool list cache (invalidated on add/remove) — status()'s per-Pond
+            #                          duck_config resolves pools off this instead of a DB query per poll
             name_by_pnid = {r[0]: r[1] for r in db.execute("SELECT id, name FROM pond_name")}
             rows = db.execute("""
                 SELECT pn.name, p.major, p.id, p.pond_version_id, pv.version, pv.source_path, pn.kind,
@@ -1274,6 +1276,10 @@ class Driver:
                     "idle_timeout", "keep_warm", "region")
 
     def _user_pools(self) -> list[dict]:
+        # Cached: rebuilt only when a pool is added/removed (or on reload), so status()'s per-Pond
+        # duck_config resolution doesn't run a DB query per Pond per ~1 s poll.
+        if self._pool_cache is not None:
+            return self._pool_cache
         rows = self.db.execute(
             "SELECT name, provider, instance_type, cpu, memory, min_instances, max_instances, "
             "idle_timeout, keep_warm, region, deploy_config FROM duck_pool ORDER BY name"
@@ -1284,6 +1290,7 @@ class Driver:
             p["provider"] = p["provider"] or "fargate"  # NULL → the default provider
             p["deploy_config"] = _load_json(p["deploy_config"])
             p["managed"] = False
+        self._pool_cache = pools
         return pools
 
     def list_pools(self) -> list[dict]:
@@ -1306,15 +1313,18 @@ class Driver:
         mn, mx = vals["min_instances"], vals["max_instances"]
         if mn is not None and mx is not None and int(mn) > int(mx):
             raise ValueError("min_instances must be <= max_instances")
-        # The pool's deployment config (provider AWS image/AMI/VPC/IAM) must be adequate to launch,
-        # validated over the env defaults — a pool that can't launch is rejected up front.
+        # When deployment config is supplied via the UI, it must be adequate to launch (validated over the
+        # env defaults). A pool created with NO blob keeps relying on the env (the CLI / hosted-platform
+        # path) — a clear launch error surfaces if the env is also unset.
         from . import cloud_deploy
-        deploy_config = cloud_deploy.clean(vals["provider"], fields.get("deploy_config"))
-        miss = cloud_deploy.missing_fields(vals["provider"], deploy_config)
-        if miss:
-            raise ValueError(
-                f"{vals['provider']} pool is missing required deployment config: {', '.join(miss)} — set "
-                f"them (or the DUCKSTRING_{vals['provider'].upper()}_* env)")
+        provided = fields.get("deploy_config")
+        deploy_config = cloud_deploy.clean(vals["provider"], provided)
+        if provided:
+            miss = cloud_deploy.missing_fields(vals["provider"], deploy_config)
+            if miss:
+                raise ValueError(
+                    f"{vals['provider']} pool is missing required deployment config: {', '.join(miss)} — set "
+                    f"them (or the DUCKSTRING_{vals['provider'].upper()}_* env)")
         with self.lock:
             self.db.execute(
                 "INSERT INTO duck_pool (name, provider, instance_type, cpu, memory, min_instances, "
@@ -1330,6 +1340,7 @@ class Driver:
             )
             self.db.commit()
             self.duck_pool_names.add(name)
+            self._pool_cache = None
             self.state_version += 1
         return self.get_pool(name)
 
@@ -1350,6 +1361,7 @@ class Driver:
             self.db.execute("DELETE FROM duck_pool WHERE name = ?", (name,))
             self.db.commit()
             self.duck_pool_names.discard(name)
+            self._pool_cache = None
             self.state_version += 1
 
     # ─── Data serving: the exposure model + the served-major pointer (plans/data-serving.md) ──

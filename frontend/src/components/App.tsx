@@ -299,9 +299,14 @@ export function App() {
     })();
     // A separate lightweight clock so freshness "age" keeps counting up between state changes.
     const clock = setInterval(() => useLiveStore.setState({ now: Date.now() }), POLL_MS);
+    // The cloud gate on its own slow poll (off the ~1 s status loop) — it changes rarely.
+    const cloud = useLiveStore.getState();
+    void cloud.refreshCloud();
+    const cloudPoll = setInterval(() => void useLiveStore.getState().refreshCloud(), 15000);
     return () => {
       alive = false;
       clearInterval(clock);
+      clearInterval(cloudPoll);
     };
   }, [refresh]);
 

@@ -231,8 +231,10 @@ def test_verify_updates_the_cred_cache(client, monkeypatch):
     assert client.app.state.cloud_creds["valid"] is True
 
 
-def test_status_payload_carries_creds_field(client):
-    cloud_gate = client.get("/api/status").json()["cloud"]
+def test_settings_carries_creds_field(client):
+    # The cloud gate (with creds validity) lives on the settings endpoint now, not the status poll.
+    assert "cloud" not in client.get("/api/status").json()
+    cloud_gate = client.get("/api/catchment/settings").json()
     assert "creds_valid" in cloud_gate and cloud_gate["creds_valid"] is None  # gate off in the open test app
 
 
@@ -339,8 +341,12 @@ def test_add_pool_rejects_and_accepts_by_deploy_config(tmp_path, monkeypatch):
     db = connect(tmp_path / "duck.db")
     migrate(db)
     driver = Driver(db, tmp_path, "http://x", NoopLauncher())
-    with pytest.raises(ValueError, match="ami"):  # an EC2 pool with no ami/profile (nor env) is rejected
-        driver.add_pool("heavy", provider="ec2", instance_type="m6i.large")
+    # A PARTIAL deploy config (ami, no instance_profile; nor env) is rejected.
+    with pytest.raises(ValueError, match="instance_profile"):
+        driver.add_pool("heavy", provider="ec2", instance_type="m6i.large", deploy_config={"ami": "ami-1"})
+    # No blob supplied → validation deferred (the CLI / env path).
+    driver.add_pool("nocfg", provider="ec2", instance_type="m6i.large")
+    # A complete blob is accepted and round-trips.
     pool = driver.add_pool("heavy", provider="ec2", instance_type="m6i.large",
                            deploy_config={"ami": "ami-1", "instance_profile": "prof"})
     assert pool["deploy_config"] == {"ami": "ami-1", "instance_profile": "prof"}

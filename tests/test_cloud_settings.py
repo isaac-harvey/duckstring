@@ -282,12 +282,13 @@ def test_switch_data_root_migrate_copies_and_preserves_freshness(tmp_path):
     assert mig["status"] == "done" and mig["copied_files"] == mig["total_files"] and mig["total_files"] >= 1
 
 
-def test_status_carries_cloud_block(tmp_path, monkeypatch):
+def test_status_omits_cloud_block(tmp_path, monkeypatch):
+    # The cloud gate is polled separately (GET /catchment/settings) now — kept off the ~1 s status poll.
     monkeypatch.delenv("AWS_ACCESS_KEY_ID", raising=False)
     client, _ = _client(tmp_path, data_root="s3://bucket/p", secret_names=["AWS_ACCESS_KEY_ID"])
-    payload = client.get("/api/status").json()
-    assert payload["cloud"]["cloud_enabled"] is True
-    assert payload["cloud"]["data_root"] == "s3://bucket/p"
+    assert "cloud" not in client.get("/api/status").json()
+    gate = client.get("/api/catchment/settings").json()
+    assert gate["cloud_enabled"] is True and gate["data_root"] == "s3://bucket/p"
 
 
 def test_boot_reads_persisted_data_root(tmp_path, monkeypatch):

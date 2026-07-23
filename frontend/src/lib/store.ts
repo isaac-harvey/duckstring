@@ -12,6 +12,7 @@ import type {
   WindowRow,
 } from './types';
 import {
+  fetchCloudSettings,
   fetchStatus,
   fetchView,
   fetchRuns,
@@ -125,7 +126,7 @@ interface StatusSlice {
   triggers: Record<PondId, TriggerView>;
 }
 
-function transformStatus(payload: StatusPayload): StatusSlice {
+function transformStatus(payload: StatusPayload): Omit<StatusSlice, 'cloud'> {
   const ponds: Record<PondId, Pond> = {};
   const ripples: Record<RippleId, Ripple> = {};
   const pondViews: Record<PondId, NodeView> = {};
@@ -193,7 +194,8 @@ function transformStatus(payload: StatusPayload): StatusSlice {
     // Default to 'full' when absent — keeps an open/unauthed Catchment (and any transitional backend)
     // showing every control, matching pre-ladder behaviour.
     accessLevel: payload.access_level ?? 'full',
-    cloud: payload.cloud ?? null,
+    // NOTE: `cloud` is NOT in the ~1 s status payload anymore — it's polled slowly via refreshCloud(). We
+    // intentionally omit it here so the existing value is preserved across a status refresh.
     ponds, ripples, pondViews, rippleViews, pondInfo, triggers,
   };
 }
@@ -241,6 +243,7 @@ export interface LiveState extends StatusSlice {
   windowsByPond: Record<PondId, WindowRow[]>;
 
   refresh(): Promise<void>;
+  refreshCloud(): Promise<void>;  // the cloud gate on its own slow poll (off the ~1 s status loop)
   submitApiKey(key: string): Promise<void>;
   refreshWindows(pond: PondId): Promise<void>;
   refreshRunDetail(): Promise<void>;
@@ -374,6 +377,17 @@ export const useLiveStore = create<LiveState>((set, get) => ({
   windowsByPond: {},
   lineage: null,
   statusVersion: null,
+
+  async refreshCloud() {
+    // The cloud gate changes rarely and its backend checks (secret store, env, the TTL-throttled STS
+    // refresh) don't belong on the engine-state hot path — so it rides its own slow poll. Failures leave
+    // the last good value (and never disturb the status loop).
+    try {
+      set({ cloud: await fetchCloudSettings() });
+    } catch {
+      /* keep the last cloud gate */
+    }
+  },
 
   async refresh() {
     let payload;
