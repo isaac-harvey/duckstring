@@ -262,6 +262,8 @@ class Driver:
         # Monotonic counter bumped on every state change — the UI long-polls /api/status against it, so
         # the display updates the instant the engine state moves rather than on a fixed timer.
         self.state_version = 0
+        # In-flight/last data-plane migration progress (None until one runs); see migrate().
+        self.migration: dict | None = None
         self.reload()
 
     def set_notify(self, cb) -> None:
@@ -705,15 +707,12 @@ class Driver:
           or one you're returning to) and resume with **no rebuild** — read each Pond's freshness from its
           ``_trickle.json`` sidecar in the target, set the ledger to match, drop the local hot state
           (registry + ledger) so the next run re-hydrates from the target, and **keep** demand + triggers.
-        - ``"migrate"``: **copy** the current plane's data to the target (server-side for same-provider
-          object stores; the Iceberg catalog is left behind and regenerated — reads serve from the flat
-          sidecars), then ``adopt`` it. A one-action move that carries the data across, no rebuild.
 
+        (The **copy+adopt** move is :meth:`migrate`, which reports progress and runs the copy off-lock.)
         Returns ``{"ponds": n}``."""
-        if mode not in ("empty", "adopt", "migrate"):
-            raise ValueError(f"unknown switch mode {mode!r} (expected 'empty', 'adopt', or 'migrate')")
+        if mode not in ("empty", "adopt"):
+            raise ValueError(f"unknown switch mode {mode!r} (expected 'empty' or 'adopt')")
         with self.lock:
-            old_root = self.data_root
             # 1. Quiesce: stop every Duck (wait, so the registry handles are free) and drop pending work.
             for key in list(self.state.ponds):
                 self.launcher.terminate(key, wait=True)
@@ -723,11 +722,7 @@ class Driver:
             self._idle_since.clear()
             lines = [(m["name"], m["major"], m["pond_id"]) for m in self.meta.values()
                      if not m.get("is_draw") and not m.get("is_spout")]
-            # 2. migrate: copy the (quiesced) old plane → the new one before re-pointing. The old location
-            #    is still left intact afterwards.
-            if mode == "migrate":
-                self._copy_planes(lines, old_root, new_root)
-            # 3. Re-point future spawns (publish + read) at the new plane. NOTE: the OLD location is not
+            # 2. Re-point future spawns (publish + read) at the new plane. NOTE: the OLD location is not
             #    touched — no scrub — so it remains a hand-migration source / switch-back backup.
             self.data_root = new_root
             if hasattr(self.launcher, "set_data_root"):
@@ -753,23 +748,82 @@ class Driver:
             self.state_version += 1
             return {"ponds": len(lines)}
 
-    def _copy_planes(self, lines, old_root: str | None, new_root: str | None) -> None:
-        """Copy each line's data dir from the old plane to the new one (skipping the Iceberg catalog +
-        namespace, which regenerate at the target — reads serve from the flat sidecars). Server-side for
-        same-provider object stores; streamed otherwise. Leaves the old location intact."""
+    _MIGRATE_SKIP = frozenset({"catalog.json", "pond.db", "pond"})  # Iceberg pointer + namespace warehouse
+
+    def migration_status(self) -> dict:
+        """The current/last data-plane migration's progress (``status`` ∈ copying/adopting/done/failed,
+        + file/byte counts + the pond in flight), or ``{"status": "idle"}`` if none has run."""
+        m = self.migration
+        return dict(m) if m else {"status": "idle"}
+
+    def migrate(self, new_root: str | None) -> dict:
+        """**Copy** the current plane's data to ``new_root``, then ``adopt`` it — a one-action move that
+        carries the data across with no rebuild. Blocking (run it in a thread for a live migration); the
+        long **copy runs off-lock** (so ``/api/status`` stays responsive), bracketed by two short locked
+        phases: quiesce+plan, then re-point+adopt. Progress is published on ``self.migration`` throughout.
+        The Iceberg catalog/namespace are skipped (regenerated at the target — reads fall back to the flat
+        sidecars); the old location is left intact. Raises (and marks the migration ``failed``) on error."""
         from pathlib import Path
 
-        from ..storage import copy_tree
+        from ..storage import copy_tree, tree_size
         from .registry import pond_data_dir
 
-        skip = frozenset({"catalog.json", "pond.db", "pond"})  # Iceberg pointer + namespace warehouse
         root = Path(self.root)
-        for name, major, _pond_id in lines:
-            src = pond_data_dir(root, name, major, old_root)
-            dst = pond_data_dir(root, name, major, new_root)
-            if src.uri() == dst.uri():  # same physical location — nothing to copy
-                continue
-            copy_tree(src, dst, skip_top=skip)
+        # Phase 1 (locked): quiesce, plan the copy, seed progress totals.
+        with self.lock:
+            old_root = self.data_root
+            for key in list(self.state.ponds):
+                self.launcher.terminate(key, wait=True)
+            self.jobs.clear()
+            self._pending_transfers.clear()
+            self._pending_egress.clear()
+            self._idle_since.clear()
+            lines = [(m["name"], m["major"], m["pond_id"]) for m in self.meta.values()
+                     if not m.get("is_draw") and not m.get("is_spout")]
+            total_files = total_bytes = 0
+            plan = []
+            for name, major, _pid in lines:
+                src = pond_data_dir(root, name, major, old_root)
+                dst = pond_data_dir(root, name, major, new_root)
+                if src.uri() == dst.uri():  # same physical location — nothing to copy
+                    continue
+                f, b = tree_size(src, skip_top=self._MIGRATE_SKIP)
+                total_files += f
+                total_bytes += b
+                plan.append((name, src, dst))
+            self.migration = {"status": "copying", "target": new_root, "pond": None,
+                              "total_files": total_files, "total_bytes": total_bytes,
+                              "copied_files": 0, "copied_bytes": 0, "error": None}
+        try:
+            # Phase 2 (off-lock): the actual copy. The engine is paused (see _process) + Ducks quiesced, so
+            # nothing writes the old plane meanwhile. Single writer of self.migration → no lock for updates.
+            def _on(nbytes: int) -> None:
+                self.migration["copied_files"] += 1
+                self.migration["copied_bytes"] += nbytes
+            for name, src, dst in plan:
+                self.migration["pond"] = name
+                copy_tree(src, dst, skip_top=self._MIGRATE_SKIP, on_file=_on)
+            # Phase 3 (locked): re-point + adopt the freshly-populated target.
+            with self.lock:
+                self.migration["status"] = "adopting"
+                self.migration["pond"] = None
+                self.data_root = new_root
+                if hasattr(self.launcher, "set_data_root"):
+                    self.launcher.set_data_root(new_root)
+                else:
+                    self.launcher.data_root = new_root
+                self._adopt_plane(lines, new_root)
+                self.db.commit()
+                self.reload()
+                self.state_version += 1
+                self.migration["status"] = "done"
+            return {"ponds": len(lines)}
+        except Exception as exc:
+            with self.lock:
+                if self.migration is not None:
+                    self.migration["status"] = "failed"
+                    self.migration["error"] = str(exc)
+            raise
 
     def _adopt_plane(self, lines, new_root: str | None) -> None:
         """Set each line's freshness to what the *target* plane actually holds (read from its sidecar) and
@@ -2461,6 +2515,10 @@ class Driver:
         self._process(now)
 
     def _process(self, now: datetime, notify: bool = True) -> None:
+        # Pause the engine while a data-plane migration copies/adopts — Ducks are quiesced and the old
+        # plane must not receive new writes (that a spawned run would produce) before the re-point.
+        if self.migration is not None and self.migration.get("status") in ("copying", "adopting"):
+            return
         self.state, _started = sentinel(now, self.state)
         for cmd in drain_begin_runs(self.state):
             self._dispatch_begin_run(cmd.pond_id, cmd.f, now, force=cmd.force, refresh=cmd.refresh,

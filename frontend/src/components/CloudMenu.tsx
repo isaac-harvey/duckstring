@@ -1,9 +1,9 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
-  addDuckPool, fetchCloudSettings, fetchDuckPools, removeDuckPool, setDataRoot, setSecret, verifyCloud,
-  type CloudSettings, type CloudVerifyResult, type DuckPool,
+  addDuckPool, fetchCloudSettings, fetchDuckPools, fetchMigration, removeDuckPool, setDataRoot, setSecret,
+  verifyCloud, type CloudSettings, type CloudVerifyResult, type DuckPool, type MigrationStatus,
 } from '@/lib/api';
 import { cpuLabel, defaultMemoryFor, FARGATE_CPU, FARGATE_MEMORY, memoryLabel } from '@/lib/aws';
 import { useLiveStore } from '@/lib/store';
@@ -26,6 +26,66 @@ const btn = (color: string, disabled: boolean): React.CSSProperties => ({
   fontSize: 12, cursor: disabled ? 'not-allowed' : 'pointer', opacity: disabled ? 0.5 : 1, fontWeight: 600,
 });
 const heading: React.CSSProperties = { fontSize: 10, fontWeight: 700, color: '#a1a1aa', letterSpacing: '0.08em', marginBottom: 6 };
+
+function fmtBytes(n: number): string {
+  if (n >= 1e9) return `${(n / 1e9).toFixed(1)} GB`;
+  if (n >= 1e6) return `${(n / 1e6).toFixed(1)} MB`;
+  if (n >= 1e3) return `${(n / 1e3).toFixed(0)} KB`;
+  return `${n} B`;
+}
+
+// Polls the data-plane migration progress and shows a bar while a copy runs (and the outcome). Hidden
+// when idle. On completion it refreshes the parent settings (the data root has moved).
+function MigrationBanner({ onDone }: { onDone: () => void }) {
+  const [mig, setMig] = useState<MigrationStatus | null>(null);
+  const doneHandled = useRef(false);
+
+  useEffect(() => {
+    let live = true;
+    const tick = () => void fetchMigration().then((m) => { if (live) setMig(m); }).catch(() => {});
+    tick();
+    const id = setInterval(tick, 1000);
+    return () => { live = false; clearInterval(id); };
+  }, []);
+
+  const status = mig?.status;
+  useEffect(() => {
+    if (status === 'done' && !doneHandled.current) {
+      doneHandled.current = true;
+      const t = setTimeout(onDone, 1500);  // let the "complete" tick show, then refresh settings
+      return () => clearTimeout(t);
+    }
+  }, [status, onDone]);
+
+  if (!mig || mig.status === 'idle') return null;
+
+  const total = mig.total_bytes ?? 0;
+  const copied = mig.copied_bytes ?? 0;
+  const pct = total > 0 ? Math.min(100, Math.round((copied / total) * 100)) : (status === 'copying' ? 0 : 100);
+  const color = status === 'failed' ? '#ef4444' : status === 'done' ? '#22c55e' : '#06c4e6';
+  return (
+    <div style={{ marginBottom: 8, border: `1px solid ${color}55`, background: `${color}12`, borderRadius: 6, padding: '6px 8px' }}>
+      <div style={{ fontSize: 11, color, fontWeight: 700, marginBottom: 3 }}>
+        {status === 'copying' && `Migrating → ${mig.target || 'local'}`}
+        {status === 'adopting' && 'Adopting migrated data…'}
+        {status === 'done' && 'Migration complete ✓'}
+        {status === 'failed' && 'Migration failed'}
+      </div>
+      {(status === 'copying' || status === 'adopting') && (
+        <>
+          <div style={{ height: 5, background: '#27272a', borderRadius: 3, overflow: 'hidden' }}>
+            <div style={{ width: `${pct}%`, height: '100%', background: color, transition: 'width 0.4s' }} />
+          </div>
+          <div style={{ fontSize: 10, color: '#a1a1aa', marginTop: 3 }}>
+            {mig.copied_files ?? 0}/{mig.total_files ?? 0} files · {fmtBytes(copied)}{total > 0 ? ` / ${fmtBytes(total)}` : ''}
+            {mig.pond ? ` · ${mig.pond}` : ''}
+          </div>
+        </>
+      )}
+      {status === 'failed' && <div style={{ fontSize: 10, color: '#ef4444', wordBreak: 'break-word' }}>{mig.error}</div>}
+    </div>
+  );
+}
 
 export function CloudMenu({ onClose }: { onClose: () => void }) {
   const [settings, setSettings] = useState<CloudSettings | null>(null);
@@ -57,6 +117,8 @@ export function CloudMenu({ onClose }: { onClose: () => void }) {
         <div>AWS creds: <span style={{ color: settings?.aws_configured ? '#22c55e' : '#71717a' }}>{settings?.aws_configured ? 'yes' : 'no'}</span></div>
         <div>cloud: <span style={{ color: enabled ? '#22c55e' : '#71717a' }}>{enabled ? 'enabled' : 'disabled'}</span></div>
       </div>
+
+      <MigrationBanner onDone={load} />
 
       {/* Persistent warning: enabled but the creds are being rejected — remote compute is broken. */}
       {enabled && settings?.creds_valid === false && (

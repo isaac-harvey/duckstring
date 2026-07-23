@@ -6,8 +6,10 @@ Migrate). Adopt restores each line's freshness from the target's `_trickle.json`
 (`_plane_freshness`), drops the local hot state to re-hydrate from the target, and keeps demand/triggers.
 Migrate copies the flat data first via `storage.copy_tree` (server-side for same-fsspec object stores;
 skips the Iceberg `catalog.json`/`pond.db` — reads fall back to the flat sidecars, Iceberg regenerates),
-then adopts. Tested in `tests/test_cloud_settings.py` (adopt + empty-target + migrate copy/skip/adopt).
-Deferred: a real-AWS e2e of the server-side s3→s3 copy path; per-object migration progress.
+then adopts. **Migrate runs in the background with live progress** (`Driver.migrate` off-locks the copy;
+`self.migration` published via `GET /api/catchment/migration`; the engine pauses via a `_process` guard;
+the Cloud-menu shows a progress bar). Tested in `tests/test_cloud_settings.py` (adopt + empty-target +
+migrate copy/skip/adopt + progress). Deferred: a real-AWS e2e of the server-side s3→s3 copy path.
 
 The data root was set-once (refused once a Catchment had published data or an existing root). It's now
 switchable, but only in one shape: an **empty + dormant** reset. This plan adds the two shapes that make

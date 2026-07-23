@@ -242,7 +242,7 @@ def test_switch_data_root_migrate_copies_then_adopts(tmp_path):
     a.write_text("{}", "catalog.json")                       # Iceberg pointer — must NOT travel
     a.child("pond.db").write_bytes(b"meta", "v1.metadata.json")  # Iceberg namespace — must NOT travel
 
-    driver.switch_data_root(str(tmp_path / "planeB"), mode="migrate")
+    driver.migrate(str(tmp_path / "planeB"))  # blocking: copies then adopts (runs to completion here)
 
     b = pond_data_dir(tmp_path, name, major, str(tmp_path / "planeB"))
     assert b.read_bytes("orders.parquet") == b"parquet-bytes"   # flat data copied
@@ -253,6 +253,9 @@ def test_switch_data_root_migrate_copies_then_adopts(tmp_path):
     start_f, end_f = db.execute("SELECT start_f, end_f FROM pond_state WHERE pond_id=?", (pond_id,)).fetchone()
     assert start_f == F and end_f == F                          # adopted the migrated freshness
     assert db.execute("SELECT COUNT(*) FROM pond_trigger").fetchone()[0] == 1  # demand kept → resumes
+    # Progress state reflects a completed copy of the one flat file (orders.parquet; sidecar counts too).
+    mig = driver.migration_status()
+    assert mig["status"] == "done" and mig["copied_files"] == mig["total_files"] and mig["total_files"] >= 1
 
 
 def test_status_carries_cloud_block(tmp_path, monkeypatch):

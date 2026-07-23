@@ -73,6 +73,14 @@ def _catchment_name(db) -> str:
     return rows.get("name") or rows.get("id") or "unknown"
 
 
+@router.get("/catchment/migration", dependencies=[auth.read])
+def get_migration(request: Request):
+    """The in-flight/last data-plane migration's progress: ``{status, target, pond, total_files,
+    total_bytes, copied_files, copied_bytes, error}`` (``status`` ∈ idle/copying/adopting/done/failed).
+    Read-gated so the UI can show a progress bar."""
+    return request.app.state.driver.migration_status()
+
+
 class _SettingsBody(BaseModel):
     data_root: str = ""       # an object-store URI (s3://…, gs://…) / path; empty → local (the state root)
     confirm: str | None = None  # must equal the catchment name to SWITCH once a root / data already exists
@@ -122,27 +130,51 @@ def put_settings(request: Request, body: _SettingsBody):
             acquire_lease(new_store, owner_id)
         except Exception as exc:
             raise HTTPException(status_code=409, detail=f"data root is in use: {exc}") from None
+    old_lease = getattr(app.state, "data_lease", None)
+
+    def _commit_switch() -> None:
+        # Persist the new root, release the previous store's lease, and refresh the cloud gate live (a
+        # switch can flip cloud enabled if creds are already present) — the backends + the cred banner.
+        cloud.set_setting(db, cloud.DATA_ROOT_KEY, new)  # None → deletes the setting (back to local)
+        if old_lease is not None:
+            try:
+                release_lease(old_lease[0], old_lease[1])
+            except Exception:
+                pass
+        app.state.data_root = new
+        app.state.data_lease = (new_store, owner_id) if new_store is not None else None
+        try:
+            from ..cloud_backends import refresh_cloud_backends, refresh_credential_status
+            refresh_cloud_backends(app)
+            refresh_credential_status(app.state, force=True)
+        except Exception:
+            pass
+
+    # 'migrate' copies the data first, which can be long — run it in the background and report progress via
+    # GET /api/catchment/migration; the switch commits only once the copy+adopt succeeds.
+    if body.mode == "migrate":
+        import threading
+
+        def _run_migration() -> None:
+            try:
+                app.state.driver.migrate(new)
+                _commit_switch()
+            except Exception:
+                # Migration failed → the old plane stays live; drop the NEW store lease we acquired.
+                if new_store is not None:
+                    try:
+                        release_lease(new_store, owner_id)
+                    except Exception:
+                        pass
+
+        threading.Thread(target=_run_migration, daemon=True).start()
+        return {**cloud.cloud_status(current, app.state.secret_store, getattr(app.state, "cloud_creds", None)),
+                "migrating": True}
+
     # Switch: quiesce, re-point (old location untouched). 'empty' resets + goes dormant; 'adopt' picks up
     # data already in the target (freshness from its sidecars) and resumes with no rebuild.
     app.state.driver.switch_data_root(new, mode=body.mode)
-    cloud.set_setting(db, cloud.DATA_ROOT_KEY, new)  # None → deletes the setting (back to local)
-    # Release the previous store's lease now that we've moved off it.
-    old_lease = getattr(app.state, "data_lease", None)
-    if old_lease is not None:
-        try:
-            release_lease(old_lease[0], old_lease[1])
-        except Exception:
-            pass
-    app.state.data_root = new
-    app.state.data_lease = (new_store, owner_id) if new_store is not None else None
-    # A switch can flip the cloud gate (creds may already be present) — build the remote backends live and
-    # re-validate the creds so the persistent banner is current. Guarded: never fail the switch.
-    try:
-        from ..cloud_backends import refresh_cloud_backends, refresh_credential_status
-        refresh_cloud_backends(app)
-        refresh_credential_status(app.state, force=True)
-    except Exception:
-        pass
+    _commit_switch()
     return cloud.cloud_status(new, app.state.secret_store, getattr(app.state, "cloud_creds", None))
 
 

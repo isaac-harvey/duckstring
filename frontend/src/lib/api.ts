@@ -439,6 +439,22 @@ export async function setDataRoot(dataRoot: string, confirm?: string, mode: 'emp
   return res.json();
 }
 
+// Progress of the in-flight/last data-plane migration (GET /catchment/migration).
+export interface MigrationStatus {
+  status: 'idle' | 'copying' | 'adopting' | 'done' | 'failed';
+  target?: string | null;
+  pond?: string | null;
+  total_files?: number;
+  total_bytes?: number;
+  copied_files?: number;
+  copied_bytes?: number;
+  error?: string | null;
+}
+
+export function fetchMigration(): Promise<MigrationStatus> {
+  return getJSON<MigrationStatus>('/catchment/migration');
+}
+
 export function fetchDuckPools(): Promise<DuckPool[]> {
   return getJSON<{ pools: DuckPool[] }>('/catchment/duck-pools').then((d) => d.pools);
 }

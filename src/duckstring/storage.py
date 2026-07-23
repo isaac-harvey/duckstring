@@ -559,22 +559,46 @@ def _copy_file(src: "Storage", dst: "Storage", name: str) -> None:
         dst.write_bytes(src.read_bytes(name), name)
 
 
-def copy_tree(src: "Storage", dst: "Storage", *, skip_top: "frozenset[str]" = frozenset()) -> int:
+def tree_size(src: "Storage", *, skip_top: "frozenset[str]" = frozenset()) -> "tuple[int, int]":
+    """``(file_count, byte_count)`` under ``src`` (recursive), with the same ``skip_top`` semantics as
+    :func:`copy_tree` — a metadata-only pass to seed a migration progress total. Missing/empty → ``(0, 0)``."""
+    if not src.exists() or not src.is_dir():
+        return (0, 0)
+    files, nbytes = 0, 0
+    for name in src.names():
+        if name in skip_top:
+            continue
+        files += 1
+        nbytes += src.size(name)
+    for sub in src.subdir_names():
+        if sub in skip_top:
+            continue
+        f, b = tree_size(src.child(sub))
+        files += f
+        nbytes += b
+    return (files, nbytes)
+
+
+def copy_tree(src: "Storage", dst: "Storage", *, skip_top: "frozenset[str]" = frozenset(), on_file=None) -> int:
     """Recursively copy every file under ``src`` into ``dst``, returning the file count. ``skip_top`` names
     (files or dirs) are skipped **at the top level only** — the data-plane migration passes the Iceberg
     ``catalog.json`` + ``pond.db`` namespace here (self-contained flat Parquet is carried; the absolute-
-    pathed Iceberg metadata is left behind and regenerated at the target). Uses :func:`_copy_file`, so it
-    is server-side for same-provider object stores. A missing/empty source is a no-op."""
+    pathed Iceberg metadata is left behind and regenerated at the target). ``on_file(nbytes)`` is called
+    after each file (for progress). Uses :func:`_copy_file`, so it is server-side for same-provider object
+    stores. A missing/empty source is a no-op."""
     if not src.exists() or not src.is_dir():
         return 0
     count = 0
     for name in src.names():
         if name in skip_top:
             continue
+        nbytes = src.size(name) if on_file else 0
         _copy_file(src, dst, name)
         count += 1
+        if on_file:
+            on_file(nbytes)
     for sub in src.subdir_names():
         if sub in skip_top:
             continue
-        count += copy_tree(src.child(sub), dst.child(sub))  # skip only applies at the top
+        count += copy_tree(src.child(sub), dst.child(sub), on_file=on_file)  # skip only applies at the top
     return count
