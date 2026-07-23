@@ -113,21 +113,24 @@ class IcebergDataPlane(DataPlane):
         # Flat-Parquet sidecar first (also the consistent fallback if the Iceberg commit fails). This also
         # runs ``data_dir.duckdb_setup(con)`` so the export connection can COPY to an object store.
         self._parquet.export(con, data_dir, mode=mode, f=f)
-        # Stamp _duckstring_f (a TIMESTAMPTZ) as UTC for Arrow: pyiceberg accepts only UTC-tz timestamps,
-        # and a registry written under a local session tz would otherwise fetch as e.g. tz=Australia/…
-        con.execute("SET TimeZone='UTC'")
-        cat = self._catalog(data_dir)
-        meta = trickle_io.read_meta(con)
         # Only plain **overwrite** tables go to Iceberg. A merge **main** is log-structured (a base + the
         # changelog) reconstructed on read; an **append-only** table (append history, ``__changelog``,
         # ``__droplog``) grows unboundedly in Iceberg metadata (its current snapshot references every data
         # file ever appended). Both are served from the flat parts layer the sidecar export already wrote
-        # above, so they are skipped here and ``_raw_read_select`` falls back to the flat read for them.
-        for table in tables:
-            if self._is_incremental(table, meta) or meta.get(table, {}).get("mode") == "merge":
-                continue
-            arrow = con.execute(f'SELECT * FROM "{table}"').fetch_arrow_table()
-            self._commit(cat, table, arrow, f, data_dir)
+        # above, so they are skipped here and the flat read serves them.
+        meta = trickle_io.read_meta(con)
+        committable = [t for t in tables
+                       if not (self._is_incremental(t, meta) or meta.get(t, {}).get("mode") == "merge")]
+        # Build the catalog only when there is actually something to commit — a merge/append-only Pond (the
+        # whole Trickle path) commits nothing, and building it would cost a wasted catalog.json round-trip.
+        if committable:
+            # Stamp _duckstring_f (a TIMESTAMPTZ) as UTC for Arrow: pyiceberg accepts only UTC-tz timestamps,
+            # and a registry written under a local session tz would otherwise fetch as e.g. tz=Australia/…
+            con.execute("SET TimeZone='UTC'")
+            cat = self._catalog(data_dir)
+            for table in committable:
+                arrow = con.execute(f'SELECT * FROM "{table}"').fetch_arrow_table()
+                self._commit(cat, table, arrow, f, data_dir)
 
     @staticmethod
     def _is_incremental(table: str, meta: dict) -> bool:
@@ -246,6 +249,11 @@ class IcebergDataPlane(DataPlane):
         except Exception:
             con.execute("INSTALL iceberg")
             con.execute("LOAD iceberg")
+
+    def _flat_read_select(self, data_dir: Path, table: str, *, as_of=None) -> str:
+        # The always-flat operands (merge base + companions, append-only tables) live only on the flat parts
+        # layer; read them directly and skip the pyiceberg catalog build entirely (no catalog.json I/O).
+        return self._parquet._raw_read_select(data_dir, table, as_of=as_of)
 
     def _raw_read_select(self, data_dir: Path, table: str, *, as_of=None) -> str:
         tbl = self._load(data_dir, table)

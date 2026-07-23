@@ -69,20 +69,39 @@ class DataPlane:
 
         data_dir = _as_storage(data_dir)
         meta = load_sidecar(data_dir).get(table, {})
-        if meta.get("mode") == "merge":
+        mode = meta.get("mode")
+        if mode == "merge":
             return self._reconstruct_select(data_dir, table, meta, as_of)
+        if mode == "append":
+            # An append-only Trickle is served from the flat parts layer — never the Iceberg catalog. Read it
+            # flat directly so the Iceberg plane doesn't build (and pay ~0.4s of catalog.json I/O over S3 for)
+            # a catalog it will only miss in.
+            return self._flat_read_select(data_dir, table, as_of=as_of)
         return self._raw_read_select(data_dir, table, as_of=as_of)
 
     def _raw_read_select(self, data_dir: Path, table: str, *, as_of=None) -> str:
         """A direct physical ``SELECT`` over a published table (no reconstruction) — the backend's storage
-        read. Used as-is for append/overwrite tables and as the base/changelog operands of a merge read."""
+        read. Used as-is for an **overwrite** table (which may live in the Iceberg catalog) and as the flat
+        fallback of :meth:`_flat_read_select`."""
         raise NotImplementedError
+
+    def _flat_read_select(self, data_dir: Path, table: str, *, as_of=None) -> str:
+        """A physical read that MUST bypass any catalog/metadata layer — the operands that are **always** flat
+        Parquet: a merge main's cold base and its ``__changelog`` / ``__band`` companions, and an append-only
+        table. The Iceberg base layer is overwrite-only, so these are never committed to it; reading them flat
+        skips the per-read pyiceberg catalog build (the dominant cost of a merge/append pipeline over S3). The
+        base backend has no catalog, so this defaults to the raw read; :class:`IcebergDataPlane` overrides it."""
+        return self._raw_read_select(data_dir, table, as_of=as_of)
 
     def _reconstruct_select(self, data_dir: Path, table: str, meta: dict, as_of=None) -> str:
         """Reconstruct a merge main's current state from its cold base + the warm tier (``__band``) ⊎ hot
-        ``__changelog`` (all read via :meth:`_raw_read_select`), per
+        ``__changelog`` (all read flat via :meth:`_flat_read_select`), per
         :func:`duckstring.trickle.io.reconstruct_sql`. The warm + hot freshness ranges are disjoint, so their
-        union is the changelog above the cold-base watermark with no double-count."""
+        union is the changelog above the cold-base watermark with no double-count.
+
+        S3-frugal: the cold **base** is read only when the sidecar says one exists (``f_base`` set = the main has
+        been checkpointed). An un-checkpointed main (the whole changelog is the state — the common case) then
+        skips a guaranteed-miss base probe, saving its round-trips over an object store."""
         from datetime import datetime
 
         from .trickle.io import changelog_name, reconstruct_sql, warm_name
@@ -90,13 +109,15 @@ class DataPlane:
         clogs = []
         for companion in (changelog_name(table), warm_name(table)):
             try:
-                clogs.append(self._raw_read_select(data_dir, companion, as_of=as_of))
+                clogs.append(self._flat_read_select(data_dir, companion, as_of=as_of))
             except FileNotFoundError:
                 pass
-        try:
-            base_sql = self._raw_read_select(data_dir, table, as_of=as_of)
-        except FileNotFoundError:
-            base_sql = None
+        base_sql = None
+        if meta.get("f_base"):  # a cold base exists only once checkpointed; else it's a certain miss
+            try:
+                base_sql = self._flat_read_select(data_dir, table, as_of=as_of)
+            except FileNotFoundError:
+                base_sql = None
         if not clogs:
             if base_sql is None:
                 raise FileNotFoundError(data_dir.uri(table))
@@ -120,13 +141,15 @@ class DataPlane:
         clogs = []
         for companion in (changelog_name(table), warm_name(table)):
             try:
-                clogs.append(self._raw_read_select(data_dir, companion, as_of=as_of))
+                clogs.append(self._flat_read_select(data_dir, companion, as_of=as_of))
             except FileNotFoundError:
                 pass
-        try:
-            base_sql = self._raw_read_select(data_dir, table, as_of=as_of)
-        except FileNotFoundError:
-            base_sql = None
+        base_sql = None
+        if meta.get("f_base"):  # a cold base exists only once checkpointed (see _reconstruct_select)
+            try:
+                base_sql = self._flat_read_select(data_dir, table, as_of=as_of)
+            except FileNotFoundError:
+                base_sql = None
         base_cnt = f"(SELECT count(*) FROM ({base_sql}))" if base_sql else "0"
         if not clogs:
             return f"SELECT {base_cnt}"
