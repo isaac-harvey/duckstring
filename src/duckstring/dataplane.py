@@ -112,12 +112,14 @@ class DataPlane:
                 clogs.append(self._flat_read_select(data_dir, companion, as_of=as_of))
             except FileNotFoundError:
                 pass
-        base_sql = None
-        if meta.get("f_base"):  # a cold base exists only once checkpointed; else it's a certain miss
-            try:
-                base_sql = self._flat_read_select(data_dir, table, as_of=as_of)
-            except FileNotFoundError:
-                base_sql = None
+        # Attempt the base regardless of f_base: a merge main can have a base with f_base unset — a **legacy
+        # single-file** base (`{table}.parquet`), or one restored/seeded outside the checkpoint path. Gating on
+        # f_base here dropped that base silently. FileNotFoundError (no base yet — the common un-checkpointed
+        # case) is the honest signal; the flat read raises it cheaply.
+        try:
+            base_sql = self._flat_read_select(data_dir, table, as_of=as_of)
+        except FileNotFoundError:
+            base_sql = None
         if not clogs:
             if base_sql is None:
                 raise FileNotFoundError(data_dir.uri(table))
@@ -144,12 +146,11 @@ class DataPlane:
                 clogs.append(self._flat_read_select(data_dir, companion, as_of=as_of))
             except FileNotFoundError:
                 pass
-        base_sql = None
-        if meta.get("f_base"):  # a cold base exists only once checkpointed (see _reconstruct_select)
-            try:
-                base_sql = self._flat_read_select(data_dir, table, as_of=as_of)
-            except FileNotFoundError:
-                base_sql = None
+        base_sql = None  # attempt the base regardless of f_base (a legacy single-file base has none) — see
+        try:            # _reconstruct_select; FileNotFoundError = no base yet (the common un-checkpointed case)
+            base_sql = self._flat_read_select(data_dir, table, as_of=as_of)
+        except FileNotFoundError:
+            base_sql = None
         base_cnt = f"(SELECT count(*) FROM ({base_sql}))" if base_sql else "0"
         if not clogs:
             return f"SELECT {base_cnt}"
