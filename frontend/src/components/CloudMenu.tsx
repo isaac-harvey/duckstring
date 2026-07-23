@@ -9,23 +9,40 @@ import { cpuLabel, defaultMemoryFor, FARGATE_CPU, FARGATE_MEMORY, memoryLabel } 
 import { useLiveStore } from '@/lib/store';
 import { InstanceTypePicker } from './InstanceTypePicker';
 
-// Catchment-level cloud config (plans/cloud-config.md, full access only). Two modes:
-//  • DISABLED → an enable flow: capture AWS creds (stored as AWS_* secrets, which the Catchment loads
-//    into its env) + a region + an S3 data root, then VERIFY (STS GetCallerIdentity + a bucket write
-//    probe) before committing the set-once data root.
-//  • ENABLED → the live config: the data root + the Duck Pools remote compute resolves against, with
-//    Fargate sizes as constrained cpu/memory dropdowns and EC2 types picked from the live AWS list.
+// Catchment-level cloud config (plans/cloud-config.md + plans/cloud-menu-redesign.md, full access only).
+// A modal with one section per concern: Status, Data plane, AWS credentials, Duck pools. Cloud enabling is
+// EMERGENT (a remote data root + valid AWS creds → the gate flips), not a wizard. Reverting to local is
+// always available (no creds, no target). The backend surface is unchanged.
 
 const input: React.CSSProperties = {
   width: '100%', boxSizing: 'border-box', background: '#1a1a1f', border: '1px solid #3f3f46',
-  borderRadius: 4, color: '#e4e4e7', padding: '4px 7px', fontSize: 12,
+  borderRadius: 4, color: '#e4e4e7', padding: '5px 8px', fontSize: 12,
 };
-const smallInput: React.CSSProperties = { ...input, fontSize: 11, padding: '3px 6px' };
+const smallInput: React.CSSProperties = { ...input, fontSize: 11, padding: '4px 7px' };
 const btn = (color: string, disabled: boolean): React.CSSProperties => ({
-  background: 'transparent', border: `1px solid ${color}`, color, borderRadius: 5, padding: '4px 12px',
+  background: 'transparent', border: `1px solid ${color}`, color, borderRadius: 5, padding: '5px 12px',
   fontSize: 12, cursor: disabled ? 'not-allowed' : 'pointer', opacity: disabled ? 0.5 : 1, fontWeight: 600,
+  fontFamily: 'inherit',
 });
-const heading: React.CSSProperties = { fontSize: 10, fontWeight: 700, color: '#a1a1aa', letterSpacing: '0.08em', marginBottom: 6 };
+const heading: React.CSSProperties = { fontSize: 10, fontWeight: 700, color: '#a1a1aa', letterSpacing: '0.08em' };
+const err = (m: string) => <div style={{ fontSize: 11, color: '#ef4444', wordBreak: 'break-word' }}>{m}</div>;
+
+const modalBackdrop: React.CSSProperties = {
+  position: 'fixed', inset: 0, zIndex: 1100, display: 'flex', alignItems: 'center', justifyContent: 'center',
+  background: 'rgba(9,9,11,0.78)', backdropFilter: 'blur(2px)', fontFamily: 'ui-monospace, SFMono-Regular, monospace',
+};
+
+function Section({ title, right, children }: { title: string; right?: React.ReactNode; children: React.ReactNode }) {
+  return (
+    <div style={{ border: '1px solid #27272a', borderRadius: 8, padding: '11px 13px', marginBottom: 10, background: '#141418' }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 9 }}>
+        <span style={heading}>{title}</span>
+        {right}
+      </div>
+      {children}
+    </div>
+  );
+}
 
 // A data root must be an object URI (s3://…) or an absolute path — a bare name would resolve to a LOCAL
 // relative folder (the backend rejects it; this soft-warns in the form first).
@@ -47,8 +64,8 @@ function fmtBytes(n: number): string {
   return `${n} B`;
 }
 
-// Polls the data-plane migration progress and shows a bar while a copy runs (and the outcome). Hidden
-// when idle. On completion it refreshes the parent settings (the data root has moved).
+// ─── Migration progress ──────────────────────────────────────────────────────
+
 function MigrationBanner({ onDone }: { onDone: () => void }) {
   const [mig, setMig] = useState<MigrationStatus | null>(null);
   const doneHandled = useRef(false);
@@ -65,7 +82,7 @@ function MigrationBanner({ onDone }: { onDone: () => void }) {
   useEffect(() => {
     if (status === 'done' && !doneHandled.current) {
       doneHandled.current = true;
-      const t = setTimeout(onDone, 1500);  // let the "complete" tick show, then refresh settings
+      const t = setTimeout(onDone, 1500);
       return () => clearTimeout(t);
     }
   }, [status, onDone]);
@@ -77,7 +94,7 @@ function MigrationBanner({ onDone }: { onDone: () => void }) {
   const pct = total > 0 ? Math.min(100, Math.round((copied / total) * 100)) : (status === 'copying' ? 0 : 100);
   const color = status === 'failed' ? '#ef4444' : status === 'done' ? '#22c55e' : '#06c4e6';
   return (
-    <div style={{ marginBottom: 8, border: `1px solid ${color}55`, background: `${color}12`, borderRadius: 6, padding: '6px 8px' }}>
+    <div style={{ marginBottom: 10, border: `1px solid ${color}55`, background: `${color}12`, borderRadius: 6, padding: '7px 9px' }}>
       <div style={{ fontSize: 11, color, fontWeight: 700, marginBottom: 3 }}>
         {status === 'copying' && `Migrating → ${mig.target || 'local'}`}
         {status === 'adopting' && 'Adopting migrated data…'}
@@ -95,78 +112,20 @@ function MigrationBanner({ onDone }: { onDone: () => void }) {
           </div>
         </>
       )}
-      {status === 'failed' && <div style={{ fontSize: 10, color: '#ef4444', wordBreak: 'break-word' }}>{mig.error}</div>}
+      {status === 'failed' && err(mig.error ?? 'failed')}
     </div>
   );
 }
 
-export function CloudMenu({ onClose }: { onClose: () => void }) {
-  const [settings, setSettings] = useState<CloudSettings | null>(null);
-  const [pools, setPools] = useState<DuckPool[]>([]);
-  const catchment = useLiveStore((s) => s.catchment);
-  const catchmentName = catchment?.name || catchment?.id || '';
-
-  const load = () => {
-    void fetchCloudSettings().then(setSettings).catch(() => setSettings(null));
-    void fetchDuckPools().then(setPools).catch(() => setPools([]));
-  };
-  useEffect(load, []);
-
-  const enabled = settings?.cloud_enabled;
-
-  return (
-    <div style={{
-      marginTop: 8, background: '#15151a', border: '1px solid #27272a', borderRadius: 8, padding: '9px 12px',
-      fontFamily: 'ui-monospace, SFMono-Regular, monospace', minWidth: 168,
-    }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
-        <span style={heading}>CLOUD</span>
-        <span role="button" onClick={onClose} style={{ cursor: 'pointer', color: '#52525b', fontSize: 13, lineHeight: 1 }}>✕</span>
-      </div>
-
-      {/* Gate summary — always shown. */}
-      <div style={{ fontSize: 11, color: '#a1a1aa', lineHeight: 1.6, marginBottom: 8 }}>
-        <div>data root: <span style={{ color: '#e4e4e7' }}>{settings?.data_root || '(local disk)'}</span></div>
-        <div>AWS creds: <span style={{ color: settings?.aws_configured ? '#22c55e' : '#71717a' }}>{settings?.aws_configured ? 'yes' : 'no'}</span></div>
-        <div>cloud: <span style={{ color: enabled ? '#22c55e' : '#71717a' }}>{enabled ? 'enabled' : 'disabled'}</span></div>
-      </div>
-
-      <MigrationBanner onDone={load} />
-
-      {/* Persistent warning: enabled but the creds are being rejected — remote compute is broken. */}
-      {enabled && settings?.creds_valid === false && (
-        <div style={{
-          fontSize: 11, lineHeight: 1.5, color: '#f59e0b', border: '1px solid #f59e0b66',
-          background: '#f59e0b14', borderRadius: 5, padding: '6px 8px', marginBottom: 8,
-        }}>
-          <div style={{ fontWeight: 700 }}>⚠ AWS credentials are not authenticating</div>
-          <div style={{ color: '#d4d4d8', marginTop: 2 }}>
-            Remote Duck launches will fail. {settings.creds_error && <span style={{ color: '#a1a1aa' }}>({settings.creds_error})</span>}
-          </div>
-          <div style={{ color: '#a1a1aa', marginTop: 2 }}>Update the credentials below, then Verify.</div>
-        </div>
-      )}
-
-      {/* The data-plane switcher is available whenever a root is set — even if cloud is disabled (a local
-          path, or a mis-typed root), so you can always re-point or revert to local and are never stranded. */}
-      {settings?.data_root && <DataPlaneSection settings={settings} catchmentName={catchmentName} reload={load} />}
-      {/* First attach (no root yet): capture creds + the root together. */}
-      {settings && !settings.data_root && <EnableFlow settings={settings} catchmentName={catchmentName} onEnabled={load} />}
-      {/* Remote compute config (pools + cred fixup) — only meaningful once cloud is enabled. */}
-      {enabled && <EnabledConfig settings={settings!} pools={pools} reload={load} />}
-    </div>
-  );
-}
+// ─── The empty/adopt/migrate choice ──────────────────────────────────────────
 
 type SwitchMode = 'empty' | 'adopt' | 'migrate';
 
-// The empty/adopt/migrate choice + a mode-aware explanation, shared by the first-time enable flow and the
-// Data Plane switcher. All three keep the CURRENT location intact as a backup.
-function SwitchModeChoice({ mode, setMode, catchmentName }: { mode: SwitchMode; setMode: (m: SwitchMode) => void; catchmentName: string }) {
+function SwitchModeChoice({ mode, setMode }: { mode: SwitchMode; setMode: (m: SwitchMode) => void }) {
   const chip = (m: SwitchMode, label: string, hint: string) => (
     <button key={m} onClick={() => setMode(m)} title={hint} style={{
       flex: 1, background: 'transparent', border: `1px solid ${mode === m ? '#f59e0b' : '#3f3f46'}`,
-      color: mode === m ? '#f59e0b' : '#a1a1aa', borderRadius: 5, padding: '3px 5px', fontSize: 10,
+      color: mode === m ? '#f59e0b' : '#a1a1aa', borderRadius: 5, padding: '4px 5px', fontSize: 10,
       cursor: 'pointer', fontFamily: 'inherit',
     }}>{label}</button>
   );
@@ -182,223 +141,138 @@ function SwitchModeChoice({ mode, setMode, catchmentName }: { mode: SwitchMode; 
         {chip('adopt', 'Adopt existing', 'The target already holds this Catchment’s data — pick it up and resume, no rebuild.')}
         {chip('migrate', 'Migrate (copy)', 'Copy the current data to the target (server-side where possible), then resume — no rebuild.')}
       </div>
-      <div style={{ fontSize: 10, color: '#f59e0b', lineHeight: 1.4 }}>
-        {blurb}{' '}The current location is kept intact as a backup. Type <b>{catchmentName}</b> to confirm.
-      </div>
+      <div style={{ fontSize: 10, color: '#f59e0b', lineHeight: 1.4 }}>{blurb} The current location is kept intact as a backup.</div>
     </>
   );
 }
 
-// ─── Enable flow (shown while cloud is disabled) ─────────────────────────────
+// ─── Data plane ──────────────────────────────────────────────────────────────
 
-function EnableFlow({ settings, catchmentName, onEnabled }:
-  { settings: CloudSettings; catchmentName: string; onEnabled: () => void }) {
-  const [akid, setAkid] = useState('');
-  const [secret, setSecret_] = useState('');
-  const [region, setRegion] = useState('');
-  const [root, setRoot] = useState('');
+function DataPlanePanel({ settings, catchmentName, reload }:
+  { settings: CloudSettings; catchmentName: string; reload: () => void }) {
+  const [target, setTarget] = useState('');
   const [confirm, setConfirm] = useState('');
-  const [mode, setMode] = useState<SwitchMode>('migrate');  // moving local data up → carry it by default
+  const [mode, setMode] = useState<SwitchMode>('migrate');  // changing to a new plane usually means carry the data
   const [busy, setBusy] = useState(false);
-  const [err, setErr] = useState<string | null>(null);
-  const [result, setResult] = useState<CloudVerifyResult | null>(null);
+  const [e, setE] = useState<string | null>(null);
 
-  const needsCreds = !settings.aws_configured;
-  const needsRoot = !settings.data_root;
-  // Attaching a data plane to a Catchment that already published locally is a plane SWITCH — the backend
-  // requires the catchment name as confirmation, and the operator picks what happens to the local data.
-  const needsConfirm = needsRoot && settings.has_data;
+  const confirmed = confirm.trim() === catchmentName && catchmentName !== '';
 
-  const run = async () => {
-    setErr(null); setResult(null); setBusy(true);
+  const applyBucket = async () => {
+    setE(null); setBusy(true);
     try {
-      // 1. Store the creds as AWS_* secrets — the Catchment loads them into its env on set.
-      if (akid.trim()) await setSecret('AWS_ACCESS_KEY_ID', akid.trim());
-      if (secret.trim()) await setSecret('AWS_SECRET_ACCESS_KEY', secret.trim());
-      if (region.trim()) await setSecret('AWS_DEFAULT_REGION', region.trim());
-      // 2. Verify the creds (and probe the bucket if a fresh data root was given).
-      const probeRoot = needsRoot ? root.trim() : '';
-      const res = await verifyCloud(probeRoot || undefined);
-      setResult(res);
-      if (!res.ok) return;
-      // 3. Commit the data root only once creds check out and the bucket is writable. When the Catchment
-      //    already has local data, honour the chosen mode (migrate carries it up; empty resets; adopt
-      //    picks up a pre-populated bucket).
-      if (probeRoot && res.bucket_ok !== false) {
-        await setDataRoot(probeRoot, needsConfirm ? confirm.trim() : undefined, needsConfirm ? mode : 'empty');
-      }
-      onEnabled();
-    } catch (e) {
-      setErr(e instanceof Error ? e.message : 'failed');
-    } finally {
-      setBusy(false);
-    }
+      await setDataRoot(target.trim(), confirm.trim(), mode);
+      setTarget(''); setConfirm(''); reload();
+    } catch (ex) { setE(ex instanceof Error ? ex.message : 'failed'); } finally { setBusy(false); }
+  };
+  const revertLocal = async () => {
+    setE(null); setBusy(true);
+    try {
+      await setDataRoot('', undefined, 'adopt');  // no confirm / creds needed; adopt restores local data
+      setTarget(''); setConfirm(''); reload();
+    } catch (ex) { setE(ex instanceof Error ? ex.message : 'failed'); } finally { setBusy(false); }
   };
 
-  const canRun = !busy && (
-    (needsCreds ? akid.trim() !== '' && secret.trim() !== '' : true) &&
-    (needsRoot ? root.trim() !== '' : true) &&
-    (needsConfirm ? confirm.trim() === catchmentName : true) &&
-    (needsCreds || needsRoot)
-  );
-
+  const onLocal = !settings.data_root;
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-      <div style={{ fontSize: 10, color: '#52525b', lineHeight: 1.5, marginBottom: 2 }}>
-        Enable remote compute: AWS credentials + an S3 data root a remote box can read. Verified before
-        anything is committed. Credentials are sent over the wire — use HTTPS.
+    <Section title="DATA PLANE">
+      <div style={{ fontSize: 11, color: '#a1a1aa', marginBottom: 9 }}>
+        current: <span style={{ color: '#e4e4e7' }}>{settings.data_root || '(local disk)'}</span>
+        {onLocal ? '' : <span style={{ color: '#52525b' }}> · {settings.data_root_remote ? 'object store' : 'local path'}</span>}
       </div>
 
-      {needsCreds ? (
-        <>
-          <input value={akid} onChange={(e) => setAkid(e.target.value)} placeholder="AWS access key ID" style={input} autoComplete="off" />
-          <input value={secret} onChange={(e) => setSecret_(e.target.value)} placeholder="AWS secret access key" type="password" style={input} autoComplete="off" />
-          <input value={region} onChange={(e) => setRegion(e.target.value)} placeholder="region (e.g. us-east-1)" style={input} />
-        </>
-      ) : (
-        <div style={{ fontSize: 11, color: '#22c55e' }}>AWS credentials already configured ✓</div>
-      )}
+      {/* Change to a bucket / absolute path. */}
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+        <div style={{ fontSize: 10, color: '#71717a' }}>Point the data plane at a new location:</div>
+        <input value={target} onChange={(ev) => setTarget(ev.target.value)} placeholder="s3://bucket/prefix" style={smallInput} />
+        {bareRootHint(target)}
+        <SwitchModeChoice mode={mode} setMode={setMode} />
+        <input value={confirm} onChange={(ev) => setConfirm(ev.target.value)} placeholder={`type ${catchmentName} to confirm`} style={smallInput} />
+        {e && err(e)}
+        <button onClick={applyBucket} disabled={busy || !confirmed || !target.trim()} style={btn('#f59e0b', busy || !confirmed || !target.trim())}>
+          {busy ? 'Working…' : 'Apply'}
+        </button>
+      </div>
 
-      {needsRoot ? (
-        <>
-          <input value={root} onChange={(e) => setRoot(e.target.value)} placeholder="s3://bucket/prefix" style={input} />
-          {bareRootHint(root)}
-        </>
-      ) : (
-        <div style={{ fontSize: 11, color: '#22c55e' }}>data root set: {settings.data_root} ✓</div>
-      )}
-
-      {needsConfirm && (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
-          <div style={{ fontSize: 10, color: '#a1a1aa', lineHeight: 1.4 }}>
-            This Catchment has local data — choose what happens to it when the bucket is attached:
+      {/* The always-available escape hatch — no creds, no target, no confirm. */}
+      {!onLocal && (
+        <div style={{ marginTop: 10, paddingTop: 9, borderTop: '1px solid #27272a' }}>
+          <button onClick={revertLocal} disabled={busy} style={btn('#a1a1aa', busy)}
+                  title="Point the data plane back at local disk and pick up your local data. No credentials needed.">
+            Revert to local disk
+          </button>
+          <div style={{ fontSize: 10, color: '#52525b', marginTop: 4, lineHeight: 1.4 }}>
+            Always available — needs no credentials. Adopts your local data; the current location is kept.
           </div>
-          <SwitchModeChoice mode={mode} setMode={setMode} catchmentName={catchmentName} />
-          <input value={confirm} onChange={(e) => setConfirm(e.target.value)} placeholder={catchmentName} style={input} />
         </div>
       )}
-
-      {result && (
-        <div style={{ fontSize: 10, lineHeight: 1.5, wordBreak: 'break-word',
-                      color: result.ok ? '#22c55e' : '#ef4444', border: `1px solid ${result.ok ? '#22c55e40' : '#ef444440'}`,
-                      borderRadius: 4, padding: '4px 6px' }}>
-          {result.ok ? (
-            <>
-              <div>authenticated ✓ {result.arn}</div>
-              {result.account && <div style={{ color: '#71717a' }}>account {result.account}{result.region ? ` · ${result.region}` : ''}</div>}
-              {result.bucket_ok === true && <div>bucket writable ✓</div>}
-              {result.bucket_ok === false && <div style={{ color: '#ef4444' }}>bucket not writable: {result.bucket_error}</div>}
-            </>
-          ) : (
-            <div>verification failed: {result.error}</div>
-          )}
-        </div>
-      )}
-      {err && <div style={{ fontSize: 11, color: '#ef4444', wordBreak: 'break-word' }}>{err}</div>}
-
-      <button onClick={run} disabled={!canRun} style={btn('#06c4e6', !canRun)}>
-        {busy ? 'Verifying…' : 'Verify & enable'}
-      </button>
-    </div>
+    </Section>
   );
 }
 
-// ─── Enabled config (data root + Duck Pools with real dropdowns) ─────────────
+// ─── AWS credentials ─────────────────────────────────────────────────────────
 
-function FixCredentials({ reload }: { reload: () => void }) {
+function CredentialsPanel({ settings, reload }: { settings: CloudSettings; reload: () => void }) {
   const [akid, setAkid] = useState('');
   const [secret, setSecret_] = useState('');
   const [region, setRegion] = useState('');
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState<CloudVerifyResult | null>(null);
-  const [err, setErr] = useState<string | null>(null);
+  const [e, setE] = useState<string | null>(null);
 
-  const save = async () => {
-    setErr(null); setResult(null); setBusy(true);
+  const run = async (withSave: boolean) => {
+    setE(null); setResult(null); setBusy(true);
     try {
-      if (akid.trim()) await setSecret('AWS_ACCESS_KEY_ID', akid.trim());
-      if (secret.trim()) await setSecret('AWS_SECRET_ACCESS_KEY', secret.trim());
-      if (region.trim()) await setSecret('AWS_DEFAULT_REGION', region.trim());
+      if (withSave) {
+        if (akid.trim()) await setSecret('AWS_ACCESS_KEY_ID', akid.trim());
+        if (secret.trim()) await setSecret('AWS_SECRET_ACCESS_KEY', secret.trim());
+        if (region.trim()) await setSecret('AWS_DEFAULT_REGION', region.trim());
+      }
       const res = await verifyCloud();
       setResult(res);
-      if (res.ok) { setAkid(''); setSecret_(''); reload(); }
-    } catch (e) {
-      setErr(e instanceof Error ? e.message : 'failed');
-    } finally {
-      setBusy(false);
-    }
+      if (res.ok) { setAkid(''); setSecret_(''); }
+      reload();
+    } catch (ex) { setE(ex instanceof Error ? ex.message : 'failed'); } finally { setBusy(false); }
   };
+
+  const badge = settings.aws_configured
+    ? (settings.creds_valid === false
+        ? <span style={{ fontSize: 10, color: '#ef4444' }}>configured · failing ✗</span>
+        : settings.creds_valid
+          ? <span style={{ fontSize: 10, color: '#22c55e' }}>configured · valid ✓</span>
+          : <span style={{ fontSize: 10, color: '#a1a1aa' }}>configured</span>)
+    : <span style={{ fontSize: 10, color: '#71717a' }}>not set</span>;
 
   const canSave = !busy && akid.trim() !== '' && secret.trim() !== '';
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginBottom: 12 }}>
-      <div style={heading}>UPDATE CREDENTIALS</div>
-      <input value={akid} onChange={(e) => setAkid(e.target.value)} placeholder="AWS access key ID" style={smallInput} autoComplete="off" />
-      <input value={secret} onChange={(e) => setSecret_(e.target.value)} placeholder="AWS secret access key" type="password" style={smallInput} autoComplete="off" />
-      <input value={region} onChange={(e) => setRegion(e.target.value)} placeholder="region (optional — leave to keep)" style={smallInput} />
-      {result && !result.ok && <div style={{ fontSize: 11, color: '#ef4444', wordBreak: 'break-word' }}>still failing: {result.error}</div>}
-      {err && <div style={{ fontSize: 11, color: '#ef4444', wordBreak: 'break-word' }}>{err}</div>}
-      <button onClick={save} disabled={!canSave} style={btn('#f59e0b', !canSave)}>{busy ? 'Verifying…' : 'Save & verify'}</button>
-    </div>
-  );
-}
-
-function DataPlaneSection({ settings, catchmentName, reload }:
-  { settings: CloudSettings; catchmentName: string; reload: () => void }) {
-  const [open, setOpen] = useState(false);
-  const [target, setTarget] = useState('');   // new data root ('' = local)
-  const [confirm, setConfirm] = useState('');
-  const [mode, setMode] = useState<SwitchMode>('empty');
-  const [busy, setBusy] = useState(false);
-  const [err, setErr] = useState<string | null>(null);
-
-  const switchTo = async (toLocal: boolean) => {
-    setErr(null); setBusy(true);
-    try {
-      await setDataRoot(toLocal ? '' : target.trim(), confirm.trim(), mode);
-      setTarget(''); setConfirm(''); setOpen(false);
-      reload();
-    } catch (e) {
-      setErr(e instanceof Error ? e.message : 'failed');
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const confirmed = confirm.trim() === catchmentName && catchmentName !== '';
-  return (
-    <div style={{ marginBottom: 12 }}>
-      <div style={heading}>DATA PLANE</div>
-      <div style={{ fontSize: 11, color: '#a1a1aa', marginBottom: 4 }}>
-        current: <span style={{ color: '#e4e4e7' }}>{settings.data_root || '(local disk)'}</span>
-      </div>
-      {!open ? (
-        <button onClick={() => setOpen(true)} style={btn('#f59e0b', false)}>Switch data plane…</button>
-      ) : (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-          <SwitchModeChoice mode={mode} setMode={setMode} catchmentName={catchmentName} />
-          <input value={target} onChange={(e) => setTarget(e.target.value)} placeholder="s3://bucket/prefix (blank = local)" style={smallInput} />
-          {bareRootHint(target)}
-          <input value={confirm} onChange={(e) => setConfirm(e.target.value)} placeholder={`type ${catchmentName}`} style={smallInput} />
-          {err && <div style={{ fontSize: 11, color: '#ef4444', wordBreak: 'break-word' }}>{err}</div>}
-          <div style={{ display: 'flex', gap: 6 }}>
-            <button onClick={() => switchTo(false)} disabled={busy || !confirmed || !target.trim()} style={btn('#f59e0b', busy || !confirmed || !target.trim())}>
-              {busy ? 'Switching…' : 'Switch to bucket'}
-            </button>
-            <button onClick={() => switchTo(true)} disabled={busy || !confirmed} style={btn('#a1a1aa', busy || !confirmed)}
-                    title="Point the data plane back at local disk">
-              Switch to local
-            </button>
-          </div>
-          <button onClick={() => { setOpen(false); setErr(null); }} style={{ ...btn('#52525b', false), alignSelf: 'flex-start' }}>Cancel</button>
+    <Section title="AWS CREDENTIALS" right={badge}>
+      {settings.creds_valid === false && (
+        <div style={{ fontSize: 11, color: '#f59e0b', marginBottom: 7 }}>
+          ⚠ The stored credentials are not authenticating{settings.creds_error ? <span style={{ color: '#a1a1aa' }}> ({settings.creds_error})</span> : null}. Remote Duck launches will fail — update them below.
         </div>
       )}
-    </div>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+        <input value={akid} onChange={(ev) => setAkid(ev.target.value)} placeholder="AWS access key ID" style={smallInput} autoComplete="off" />
+        <input value={secret} onChange={(ev) => setSecret_(ev.target.value)} placeholder="AWS secret access key" type="password" style={smallInput} autoComplete="off" />
+        <input value={region} onChange={(ev) => setRegion(ev.target.value)} placeholder="region (e.g. us-east-1)" style={smallInput} />
+        {result && (result.ok
+          ? <div style={{ fontSize: 10, color: '#22c55e', wordBreak: 'break-word' }}>authenticated ✓ {result.arn}{result.account ? ` · account ${result.account}` : ''}</div>
+          : err(`verification failed: ${result.error}`))}
+        {e && err(e)}
+        <div style={{ display: 'flex', gap: 6 }}>
+          <button onClick={() => run(true)} disabled={!canSave} style={btn('#f59e0b', !canSave)}>{busy ? 'Verifying…' : 'Save & verify'}</button>
+          <button onClick={() => run(false)} disabled={busy || !settings.aws_configured} style={btn('#a1a1aa', busy || !settings.aws_configured)}
+                  title="Re-check the stored credentials">Verify</button>
+        </div>
+        <div style={{ fontSize: 10, color: '#52525b', lineHeight: 1.4 }}>Sent over the wire — use HTTPS. Stored write-only.</div>
+      </div>
+    </Section>
   );
 }
 
-function EnabledConfig({ settings, pools, reload }:
-  { settings: CloudSettings; pools: DuckPool[]; reload: () => void }) {
+// ─── Duck pools ──────────────────────────────────────────────────────────────
+
+function PoolsPanel({ enabled, pools, reload }: { enabled: boolean; pools: DuckPool[]; reload: () => void }) {
   const [busy, setBusy] = useState(false);
   const [pName, setPName] = useState('');
   const [pProvider, setPProvider] = useState('fargate');
@@ -425,21 +299,17 @@ function EnabledConfig({ settings, pools, reload }:
         memory: pProvider === 'fargate' && pMem ? Number(pMem) : null,
         region: pProvider === 'ec2' && pRegion.trim() ? pRegion.trim() : null,
       });
-      setPName(''); setPType(''); setPRegion('');
-      reload();
-    } catch (e) {
-      setPErr(e instanceof Error ? e.message : 'failed');
-    } finally {
-      setBusy(false);
-    }
+      setPName(''); setPType(''); setPRegion(''); reload();
+    } catch (e) { setPErr(e instanceof Error ? e.message : 'failed'); } finally { setBusy(false); }
   };
 
   return (
-    <>
-      {settings.creds_valid === false && <FixCredentials reload={reload} />}
-
-
-      <div style={heading}>DUCK POOLS</div>
+    <Section title="DUCK POOLS">
+      {!enabled && (
+        <div style={{ fontSize: 10, color: '#71717a', marginBottom: 8, lineHeight: 1.4 }}>
+          Pools are inert until cloud is enabled (a remote data root + valid AWS credentials).
+        </div>
+      )}
       {pools.map((p) => {
         const spec = (p.provider || 'fargate') === 'fargate'
           ? (p.cpu || p.memory ? `${p.cpu ?? '?'}cpu / ${p.memory ?? '?'}MiB` : '—')
@@ -457,7 +327,6 @@ function EnabledConfig({ settings, pools, reload }:
           </div>
         );
       })}
-
       <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 6 }}>
         <input value={pName} onChange={(e) => setPName(e.target.value)} placeholder="pool name (e.g. heavy)" style={smallInput} />
         <select value={pProvider} onChange={(e) => setPProvider(e.target.value)} style={smallInput}>
@@ -479,11 +348,64 @@ function EnabledConfig({ settings, pools, reload }:
             <InstanceTypePicker value={pType} onCommit={setPType} region={pRegion.trim() || undefined} style={smallInput} />
           </>
         )}
-        {pErr && <div style={{ fontSize: 11, color: '#ef4444', wordBreak: 'break-word' }}>{pErr}</div>}
-        <button onClick={addPool} disabled={busy || !pName.trim()} style={btn('#22c55e', busy || !pName.trim())}>
-          Add pool
-        </button>
+        {pErr && err(pErr)}
+        <button onClick={addPool} disabled={busy || !pName.trim()} style={btn('#22c55e', busy || !pName.trim())}>Add pool</button>
       </div>
-    </>
+    </Section>
+  );
+}
+
+// ─── The modal ───────────────────────────────────────────────────────────────
+
+export function CloudMenu({ onClose }: { onClose: () => void }) {
+  const [settings, setSettings] = useState<CloudSettings | null>(null);
+  const [pools, setPools] = useState<DuckPool[]>([]);
+  const catchment = useLiveStore((s) => s.catchment);
+  const catchmentName = catchment?.name || catchment?.id || '';
+
+  const load = () => {
+    void fetchCloudSettings().then(setSettings).catch(() => setSettings(null));
+    void fetchDuckPools().then(setPools).catch(() => setPools([]));
+  };
+  useEffect(load, []);
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => e.key === 'Escape' && onClose();
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose]);
+
+  const enabled = !!settings?.cloud_enabled;
+  const statusBadge = !settings ? null : enabled
+    ? (settings.creds_valid === false
+        ? <span style={{ fontSize: 11, color: '#f59e0b', fontWeight: 700 }}>enabled · creds failing</span>
+        : <span style={{ fontSize: 11, color: '#22c55e', fontWeight: 700 }}>enabled</span>)
+    : <span style={{ fontSize: 11, color: '#71717a', fontWeight: 700 }}>disabled</span>;
+
+  return (
+    <div onClick={onClose} style={modalBackdrop}>
+      <div onClick={(e) => e.stopPropagation()} style={{
+        background: '#15151a', border: '1px solid #27272a', borderRadius: 10, width: 'min(560px, 94vw)',
+        maxHeight: '86vh', display: 'flex', flexDirection: 'column', overflow: 'hidden', color: '#e4e4e7',
+      }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '12px 16px', borderBottom: '1px solid #27272a', flexShrink: 0 }}>
+          <span style={{ fontSize: 13, fontWeight: 700 }}>Cloud</span>
+          {statusBadge}
+          {!enabled && settings && (
+            <span style={{ fontSize: 10, color: '#52525b' }}>needs a remote data root + AWS credentials</span>
+          )}
+          <button onClick={onClose} title="Close (Esc)"
+                  style={{ marginLeft: 'auto', background: 'transparent', border: '1px solid #3f3f46', borderRadius: 5,
+                           color: '#a1a1aa', fontSize: 13, lineHeight: 1, padding: '4px 9px', cursor: 'pointer', fontFamily: 'inherit' }}>
+            ✕
+          </button>
+        </div>
+        <div style={{ overflowY: 'auto', padding: '12px 16px', minHeight: 0 }}>
+          <MigrationBanner onDone={load} />
+          {settings && <DataPlanePanel settings={settings} catchmentName={catchmentName} reload={load} />}
+          {settings && <CredentialsPanel settings={settings} reload={load} />}
+          <PoolsPanel enabled={enabled} pools={pools} reload={load} />
+        </div>
+      </div>
+    </div>
   );
 }

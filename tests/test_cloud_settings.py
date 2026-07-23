@@ -144,6 +144,15 @@ def test_switch_configured_root_needs_confirm_and_can_go_local(tmp_path):
     assert client.app.state.driver.data_root is None
 
 
+def test_revert_to_local_needs_no_confirm(tmp_path):
+    # Reverting to local disk is the escape hatch — always allowed, no catchment-name confirmation (it
+    # needs no creds and keeps the old location intact).
+    client, _ = _client(tmp_path, data_root="s3://bucket/a")
+    r = client.put("/api/catchment/settings", json={"data_root": "", "mode": "adopt"})
+    assert r.status_code == 200 and r.json()["data_root"] is None
+    assert client.app.state.driver.data_root is None
+
+
 def test_switch_data_root_empties_and_stays_dormant(tmp_path):
     from duckstring.catchment.driver import _iso
     from duckstring.engine.core import NEVER

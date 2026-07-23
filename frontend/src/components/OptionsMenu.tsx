@@ -212,7 +212,7 @@ export function TopBar() {
 
           {panel === 'secrets' && <Popout onClose={() => setPanel(null)}><SecretsMenu onClose={() => setPanel(null)} /></Popout>}
           {panel === 'alerts' && <Popout onClose={() => setPanel(null)}><AlertsMenu onClose={() => setPanel(null)} /></Popout>}
-          {panel === 'cloud' && <Popout onClose={() => setPanel(null)}><CloudMenu onClose={() => setPanel(null)} /></Popout>}
+          {panel === 'cloud' && <CloudMenu onClose={() => setPanel(null)} />}
         </div>
       )}
     </div>

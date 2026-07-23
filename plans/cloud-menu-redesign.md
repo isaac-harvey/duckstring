@@ -1,9 +1,10 @@
 # Cloud menu redesign — a modal with coherent sections
 
-Status: **to build.** The Cloud config outgrew its dropdown popup (creds + data root + pools + migration
-progress all crammed in), and the two-UI split (onboarding EnableFlow vs the switcher) made basic actions
-— like reverting to local — unreachable or wrongly gated. Redesign as a **full modal** with one section
-per concern.
+Status: **built.** `CloudMenu` is now a full modal (Status header + Data plane / AWS credentials / Duck
+pools sections + migration banner), opened straight from Options → Cloud (no Popout). Reverting to local
+is a dedicated always-available button that needs no confirm/creds (backend relaxed: confirm is required
+only when switching to a non-local target). Enabling is emergent (set a remote root + valid creds). Tested
+in `tests/test_cloud_settings.py`; frontend tsc/eslint/build green.
 
 ## Problems being fixed
 

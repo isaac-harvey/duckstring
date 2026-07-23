@@ -123,10 +123,11 @@ def put_settings(request: Request, body: _SettingsBody):
             raise HTTPException(status_code=422, detail=(
                 f"data_root must be an object-store URI (s3://…, gs://…) or an absolute path — got {new!r}. "
                 f"A bare name is treated as a LOCAL relative directory; an S3 bucket needs the s3:// prefix."))
-    # A switch rebuilds the pipeline — gate it behind the catchment name once there's an existing root or
-    # any published data, so it isn't done by accident (a first attach on an empty Catchment is free).
+    # A switch to a NON-local target is gated behind the catchment name once there's an existing root or
+    # published data (so it isn't done by accident). Reverting to local (new is None) is the safe escape
+    # hatch — always allowed without confirmation (it needs no creds and keeps the old location intact).
     name = _catchment_name(db)
-    if (current is not None or cloud.has_published_data(db)) and (body.confirm or "") != name:
+    if new is not None and (current is not None or cloud.has_published_data(db)) and (body.confirm or "") != name:
         raise HTTPException(status_code=422, detail=(
             f"switching the data root empties the data plane (every Pond is left with no data and idle — "
             f"no auto-rebuild; the old location is kept as a backup); confirm by passing the catchment "
