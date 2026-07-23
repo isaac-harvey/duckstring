@@ -157,6 +157,7 @@ function DataPlanePanel({ settings, catchmentName, reload }:
   const [e, setE] = useState<string | null>(null);
 
   const confirmed = confirm.trim() === catchmentName && catchmentName !== '';
+  const validTarget = target.trim() !== '' && !looksBareRoot(target);
 
   const applyBucket = async () => {
     setE(null); setBusy(true);
@@ -181,17 +182,22 @@ function DataPlanePanel({ settings, catchmentName, reload }:
         {onLocal ? '' : <span style={{ color: '#52525b' }}> · {settings.data_root_remote ? 'object store' : 'local path'}</span>}
       </div>
 
-      {/* Change to a bucket / absolute path. */}
+      {/* Change to a bucket / absolute path. The mode + confirm + apply appear only once a valid target
+          is entered (a bare name is not a valid data root). */}
       <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
         <div style={{ fontSize: 10, color: '#71717a' }}>Point the data plane at a new location:</div>
         <input value={target} onChange={(ev) => setTarget(ev.target.value)} placeholder="s3://bucket/prefix" style={smallInput} />
         {bareRootHint(target)}
-        <SwitchModeChoice mode={mode} setMode={setMode} />
-        <input value={confirm} onChange={(ev) => setConfirm(ev.target.value)} placeholder={`type ${catchmentName} to confirm`} style={smallInput} />
+        {validTarget && (
+          <>
+            <SwitchModeChoice mode={mode} setMode={setMode} />
+            <input value={confirm} onChange={(ev) => setConfirm(ev.target.value)} placeholder={`type ${catchmentName} to confirm`} style={smallInput} />
+            <button onClick={applyBucket} disabled={busy || !confirmed} style={btn('#f59e0b', busy || !confirmed)}>
+              {busy ? 'Working…' : 'Apply'}
+            </button>
+          </>
+        )}
         {e && err(e)}
-        <button onClick={applyBucket} disabled={busy || !confirmed || !target.trim()} style={btn('#f59e0b', busy || !confirmed || !target.trim())}>
-          {busy ? 'Working…' : 'Apply'}
-        </button>
       </div>
 
       {/* The always-available escape hatch — no creds, no target, no confirm. */}
@@ -272,7 +278,7 @@ function CredentialsPanel({ settings, reload }: { settings: CloudSettings; reloa
 
 // ─── Duck pools ──────────────────────────────────────────────────────────────
 
-function PoolsPanel({ enabled, pools, reload }: { enabled: boolean; pools: DuckPool[]; reload: () => void }) {
+function PoolsPanel({ pools, reload }: { pools: DuckPool[]; reload: () => void }) {
   const [busy, setBusy] = useState(false);
   const [pName, setPName] = useState('');
   const [pProvider, setPProvider] = useState('fargate');
@@ -305,11 +311,6 @@ function PoolsPanel({ enabled, pools, reload }: { enabled: boolean; pools: DuckP
 
   return (
     <Section title="DUCK POOLS">
-      {!enabled && (
-        <div style={{ fontSize: 10, color: '#71717a', marginBottom: 8, lineHeight: 1.4 }}>
-          Pools are inert until cloud is enabled (a remote data root + valid AWS credentials).
-        </div>
-      )}
       {pools.map((p) => {
         const spec = (p.provider || 'fargate') === 'fargate'
           ? (p.cpu || p.memory ? `${p.cpu ?? '?'}cpu / ${p.memory ?? '?'}MiB` : '—')
@@ -403,7 +404,7 @@ export function CloudMenu({ onClose }: { onClose: () => void }) {
           <MigrationBanner onDone={load} />
           {settings && <DataPlanePanel settings={settings} catchmentName={catchmentName} reload={load} />}
           {settings && <CredentialsPanel settings={settings} reload={load} />}
-          <PoolsPanel enabled={enabled} pools={pools} reload={load} />
+          {enabled && <PoolsPanel pools={pools} reload={load} />}
         </div>
       </div>
     </div>

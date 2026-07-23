@@ -803,18 +803,17 @@ class Driver:
             for name, src, dst in plan:
                 self.migration["pond"] = name
                 copy_tree(src, dst, skip_top=self._MIGRATE_SKIP, on_file=_on)
-            # Phase 3 (locked): re-point + adopt the freshly-populated target.
+            # Phase 3 (locked): re-point. The target now holds a VERBATIM copy of the current data, so the
+            # freshness ledger + registries already match it — just move the pointer. No adopt/re-read of
+            # the target sidecar (which could come back empty and wrongly reset freshness), no rewind: a
+            # migration is faithful, so the pipeline resumes exactly where it was, at the new location.
             with self.lock:
-                self.migration["status"] = "adopting"
                 self.migration["pond"] = None
                 self.data_root = new_root
                 if hasattr(self.launcher, "set_data_root"):
                     self.launcher.set_data_root(new_root)
                 else:
                     self.launcher.data_root = new_root
-                self._adopt_plane(lines, new_root)
-                self.db.commit()
-                self.reload()
                 self.state_version += 1
                 self.migration["status"] = "done"
             return {"ponds": len(lines)}

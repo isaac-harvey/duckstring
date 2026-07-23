@@ -241,7 +241,7 @@ def test_switch_data_root_adopt_empty_target_is_cold(tmp_path):
     assert end_f in (None, _iso(NEVER))  # empty target → cold (nothing to adopt)
 
 
-def test_switch_data_root_migrate_copies_then_adopts(tmp_path):
+def test_switch_data_root_migrate_copies_and_preserves_freshness(tmp_path):
     import json
 
     from duckstring.catchment.registry import pond_data_dir
@@ -252,16 +252,21 @@ def test_switch_data_root_migrate_copies_then_adopts(tmp_path):
     m = driver.meta[key]
     name, major, pond_id = m["name"], m["major"], m["pond_id"]
     driver.wave(key)  # demand that must survive the migrate
+    # The Catchment is currently fresh at F (migrate carries a verbatim copy, so this must be KEPT — not
+    # reset by re-reading the target sidecar).
+    F = "2026-06-06T00:00:00+00:00"
+    db.execute("UPDATE pond_state SET start_f=?, end_f=?, changed_f=? WHERE pond_id=?", (F, F, F, pond_id))
+    db.commit()
+    driver.reload()
 
     # Populate plane A: the flat, self-contained files (carried) + Iceberg catalog/namespace (skipped).
-    F = "2026-06-06T00:00:00+00:00"
     a = pond_data_dir(tmp_path, name, major, str(tmp_path / "planeA"))
     a.write_text(json.dumps({"orders": {"mode": "overwrite", "f": F}}), "_trickle.json")
     a.write_bytes(b"parquet-bytes", "orders.parquet")
     a.write_text("{}", "catalog.json")                       # Iceberg pointer — must NOT travel
     a.child("pond.db").write_bytes(b"meta", "v1.metadata.json")  # Iceberg namespace — must NOT travel
 
-    driver.migrate(str(tmp_path / "planeB"))  # blocking: copies then adopts (runs to completion here)
+    driver.migrate(str(tmp_path / "planeB"))  # blocking: copies + re-points (runs to completion here)
 
     b = pond_data_dir(tmp_path, name, major, str(tmp_path / "planeB"))
     assert b.read_bytes("orders.parquet") == b"parquet-bytes"   # flat data copied
@@ -269,10 +274,10 @@ def test_switch_data_root_migrate_copies_then_adopts(tmp_path):
     assert not b.exists("catalog.json")                         # Iceberg catalog skipped
     assert not b.exists("pond.db")                              # Iceberg namespace skipped
     assert a.read_bytes("orders.parquet") == b"parquet-bytes"   # old location left intact (backup)
+    assert driver.data_root == str(tmp_path / "planeB")         # re-pointed
     start_f, end_f = db.execute("SELECT start_f, end_f FROM pond_state WHERE pond_id=?", (pond_id,)).fetchone()
-    assert start_f == F and end_f == F                          # adopted the migrated freshness
+    assert start_f == F and end_f == F                          # freshness PRESERVED (no reset)
     assert db.execute("SELECT COUNT(*) FROM pond_trigger").fetchone()[0] == 1  # demand kept → resumes
-    # Progress state reflects a completed copy of the one flat file (orders.parquet; sidecar counts too).
     mig = driver.migration_status()
     assert mig["status"] == "done" and mig["copied_files"] == mig["total_files"] and mig["total_files"] >= 1
 
