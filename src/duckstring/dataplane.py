@@ -559,6 +559,7 @@ def hydrate_registry(con, data_dir, tables=None) -> list[str]:
     from . import trickle_io as trickle
 
     store = _as_storage(data_dir)
+    store.duckdb_setup(con)  # configure object-store creds on this connection (a no-op for local)
     plane = ParquetDataPlane()  # hydration reads the flat layer (every backend also writes it)
     sidecar = trickle.load_sidecar(store)
     hydrated: list[str] = []

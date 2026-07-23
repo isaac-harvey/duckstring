@@ -159,6 +159,11 @@ class RippleExecutor:
             spill.mkdir(parents=True, exist_ok=True)
             self._registry.execute(f"SET memory_limit = '{mem_limit}'")
             self._registry.execute(f"SET temp_directory = '{spill}'")
+        # Configure the data-plane's object-store credentials on the registry INSTANCE up front (a DuckDB
+        # SECRET is instance-wide, shared by every cursor), so registry-loss hydration below, cross-Pond
+        # foreign reads, and the export can all reach S3/GCS. A no-op for a local data root. Without this,
+        # the first S3 read (typically hydration) fails with a 403 "no credentials provided".
+        self.own_data_dir.duckdb_setup(self._registry)
         if recover:
             from ..dataplane import hydrate_registry
 

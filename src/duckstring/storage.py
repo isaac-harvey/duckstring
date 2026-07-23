@@ -528,7 +528,9 @@ class ObjectStorage(Storage):
         bits = [f"TYPE {duck_type}"]
         key = self.params.get("key_id") or self.params.get("key")
         secret = self.params.get("secret")
-        region = self.params.get("region")
+        # Region: explicit query param, else the ambient AWS region from the environment. DuckDB needs it
+        # to address the bucket — without it an S3 read fails with "in region ''".
+        region = self.params.get("region") or os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
         try:
             if key and secret:
                 bits.append(f"KEY_ID '{credentials.resolve(key)}'")
