@@ -2,7 +2,12 @@
 
 import { useEffect, useState } from 'react';
 import { useLiveStore, THEME_BRAND, THEME_PULL } from '@/lib/store';
-import { fetchDuckPools, type DuckConfig, type DuckPool } from '@/lib/api';
+import {
+  fetchComputeDefaults, fetchDuckPools, setDuck as apiSetDuck,
+  type ComputeDefaults, type DuckConfig, type DuckPool,
+} from '@/lib/api';
+import { cpuLabel, defaultMemoryFor, FARGATE_CPU, FARGATE_MEMORY, memoryLabel } from '@/lib/aws';
+import { DeployConfigForm, deployConfigMissing } from './DeployConfigForm';
 import { InstanceTypePicker } from './InstanceTypePicker';
 
 // The per-Pond compute config (plans/cloud-config.md): the Duck TARGET (where it runs) + size, and the
@@ -86,28 +91,9 @@ export function DuckSection({ pondId, duck }: { pondId: string; duck: DuckConfig
         </div>
       )}
 
-      {/* Dedicated: its own instance type + auto-stop on run completion. The Catchment box is whatever
-          the host is; a pool defines its own instance type — so there is no abstract size control. */}
-      {target === 'dedicated' && (
-        <div style={row}>
-          <span style={lbl}>Box</span>
-          <InstanceTypePicker
-            value={duck.dedicated_instance_type ?? ''}
-            style={input}
-            placeholder="instance type (e.g. r6i.2xlarge)"
-            onCommit={(v) => {
-              if (v !== (duck.dedicated_instance_type ?? '')) setDuck(pondId, { dedicated_instance_type: v || null });
-            }}
-          />
-          <button
-            style={chip(!!duck.dedicated_auto_stop)}
-            title="Terminate the box when the Pond Run completes"
-            onClick={() => setDuck(pondId, { dedicated_auto_stop: !duck.dedicated_auto_stop })}
-          >
-            auto-stop
-          </button>
-        </div>
-      )}
+      {/* Dedicated: a remote Duck of one — the SAME provider setup a pool uses (provider + size + region +
+          AWS deployment config), scoped to this Duck (plans/compute-config-ui.md). */}
+      {target === 'dedicated' && <DedicatedDuckConfig pondId={pondId} duck={duck} />}
 
       {/* Flock posture (over-envelope offload). Off is inert; upgrade/always need a configured engine. */}
       <div style={row}>
@@ -149,6 +135,82 @@ export function DuckSection({ pondId, duck }: { pondId: string; duck: DuckConfig
           Reset to declared
         </button>
       )}
+    </div>
+  );
+}
+
+// A Pond's Dedicated Duck: the same provider setup as a pool (provider + size + region + AWS deployment
+// config), scoped to this one Duck, validated before it's accepted (the backend rejects an inadequate
+// config; the form gates Apply the same way).
+function DedicatedDuckConfig({ pondId, duck }: { pondId: string; duck: DuckConfig }) {
+  const [defaults, setDefaults] = useState<ComputeDefaults | null>(null);
+  useEffect(() => { void fetchComputeDefaults().then(setDefaults).catch(() => setDefaults(null)); }, []);
+
+  const cur = duck.deploy_config ?? {};
+  const [provider, setProvider] = useState<'fargate' | 'ec2'>(cur.provider === 'ec2' ? 'ec2' : 'fargate');
+  const [cfg, setCfg] = useState<Record<string, string>>(cur);
+  const [instanceType, setInstanceType] = useState(cur.instance_type ?? duck.dedicated_instance_type ?? '');
+  const [cpu, setCpu] = useState(cur.cpu ?? '1024');
+  const [mem, setMem] = useState(cur.memory ?? String(defaultMemoryFor(1024)));
+  const [region, setRegion] = useState(cur.region ?? '');
+  const [autoStop, setAutoStop] = useState(!!duck.dedicated_auto_stop);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const pickCpu = (v: string) => {
+    setCpu(v);
+    const m = FARGATE_MEMORY[Number(v)] ?? [];
+    if (!m.includes(Number(mem))) setMem(String(m[0] ?? ''));
+  };
+  const missing = deployConfigMissing(provider, cfg, defaults);
+
+  const apply = async () => {
+    setBusy(true); setErr(null);
+    const deploy: Record<string, string> = { provider, ...cfg };
+    if (region.trim()) deploy.region = region.trim();
+    if (provider === 'ec2') { if (instanceType.trim()) deploy.instance_type = instanceType.trim(); }
+    else { deploy.cpu = cpu; deploy.memory = mem; }
+    try {
+      await apiSetDuck(pondId, { duck_target: 'dedicated', deploy_config: deploy, dedicated_auto_stop: autoStop });
+    } catch (e) { setErr(e instanceof Error ? e.message : 'failed'); } finally { setBusy(false); }
+  };
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginTop: 4 }}>
+      <select value={provider} onChange={(e) => setProvider(e.target.value as 'fargate' | 'ec2')} style={input}>
+        <option value="fargate">fargate (serverless)</option>
+        <option value="ec2">ec2 (big / GPU)</option>
+      </select>
+      <input value={region} onChange={(e) => setRegion(e.target.value)} placeholder="region (e.g. us-east-1)" style={input} />
+      {provider === 'fargate' ? (
+        <div style={{ display: 'flex', gap: 6 }}>
+          <select value={cpu} onChange={(e) => pickCpu(e.target.value)} style={input}>
+            {FARGATE_CPU.map((c) => <option key={c} value={c}>{cpuLabel(c)}</option>)}
+          </select>
+          <select value={mem} onChange={(e) => setMem(e.target.value)} style={input}>
+            {(FARGATE_MEMORY[Number(cpu)] ?? []).map((m) => <option key={m} value={m}>{memoryLabel(m)}</option>)}
+          </select>
+        </div>
+      ) : (
+        <InstanceTypePicker value={instanceType} onCommit={setInstanceType} region={region.trim() || undefined} style={input} />
+      )}
+      <div style={{ borderTop: '1px solid #27272a', paddingTop: 6 }}>
+        <div style={{ fontSize: 10, color: '#71717a', marginBottom: 4 }}>Deployment ({provider})</div>
+        <DeployConfigForm provider={provider} value={cfg} onChange={setCfg} defaults={defaults} />
+      </div>
+      {err && <div style={{ fontSize: 11, color: '#ef4444', wordBreak: 'break-word' }}>{err}</div>}
+      <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+        <button style={chip(autoStop)} title="Terminate the box when the Pond Run completes" onClick={() => setAutoStop(!autoStop)}>
+          auto-stop
+        </button>
+        <button
+          style={{ ...chip(false), color: THEME_BRAND, borderColor: THEME_BRAND, opacity: busy || missing.length > 0 ? 0.5 : 1 }}
+          disabled={busy || missing.length > 0}
+          onClick={apply}
+        >
+          {busy ? 'Saving…' : 'Apply'}
+        </button>
+      </div>
     </div>
   );
 }

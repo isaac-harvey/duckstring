@@ -2,11 +2,13 @@
 
 import { useEffect, useRef, useState } from 'react';
 import {
-  addDuckPool, fetchCloudSettings, fetchDuckPools, fetchMigration, removeDuckPool, setDataRoot, setSecret,
-  verifyCloud, type CloudSettings, type CloudVerifyResult, type DuckPool, type MigrationStatus,
+  addDuckPool, fetchCloudSettings, fetchComputeDefaults, fetchDuckPools, fetchMigration, removeDuckPool,
+  setDataRoot, setSecret, verifyCloud, type CloudSettings, type CloudVerifyResult, type ComputeDefaults,
+  type DuckPool, type MigrationStatus,
 } from '@/lib/api';
 import { cpuLabel, defaultMemoryFor, FARGATE_CPU, FARGATE_MEMORY, memoryLabel } from '@/lib/aws';
 import { useLiveStore } from '@/lib/store';
+import { DeployConfigForm, deployConfigMissing } from './DeployConfigForm';
 import { InstanceTypePicker } from './InstanceTypePicker';
 
 // Catchment-level cloud config (plans/cloud-config.md + plans/cloud-menu-redesign.md, full access only).
@@ -278,14 +280,15 @@ function CredentialsPanel({ settings, reload }: { settings: CloudSettings; reloa
 
 // ─── Duck pools ──────────────────────────────────────────────────────────────
 
-function PoolsPanel({ pools, reload }: { pools: DuckPool[]; reload: () => void }) {
+function PoolsPanel({ pools, reload, defaults }: { pools: DuckPool[]; reload: () => void; defaults: ComputeDefaults | null }) {
   const [busy, setBusy] = useState(false);
   const [pName, setPName] = useState('');
-  const [pProvider, setPProvider] = useState('fargate');
+  const [pProvider, setPProvider] = useState<'fargate' | 'ec2'>('fargate');
   const [pType, setPType] = useState('');
   const [pRegion, setPRegion] = useState('');
   const [pCpu, setPCpu] = useState('1024');
   const [pMem, setPMem] = useState(String(defaultMemoryFor(1024)));
+  const [deploy, setDeploy] = useState<Record<string, string>>({});
   const [pErr, setPErr] = useState<string | null>(null);
 
   const pickCpu = (v: string) => {
@@ -304,10 +307,12 @@ function PoolsPanel({ pools, reload }: { pools: DuckPool[]; reload: () => void }
         cpu: pProvider === 'fargate' && pCpu ? Number(pCpu) : null,
         memory: pProvider === 'fargate' && pMem ? Number(pMem) : null,
         region: pProvider === 'ec2' && pRegion.trim() ? pRegion.trim() : null,
+        deploy_config: deploy,
       });
-      setPName(''); setPType(''); setPRegion(''); reload();
+      setPName(''); setPType(''); setPRegion(''); setDeploy({}); reload();
     } catch (e) { setPErr(e instanceof Error ? e.message : 'failed'); } finally { setBusy(false); }
   };
+  const deployMissing = deployConfigMissing(pProvider, deploy, defaults);
 
   return (
     <Section title="DUCK POOLS">
@@ -330,7 +335,7 @@ function PoolsPanel({ pools, reload }: { pools: DuckPool[]; reload: () => void }
       })}
       <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 6 }}>
         <input value={pName} onChange={(e) => setPName(e.target.value)} placeholder="pool name (e.g. heavy)" style={smallInput} />
-        <select value={pProvider} onChange={(e) => setPProvider(e.target.value)} style={smallInput}>
+        <select value={pProvider} onChange={(e) => setPProvider(e.target.value as 'fargate' | 'ec2')} style={smallInput}>
           <option value="fargate">fargate (serverless)</option>
           <option value="ec2">ec2 (big / GPU)</option>
         </select>
@@ -349,8 +354,13 @@ function PoolsPanel({ pools, reload }: { pools: DuckPool[]; reload: () => void }
             <InstanceTypePicker value={pType} onCommit={setPType} region={pRegion.trim() || undefined} style={smallInput} />
           </>
         )}
+        <div style={{ borderTop: '1px solid #27272a', paddingTop: 6, marginTop: 2 }}>
+          <div style={{ fontSize: 10, color: '#71717a', marginBottom: 4 }}>Deployment ({pProvider})</div>
+          <DeployConfigForm provider={pProvider} value={deploy} onChange={setDeploy} defaults={defaults} />
+        </div>
         {pErr && err(pErr)}
-        <button onClick={addPool} disabled={busy || !pName.trim()} style={btn('#22c55e', busy || !pName.trim())}>Add pool</button>
+        <button onClick={addPool} disabled={busy || !pName.trim() || deployMissing.length > 0}
+                style={btn('#22c55e', busy || !pName.trim() || deployMissing.length > 0)}>Add pool</button>
       </div>
     </Section>
   );
@@ -361,6 +371,7 @@ function PoolsPanel({ pools, reload }: { pools: DuckPool[]; reload: () => void }
 export function CloudMenu({ onClose }: { onClose: () => void }) {
   const [settings, setSettings] = useState<CloudSettings | null>(null);
   const [pools, setPools] = useState<DuckPool[]>([]);
+  const [computeDefaults, setComputeDefaults] = useState<ComputeDefaults | null>(null);
   const catchment = useLiveStore((s) => s.catchment);
   const catchmentName = catchment?.name || catchment?.id || '';
 
@@ -369,6 +380,7 @@ export function CloudMenu({ onClose }: { onClose: () => void }) {
     void fetchDuckPools().then(setPools).catch(() => setPools([]));
   };
   useEffect(load, []);
+  useEffect(() => { void fetchComputeDefaults().then(setComputeDefaults).catch(() => setComputeDefaults(null)); }, []);
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => e.key === 'Escape' && onClose();
     window.addEventListener('keydown', onKey);
@@ -404,7 +416,7 @@ export function CloudMenu({ onClose }: { onClose: () => void }) {
           <MigrationBanner onDone={load} />
           {settings && <DataPlanePanel settings={settings} catchmentName={catchmentName} reload={load} />}
           {settings && <CredentialsPanel settings={settings} reload={load} />}
-          {enabled && <PoolsPanel pools={pools} reload={load} />}
+          {enabled && <PoolsPanel pools={pools} reload={load} defaults={computeDefaults} />}
         </div>
       </div>
     </div>

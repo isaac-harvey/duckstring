@@ -1,10 +1,13 @@
 # UI-entered, validated compute (Fargate/EC2) deployment config
 
-Status: **to build.** Today the AWS deployment config a remote Duck needs (Fargate: image/task-def, VPC
-subnets, security groups, execution+task roles, cluster; EC2: AMI, instance profile) comes ONLY from
-Catchment env vars, read once at `create_app`. So a pool/dedicated Duck can be "selected" but fail at
-launch with "no image/AMI configured" (surfaced now, but only after a run fails). This makes that config
-**UI-entered, co-located with where the compute is configured, and validated up front**.
+Status: **built.** The AWS deployment config is a per-pool / per-dedicated `deploy_config` JSON blob
+(migration 026) coalesced over the launcher env defaults; `catchment/cloud_deploy.py` owns the field lists
++ validation; `Driver.add_pool`/`set_duck` validate + persist it (reject listing missing fields); the
+Fargate/EC2 launchers read the per-spawn config (Fargate task-defs keyed per config); routes carry it +
+`GET /api/catchment/compute-defaults`. UI: a shared `DeployConfigForm` (env-inherited hints + required
+validation) in the Cloud-menu pool form and a Pond's Dedicated Duck (which now shows the same provider +
+size + region + deployment setup, scoped to one Duck). Tested (`test_cloud_config`, `test_ec2_launcher`);
+frontend tsc/eslint/build green.
 
 ## Goals
 

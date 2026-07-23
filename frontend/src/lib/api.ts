@@ -131,7 +131,19 @@ export interface DuckPool {
   idle_timeout: number | null;
   keep_warm: number;
   region: string | null;
+  deploy_config?: Record<string, string> | null; // provider AWS deployment config (image/AMI/VPC/IAM)
   managed?: boolean; // a built-in preset (S/M/L/XL) — not editable/removable
+}
+
+// Per-provider deployment config metadata (GET /catchment/compute-defaults): which fields the launcher
+// already reads from env (shown as inherited) + the required fields still missing without any UI input.
+export interface ComputeDefaults {
+  fargate: { fields: string[]; env: Record<string, string>; missing_without_input: string[] };
+  ec2: { fields: string[]; env: Record<string, string>; missing_without_input: string[] };
+}
+
+export function fetchComputeDefaults(): Promise<ComputeDefaults> {
+  return getJSON<ComputeDefaults>('/catchment/compute-defaults');
 }
 
 // A Pond's effective compute config = override ?? declared ?? Catchment default (coalesce). Sizing is
@@ -142,6 +154,7 @@ export interface DuckConfig {
   pool: DuckPool | null;
   dedicated_instance_type: string | null;
   dedicated_auto_stop: boolean | null;
+  deploy_config: Record<string, string> | null; // dedicated Duck's provider deployment config
   flock_mode: string; // 'off' | 'upgrade' | 'always'
   flock_engine: string | null;
   oom_policy: string; // 'fail_up' | 'fail'
@@ -405,6 +418,7 @@ export interface DuckOverrideBody {
   duck_target?: string | null;
   dedicated_instance_type?: string | null;
   dedicated_auto_stop?: boolean | null;
+  deploy_config?: Record<string, string> | null;  // dedicated Duck's provider AWS deployment config
   flock_mode?: string | null;
   flock_engine?: string | null;
   oom_policy?: string | null;
@@ -470,6 +484,7 @@ export function addDuckPool(body: {
   keep_warm?: number | null;
   idle_timeout?: number | null;
   region?: string | null;
+  deploy_config?: Record<string, string> | null;
 }): Promise<void> {
   return postJSON('/catchment/duck-pools', body);
 }
