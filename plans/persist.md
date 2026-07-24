@@ -1,8 +1,25 @@
 # Plan: Persist — local-first publish, async durability, Pool-aware freshness
 
-> **Status: design, not implemented.** Settled with the author 2026-07-24. Companion to
-> `plans/s3-resident-state.md` (which covers the *hydration* direction; this plan covers the *publish*
-> direction and the Pool model both rest on).
+> **Status: phase 2 IMPLEMENTED and verified; phases 3–6 designed, not built.** Settled with the author
+> 2026-07-24. Companion to `plans/s3-resident-state.md` (the *hydration* direction; this plan is the
+> *publish* direction and the Pool model both rest on).
+>
+> **Built (phase 2):** local-first publish + the Duck-side async Persist + `persisted_f`. A Catchment-Pool
+> Duck publishes to the local layout (`--persist-root`, passed by `SubprocessLauncher`; remote launchers
+> keep publishing straight to the data root) and `persist_tree` mirrors it to the data root off the run's
+> critical path (coalescing, replay-safe, refuses an empty local, prunes what local dropped, skips the
+> local-only Iceberg catalog). Reads resolve **local-first** (`resolve_data_dir`: Duck foreign reads, the
+> data viewer, serving, egress). The `persist` Duck event → migration 027 (`pond_state.persisted_f` +
+> the `pond_persist` log — a separate log item from the Pond Run) → `/api/status.persisted_f`. Hydration
+> falls back local → persist layer. A data-root **switch** scrubs the local publish cache when leaving a
+> non-local plane (it would shadow the new plane); `migrate()` copies from the local-first source (the
+> old plane's mirror may lag `persisted_f` behind `end_f`). Verified against a real ap-southeast-2
+> bucket: local publish ~0.01s on the critical path, persist 0.2–0.7s off it, delta mirrors O(new parts).
+> E2E `test_local_first_publish_persists_to_data_root`; units `tests/test_persist.py`.
+>
+> **Gating is still `end_f`-only** (phase 2 scope): correct for the Catchment-only topology; a
+> remote-Pool Duck still publishes synchronously to the data root, so cross-Pool reads stay sound. The
+> `persisted_f` gating rule below activates in phase 3.
 
 ## The reframing
 
