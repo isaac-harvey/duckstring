@@ -47,12 +47,13 @@
 > hot state LRU: the registry when a publish backs it; the local publish too only when fully mirrored
 > (`persisted_f >= changed_f` — reads fall to the plane). Never touches the only copy of anything.
 >
-> **NOT built — phase 5** (named Pools as shared machines): the task-per-Pool launcher needs a new
-> in-container component (a Pool agent supervising multiple co-resident Ducks, with spawn/stop plumbing
-> from the Catchment) and **real-AWS iteration to validate** — the same gate that deferred warm-pool
-> reuse before. Until it lands, a named pool spawns one machine per Pond (a Pool-of-one), which the
-> phase-3 gating already models correctly; nothing is wrong, co-location off the Catchment is simply
-> not yet available. This is the one remaining phase.
+> **Built (phase 5):** named Pools as shared machines — the Pool agent (plans/pool-agent.md). The agent
+> dials back (symmetric with the Duck transport), supervises co-resident child Ducks on one machine,
+> and the DispatchingLauncher routes named non-preset pools to a per-pool PoolLauncher with three
+> machine backends (local subprocess / one Fargate task / one EC2 instance). Verified offline
+> end-to-end with a REAL local agent (`test_named_pool_runs_co_resident_ducks`); only the Fargate/EC2
+> machine-start calls await the real-AWS gate run. v1 gaps in plans/pool-agent.md (dead-machine
+> respawn, pool-side reset scrub, idle scheduling).
 
 ## The reframing
 
