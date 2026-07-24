@@ -65,7 +65,7 @@ Execution is **freshness-based**, not schedule-based. Instead of cron expression
 | **Inlet** | A Pond with no Sources — it ingests from external systems |
 | **Outlet** | A Pond with no Sinks — it produces final data products |
 
-The **Catchment** is a convenience, not the product: Duckstring is the packaging standard, and the Catchment is its batteries-included runtime (FastAPI server, web UI, CLI) for teams that want the full stack.
+Duckstring is the packaging standard, and the **Catchment** is its batteries-included runtime (FastAPI server, web UI, CLI) for teams that want the full stack.
 
 ## Where to start
 
