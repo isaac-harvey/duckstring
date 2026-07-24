@@ -223,3 +223,5 @@ src/duckstring/catchment/static/
 
 # Sandbox
 .sandbox/
+# Local cloud-testing artifacts (S3 bucket mirrors) — never commit
+duckstring-testing-*/
