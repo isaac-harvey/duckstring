@@ -44,6 +44,7 @@ from ..engine import (
     kill_pond,
     next_wake,
     pulse_pond,
+    record_persist,
     refresh_pond,
     repair_pond,
     sentinel,
@@ -387,10 +388,17 @@ class Driver:
                 always_run = bool(db.execute(
                     "SELECT MAX(always_run) FROM ripple WHERE pond_version_id = ?", (pv_id,)
                 ).fetchone()[0])
+                # Pool identity + persist mode (plans/persist.md): where this Pond's Duck actually runs
+                # decides whose Sinks see end_f (same Pool) vs persisted_f (cross-Pool), and whether its
+                # own publish is async-mirrored. Draws/Spouts run in the Catchment process → Catchment Pool.
+                pool = self._pool_of(key) if not (is_draw or is_spout) else "catchment"
                 ponds[key] = Pond(
                     id=key, name=key, sources=sources, optional_sources=optional, windows=windows,
                     retry_immediately=imm, retry_on_change=onc, is_draw=bool(is_draw),
                     is_spout=bool(is_spout), has_missing_source=has_missing_source, always_run=always_run,
+                    pool=pool,
+                    async_persist=(pool == "catchment" and self.data_root is not None
+                                   and not (is_draw or is_spout)),
                 )
                 pond_states[key] = self._load_pond_state(pond_id)
                 if is_spout:
@@ -460,12 +468,21 @@ class Driver:
             for pid in self.state.pond_states:
                 derive_blocked(self.state, pid)
             # The persist watermark (plans/persist.md): the freshness through which each line's published
-            # output is mirrored to the data root. Observability in phase 2 (no engine gating yet).
+            # output is mirrored to the durable plane. Restore-then-derive: an async_persist Pond gets its
+            # recorded watermark from the DB (NEVER if it has not mirrored yet — conservative: cross-Pool
+            # Sinks wait for the next mirror); every other Pond's publish is durable at completion, so its
+            # watermark IS end_f. Pool-aware gating (source_visible_f) rides these restored values.
             self.persisted = {}
             for pid, pf in db.execute("SELECT pond_id, persisted_f FROM pond_state WHERE persisted_f IS NOT NULL"):
                 key = pondid_to_key.get(pid)
                 if key:
                     self.persisted[key] = pf
+            for key, st in self.state.pond_states.items():
+                if self.state.ponds[key].async_persist:
+                    pf = self.persisted.get(key)
+                    st.persisted_f = datetime.fromisoformat(pf) if pf else NEVER
+                else:
+                    st.persisted_f = st.end_f
             self.jobs = {key: self.jobs.get(key, []) for key in ponds}
             self.state_version += 1  # topology/config (deploy, ducts, windows) changed
 
@@ -1272,6 +1289,25 @@ class Driver:
                 self.duck_overrides[pond] = new
             self.db.commit()
             self.state_version += 1  # the config shows in /api/status
+
+    def _pool_of(self, pond: str) -> str:
+        """The Pool (one shared filesystem — plans/persist.md) this Pond's Duck runs on, mirroring the
+        DispatchingLauncher's actual routing: the Catchment Pool unless the Pond both TARGETS remote
+        compute and a remote backend is attached to take it (with none, the dispatcher degrades the spawn
+        to local — the Pool identity must follow the real box, not the configured wish). A remote spawn
+        is one machine per Pond in v1 → a Pool-of-one keyed by the pond key (named-Pool sharing is
+        plans/persist.md phase 5). Misclassification is fail-safe: a wrongly-remote identity only makes
+        gating conservative (waits for persisted_f), never premature."""
+        try:
+            duck = self.duck_config(pond)
+        except Exception:
+            return "catchment"
+        if not duck.get("remote"):
+            return "catchment"
+        remote_for = getattr(self.launcher, "_remote_for", None)
+        if remote_for is None or remote_for(duck) is None:
+            return "catchment"  # no backend to take it — the dispatcher runs it locally
+        return f"duck:{pond}"
 
     def duck_config(self, pond: str) -> dict:
         """The Pond's EFFECTIVE compute config = override ?? declared ?? Catchment default (coalesce;
@@ -2746,7 +2782,9 @@ class Driver:
     def _record_persist(self, pond: str, f: str | None, status: str, error: str | None, now: datetime) -> None:
         """Record a Duck's persist report (plans/persist.md): upsert the ``pond_persist`` log row and, on
         success, advance the ``persisted_f`` watermark (monotonic — a replayed/stale report never regresses
-        it). Idempotent on ``(pond, f)`` so event replay after a reconnect is safe."""
+        it) in the DB **and the engine** — cross-Pool Sinks gate on it (``source_visible_f``), so the
+        advance is a demand-relevant event and the cascade is driven (``_process``). Idempotent on
+        ``(pond, f)`` so event replay after a reconnect is safe."""
         if not f:
             return
         meta = self.meta.get(pond)
@@ -2763,7 +2801,11 @@ class Driver:
                 self.persisted[pond] = f
                 self.db.execute("UPDATE pond_state SET persisted_f = ? WHERE pond_id = ?",
                                 (f, meta["pond_id"]))
+            if pond in self.state.pond_states:
+                record_persist(self.state, pond, datetime.fromisoformat(f))
         self.db.commit()
+        if status == "success":
+            self._process(now)  # a cross-Pool Sink waiting on this Source's mirror may now be runnable
 
     def _record_pass(self, pond: str, f: datetime, now: datetime) -> None:
         """An engine-synthesised pass (no Duck): record an instant, successful no-change pond_run so the
@@ -3235,9 +3277,10 @@ class Driver:
                     "start_f": ts(ps.start_f),
                     "end_f": ts(ps.end_f),
                     "changed_f": ts(ps.changed_f),  # content freshness: held across a pass (no-change run)
-                    # The durable-mirror watermark (plans/persist.md): output persisted to the data root
-                    # through this freshness. null = never persisted / no cloud.
-                    "persisted_f": self.persisted.get(key),
+                    # The durable-mirror watermark (plans/persist.md): output persisted to the durable
+                    # plane through this freshness (= end_f for a Pond whose publish is durable at
+                    # completion). Cross-Pool Sinks gate on it (source_visible_f).
+                    "persisted_f": ts(ps.persisted_f),
                     "d_ms": int(ps.d.total_seconds() * 1000),
                     "trigger": trigger,
                     "is_failed": ps.is_failed,

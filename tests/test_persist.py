@@ -111,3 +111,53 @@ def test_pond_source_read_resolves_local_first(tmp_path):
                 source_majors={"src": 1, "faraway": 2}, data_root=str(tmp_path / "durable"))
     assert str(local) in pond._source_data_dir("src").uri()
     assert str(tmp_path / "durable") in pond._source_data_dir("faraway").uri()
+
+
+def test_driver_persist_event_releases_cross_pool_sink(tmp_path, monkeypatch):
+    """The wiring behind the gating rule (plans/persist.md phase 3): a cross-Pool Sink's demand is NOT
+    satisfied by its Source's run completion alone (end_f) — only the Duck's `persist` event (advancing
+    persisted_f, via Driver._record_persist → engine record_persist → _process) releases its BeginRun.
+    A same-Pool Sink under identical demand runs immediately."""
+    from datetime import datetime, timezone
+
+    from duckstring.catchment.db import connect, migrate
+    from duckstring.catchment.driver import Driver
+    from duckstring.catchment.launcher import NoopLauncher
+    from duckstring.catchment.routes.deploy import _register
+
+    t0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    db = connect(tmp_path / "duck.db")
+    migrate(db)
+    cfg = {"sources": {}, "immediate_retries": 0, "source_retries": 0, "kind": "pond"}
+    _register(db, "sales", "1.0.0", "pond", "ponds/sales/1.0.0", cfg,
+              [{"func": "f", "name": "agg", "parents": []}])
+    snk = {**cfg, "kind": "outlet", "sources": {"rpt_src": "1.0.0"}, "sources_map": {"sales": "1.0.0"}}
+    snk["sources"] = {"sales": "1.0.0"}
+    _register(db, "rpt", "1.0.0", "outlet", "ponds/rpt/1.0.0", snk,
+              [{"func": "f", "name": "out", "parents": []}])
+    # The sink resolves to its own Pool (as a remote spawn would); the source stays on the Catchment Pool.
+    monkeypatch.setattr(Driver, "_pool_of",
+                        lambda self, key: "duck:rpt@1" if key.startswith("rpt") else "catchment")
+    driver = Driver(db, tmp_path, "http://x", NoopLauncher(), data_root=str(tmp_path / "durable"))
+
+    assert driver.state.ponds["sales@1"].async_persist is True   # catchment Pool + data root
+    assert driver.state.ponds["rpt@1"].pool == "duck:rpt@1"
+
+    # The source has completed a run locally (end_f advanced; mirror not yet landed).
+    with driver.lock:
+        ss = driver.state.pond_states["sales@1"]
+        ss.start_f = ss.end_f = t0
+    driver.tap("rpt@1")
+    begin_runs = [j for j in driver.jobs.get("rpt@1", []) if j.get("kind") == "begin_run"]
+    assert not begin_runs, "the cross-Pool sink must hold until the source's mirror lands"
+
+    # The Duck reports the persist → the watermark advances → the sink's BeginRun releases.
+    driver.on_event("sales@1", {"kind": "persist", "f": t0.isoformat(), "status": "success"})
+    begin_runs = [j for j in driver.jobs.get("rpt@1", []) if j.get("kind") == "begin_run"]
+    assert begin_runs, "the persist event must release the waiting cross-Pool sink"
+    assert begin_runs[0]["f"] == t0.isoformat()
+
+    # And the watermark is persisted + surfaced.
+    assert driver.persisted["sales@1"] == t0.isoformat()
+    st = next(p for p in driver.status()["ponds"] if p["id"] == "sales@1")
+    assert st["persisted_f"] == t0.isoformat()

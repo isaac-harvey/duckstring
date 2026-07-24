@@ -142,6 +142,15 @@ class Pond:
     # and not drawn over a duct. The Pond cannot run with a missing dependency, so it is hard-blocked
     # until every Source is present (e.g. the Source is deployed, or a duct draws it in).
     has_missing_source: bool = False
+    # The Pool (one shared filesystem — plans/persist.md) this Pond's Duck runs on: "catchment" for the
+    # Catchment's own box, a Pool-of-one identity for a remote Duck. Same-Pool Sinks see this Pond's
+    # output at ``end_f`` (the local publish is the handoff); cross-Pool Sinks at ``persisted_f``.
+    pool: str = "catchment"
+    # Whether this Pond publishes locally and mirrors to the durable plane ASYNCHRONOUSLY (a
+    # Catchment-Pool Duck with a data root attached). False = the publish is already durable at
+    # completion (no cloud, or a remote Duck writing the data root directly), so ``persisted_f``
+    # tracks ``end_f`` and cross-Pool visibility never lags.
+    async_persist: bool = False
 
 
 @dataclass
@@ -187,6 +196,11 @@ class PondState:
     changed_f: datetime = NEVER  # freshness at which this Pond's OUTPUT last actually changed
                                  # (<= end_f). A pass advances end_f but holds this. See
                                  # plans/no-change-skip.md.
+    persisted_f: datetime = NEVER  # freshness through which the published output is mirrored to the
+                                   # durable plane (<= end_f; plans/persist.md). Tracks end_f exactly
+                                   # for a non-async_persist Pond; advanced by record_persist for an
+                                   # async one. Cross-Pool Sinks gate on THIS, same-Pool on end_f. A
+                                   # data watermark, not demand — fail/clear/force never touch it.
     d: timedelta = ZERO  # window delay carried by the current freshness
     remote_f: datetime = NEVER  # Pond Draws only: the upstream freshness mirrored by the poller
                                 # (transient — repopulated on each poll, not persisted)

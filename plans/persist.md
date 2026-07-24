@@ -17,9 +17,26 @@
 > bucket: local publish ~0.01s on the critical path, persist 0.2–0.7s off it, delta mirrors O(new parts).
 > E2E `test_local_first_publish_persists_to_data_root`; units `tests/test_persist.py`.
 >
-> **Gating is still `end_f`-only** (phase 2 scope): correct for the Catchment-only topology; a
-> remote-Pool Duck still publishes synchronously to the data root, so cross-Pool reads stay sound. The
-> `persisted_f` gating rule below activates in phase 3.
+> **Built (phase 3):** Pool-aware gating is LIVE. The engine carries `Pond.pool` + `Pond.async_persist`
+> and `PondState.persisted_f` (tracks `end_f` exactly on completion for a durable-at-completion publish;
+> advanced by `record_persist` for an async one — monotonic, never regressed by replay). The one-rule
+> protocol is `source_visible_f` (engine/catchment.py): a Sink aggregates its Sources' *visible*
+> freshness — `end_f` same-Pool / non-async, `persisted_f` cross-Pool — used by `pond_source_f` and the
+> missing-asset re-attempt gates. The Driver resolves each Pond's Pool identity (`_pool_of`, mirroring
+> the DispatchingLauncher's real routing incl. the degrade-to-local path; a remote spawn is a
+> Pool-of-one in v1; misclassification is fail-safe — only ever conservative), populates the engine at
+> reload, restores `persisted_f` on restart (async: the DB watermark; others: `end_f`), and drives the
+> cascade on the Duck's `persist` event (`_record_persist` → engine → `_process`). The mirror uploads
+> the **sidecar last** (the commit marker — mirrored data always supersets its claims, so a cross-Pool
+> reader never sees a torn window). `persisted_f` on `/api/status` now reads the engine value (= `end_f`
+> for durable-at-completion Ponds). theory.md carries `persistedF` + `Source.visibleF` in the state
+> pseudocode. Tests: engine `test_cross_pool_sink_gates_on_persisted_f_same_pool_on_end_f` (+
+> monotonicity, both completion modes), driver `test_driver_persist_event_releases_cross_pool_sink`.
+>
+> **Not yet built:** phase 4 (Pool-loss rollback — freshness regression to `persisted_f`), phase 5
+> (named Pools as shared machines — task-per-Pool launcher), phase 6 (registry eviction). One accepted
+> conservatism: a Pond whose data was adopted onto the plane but that has not run since (async,
+> `persisted_f` = NEVER) holds cross-Pool Sinks until its first post-adopt mirror.
 
 ## The reframing
 

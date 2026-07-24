@@ -679,15 +679,22 @@ def persist_tree(local_dir, dest) -> int:
         return 0  # nothing published locally — never touch the durable layer from an empty source
     copied = 0
     local_dirs: set[str] = set()
+    files: list = []
+    # Data first, the SIDECAR LAST: `_trickle.json` is the mirror's commit marker — a cross-Pool reader
+    # trusts its freshness claims, so at every instant the mirrored data must be a superset of what the
+    # mirrored sidecar declares. Uploading it before its parts would expose a torn window (sidecar at f,
+    # parts for f still in flight → a delta read misses rows). Directories, then plain files, then it.
     for p in sorted(root.iterdir()):
         if p.name in _PERSIST_SKIP or p.name.endswith(".tmp"):
             continue
         if p.is_file():
-            dest.put_file(p, p.name)
-            copied += 1
+            files.append(p)
         elif p.is_dir():
             local_dirs.add(p.name)
             copied += _mirror_dir(p, dest, (p.name,))
+    for p in sorted(files, key=lambda q: q.name == "_trickle.json"):  # sidecar sorts last
+        dest.put_file(p, p.name)
+        copied += 1
     # Prune destination directories that no longer exist locally (skip-set aside) — e.g. a warm tier
     # folded into the cold base, or a table dropped locally. Guarded by the sidecar check above.
     for name in dest.subdir_names():
