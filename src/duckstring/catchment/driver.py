@@ -483,8 +483,89 @@ class Driver:
                     st.persisted_f = datetime.fromisoformat(pf) if pf else NEVER
                 else:
                     st.persisted_f = st.end_f
+            self._reconcile_lost_publishes()
             self.jobs = {key: self.jobs.get(key, []) for key in ponds}
             self.state_version += 1  # topology/config (deploy, ducts, windows) changed
+
+    def _reconcile_lost_publishes(self) -> None:
+        """Pool-loss rollback (plans/persist.md phase 4): make each async_persist Pond's freshness claims
+        match the bytes that actually survived. The local publish is the handoff and can die with its box
+        in the publish→persist window; a Pond then claims content (``changed_f``) that neither the local
+        layout nor the durable plane holds — a Sink reading now would get older bytes stamped as newer
+        freshness. On every reload (which every boot runs):
+
+        - **healthy** (the overwhelmingly common case, checked with one local file read): the local
+          sidecar's freshness backs ``changed_f`` → untouched. A pass advances ``end_f`` but publishes
+          nothing, so the comparison is content-anchored on ``changed_f``, never ``end_f``.
+        - **suspicious** (local bytes behind the claim): read the durable plane's sidecar (one object-store
+          read, rare path). The plane is TRUTH: its freshness advances ``persisted_f`` if ahead (this is
+          what un-parks cross-Pool Sinks after an adopt/hand-copy — the recorded watermark is advisory,
+          the plane decides). Then the Pond (and its Ripples) REGRESSES to the floor = what local ∪ plane
+          actually holds, the failure episode above the floor clears (that world is gone), and normal
+          demand re-runs the gap.
+
+        Fate-sharing makes this coherent: a same-Pool Sink that consumed the lost window lost its own
+        publishes with the same box and regresses by the same rule; a cross-Pool Sink never saw past
+        ``persisted_f`` at all (the gating rule). Deterministic from (DB, disk) — safe to re-run on every
+        reload; once the gap re-runs, the claims are backed again and this is a no-op."""
+        from pathlib import Path as _Path
+
+        from ..trickle_io import load_sidecar
+        from .registry import pond_data_dir
+
+        root = _Path(self.root)
+        for key, pond in self.state.ponds.items():
+            if not pond.async_persist:
+                continue
+            ps = self.state.pond_states[key]
+            if ps.changed_f == NEVER:
+                continue  # nothing ever published — nothing to back
+            meta = self.meta[key]
+            local_dir = pond_data_dir(root, meta["name"], meta["major"], None)
+            try:
+                local_f = _plane_freshness(load_sidecar(local_dir))
+            except Exception:
+                local_f = None
+            claimed = _iso(ps.changed_f)
+            if local_f is not None and local_f >= claimed:
+                continue  # the local publish backs the claim — healthy
+            try:
+                plane_f = _plane_freshness(
+                    load_sidecar(pond_data_dir(root, meta["name"], meta["major"], self.data_root)))
+            except Exception:
+                plane_f = None
+            if plane_f is not None and plane_f > _iso(ps.persisted_f):
+                ps.persisted_f = datetime.fromisoformat(plane_f)  # the plane is truth (adopt/hand-copy)
+                self.persisted[key] = plane_f
+                self.db.execute("UPDATE pond_state SET persisted_f = ? WHERE pond_id = ?",
+                                (plane_f, meta["pond_id"]))
+            floor = max(ps.persisted_f,
+                        datetime.fromisoformat(local_f) if local_f else NEVER)
+            if ps.changed_f <= floor:
+                continue  # the plane (or what's left locally) covers the claim after all
+            print(f"[driver] {key}: published content through {claimed} was lost with its Pool "
+                  f"(backed only through {_iso(floor)}) — regressing; demand will re-run the gap",
+                  flush=True)
+            ps.end_f = ps.start_f = ps.changed_f = floor
+            if ps.failed_f > floor:  # a failure episode above the floor belongs to the lost world
+                ps.is_failed = False
+                ps.failed_f = NEVER
+                ps.failures = 0
+            ps.targets = [t for t in ps.targets if t > floor]
+            for rid in (r for r, rip in self.state.ripples.items() if rip.pond_id == key):
+                rs = self.state.ripple_states[rid]
+                rs.end_f = min(rs.end_f, floor)
+                rs.start_f = min(rs.start_f, floor)
+                rs.targets = [t for t in rs.targets if t > floor]
+            self.db.execute(
+                "UPDATE pond_state SET start_f=?, end_f=?, changed_f=?, is_failed=?, failed_f=?, "
+                "failures=? WHERE pond_id=?",
+                (_iso(floor), _iso(floor), _iso(floor), int(ps.is_failed), _iso(ps.failed_f),
+                 ps.failures, meta["pond_id"]),
+            )
+        self.db.commit()
+        for pid in self.state.pond_states:
+            derive_blocked(self.state, pid)
 
     def _load_pond_state(self, pond_id: int) -> PondState:
         row = self.db.execute(
@@ -2614,6 +2695,105 @@ class Driver:
             self._tick_process(now)
             self._check_freshness(now)
             self._check_renotify(now)
+            self._check_disk_pressure(now)
+
+    # Registry eviction under disk pressure (plans/persist.md phase 6). Registries (and, once mirrored,
+    # local publishes) are reconstructible caches — under pressure the Catchment Pool sheds idle Ponds'
+    # hot state, LRU, and they rehydrate on next demand. Free-space floor: DUCKSTRING_MIN_FREE_BYTES
+    # (default 1 GiB; 0 disables). Checked cheaply every tick (one statvfs); the eviction scan runs only
+    # below the floor.
+    _EVICT_CHECK_EVERY = timedelta(seconds=30)
+
+    def _min_free_bytes(self) -> int:
+        try:
+            return int(os.environ.get("DUCKSTRING_MIN_FREE_BYTES", str(1 << 30)))
+        except ValueError:
+            return 1 << 30
+
+    def _check_disk_pressure(self, now: datetime) -> None:
+        floor = self._min_free_bytes()
+        if floor <= 0 or not self.launcher.manages_processes:
+            return
+        last = getattr(self, "_last_evict_check", None)
+        if last is not None and (now - last) < self._EVICT_CHECK_EVERY:
+            return
+        self._last_evict_check = now
+        try:
+            st = os.statvfs(str(self.root))
+            free = st.f_bavail * st.f_frsize
+        except Exception:
+            return
+        if free >= floor:
+            return
+        self._evict_idle_registries(now, floor - free)
+
+    def _evict_idle_registries(self, now: datetime, needed: int) -> None:
+        """Shed idle Ponds' reconstructible hot state, LRU by last completion, until ``needed`` bytes are
+        reclaimed or candidates run out. Two safety-tiered forms per Pond:
+
+        - the **registry** (registry.duckdb) — evictable whenever the Pond's published content survives
+          somewhere it can rehydrate from (the local publish, or the durable plane);
+        - the **local publish** too — ONLY when the durable plane holds everything (``persisted_f >=
+          changed_f``): reads then resolve to the plane and rehydration comes from it. Never evicted
+          when un-mirrored content exists — eviction must never lose data.
+
+        Only idle, demand-free, non-running Ponds qualify (their Duck is terminated first). Draws/Spouts
+        hold no registry."""
+        import shutil
+        from pathlib import Path as _Path
+
+        from ..trickle_io import load_sidecar
+        from .registry import pond_data_dir, pond_registry_path
+
+        root = _Path(self.root)
+        candidates = []
+        for key, pond in self.state.ponds.items():
+            if pond.is_draw or pond.is_spout:
+                continue
+            ps = self.state.pond_states[key]
+            if ps.start_f > ps.end_f or ps.has_pull or ps.targets or key in self.jobs and self.jobs[key]:
+                continue  # running or demanded — never evict live work
+            if self.launcher.is_running(key):
+                continue  # warm Duck (standing trigger keeps it) — reaping is the reaper's job, not ours
+            meta = self.meta[key]
+            reg = pond_registry_path(root, meta["name"], meta["major"])
+            if not reg.exists():
+                continue  # nothing to shed
+            local_dir = pond_data_dir(root, meta["name"], meta["major"], None)
+            try:
+                local_f = _plane_freshness(load_sidecar(local_dir))
+            except Exception:
+                local_f = None
+            claimed = _iso(ps.changed_f) if ps.changed_f != NEVER else None
+            mirrored = pond.async_persist and claimed is not None and _iso(ps.persisted_f) >= claimed
+            backed_local = claimed is None or (local_f is not None and local_f >= claimed)
+            if not (backed_local or mirrored):
+                continue  # the registry is the only copy of something — never evict
+            last_done = ps.completion_times[-1] if ps.completion_times else NEVER
+            candidates.append((last_done, key, reg, local_dir, mirrored))
+        candidates.sort()  # LRU: oldest completion first
+        reclaimed = 0
+        for _, key, reg, local_dir, mirrored in candidates:
+            if reclaimed >= needed:
+                break
+            self.launcher.terminate(key, wait=True)
+            size = 0
+            for p in (reg, reg.with_name(reg.name + ".wal"), reg.with_name(reg.name + ".shm")):
+                try:
+                    size += p.stat().st_size
+                    p.unlink()
+                except OSError:
+                    pass
+            if mirrored:  # tier 2: the plane holds everything — the local publish is shed too
+                try:
+                    size += sum(f.stat().st_size for f in local_dir.root.rglob("*") if f.is_file())
+                    shutil.rmtree(local_dir.root, ignore_errors=True)
+                except OSError:
+                    pass
+            reclaimed += size
+            print(f"[driver] disk pressure: evicted {key}'s hot state "
+                  f"({size / 1e6:.0f} MB; {'registry+publish' if mirrored else 'registry'}) — "
+                  f"rehydrates on next demand", flush=True)
 
     def _check_liveness(self, now: datetime) -> None:
         """Fail any Pond whose Duck has died (process gone) or fallen silent (no contact) while a Run

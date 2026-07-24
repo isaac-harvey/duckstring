@@ -161,3 +161,173 @@ def test_driver_persist_event_releases_cross_pool_sink(tmp_path, monkeypatch):
     assert driver.persisted["sales@1"] == t0.isoformat()
     st = next(p for p in driver.status()["ponds"] if p["id"] == "sales@1")
     assert st["persisted_f"] == t0.isoformat()
+
+
+def _persist_driver(tmp_path, monkeypatch=None, data_root=None):
+    """A Driver over one registered pond line 'sales@1' (one ripple 'agg'), NoopLauncher."""
+    from duckstring.catchment.db import connect, migrate
+    from duckstring.catchment.driver import Driver
+    from duckstring.catchment.launcher import NoopLauncher
+    from duckstring.catchment.routes.deploy import _register
+
+    db = connect(tmp_path / "duck.db")
+    migrate(db)
+    cfg = {"sources": {}, "immediate_retries": 0, "source_retries": 0, "kind": "outlet"}
+    _register(db, "sales", "1.0.0", "outlet", "ponds/sales/1.0.0", cfg,
+              [{"func": "f", "name": "agg", "parents": []}])
+    return db, Driver(db, tmp_path, "http://x", NoopLauncher(), data_root=data_root)
+
+
+def _set_freshness(db, driver, key, f_iso, persisted_iso=None):
+    pond_id = driver.meta[key]["pond_id"]
+    db.execute("INSERT INTO pond_state (pond_id, start_f, end_f, changed_f, persisted_f) "
+               "VALUES (?, ?, ?, ?, ?) ON CONFLICT(pond_id) DO UPDATE SET "
+               "start_f=excluded.start_f, end_f=excluded.end_f, changed_f=excluded.changed_f, "
+               "persisted_f=excluded.persisted_f",
+               (pond_id, f_iso, f_iso, f_iso, persisted_iso))
+    db.commit()
+
+
+def test_pool_loss_regresses_to_the_persisted_floor(tmp_path):
+    """Pool-loss rollback (plans/persist.md phase 4): a Pond whose local publish died in the
+    publish→persist window claims content (changed_f) that no surviving bytes back — on reload it
+    regresses to the floor of what local ∪ plane actually holds (here: the durable plane through
+    persisted_f), its failure state above the floor clears, and its Ripples clamp with it."""
+    import json
+    from datetime import datetime, timezone
+
+    from duckstring.catchment.registry import pond_data_dir
+
+    f_old = "2026-06-01T00:00:00+00:00"   # mirrored to the plane before the loss
+    f_new = "2026-06-02T00:00:00+00:00"   # published locally, lost with the box
+    db, driver = _persist_driver(tmp_path, data_root=str(tmp_path / "durable"))
+    # The durable plane holds content through f_old (what the last completed mirror landed).
+    plane = pond_data_dir(tmp_path, "sales", 1, str(tmp_path / "durable"))
+    plane.write_text(json.dumps({"t": {"mode": "overwrite", "f": f_old}}), "_trickle.json")
+    # The DB claims f_new (the run completed before the box died); no local publish survives.
+    _set_freshness(db, driver, "sales@1", f_new, persisted_iso=f_old)
+    driver.reload()
+
+    ps = driver.state.pond_states["sales@1"]
+    want = datetime(2026, 6, 1, tzinfo=timezone.utc)
+    assert ps.end_f == want and ps.changed_f == want and ps.start_f == want, \
+        "the lost window must regress to the persisted floor"
+    assert driver.state.ripple_states["sales@1.agg"].end_f <= want
+    # Persisted to the DB too (a second reload is a no-op, not a second regression).
+    row = db.execute("SELECT end_f FROM pond_state WHERE pond_id=?",
+                     (driver.meta["sales@1"]["pond_id"],)).fetchone()
+    assert row[0] == f_old
+
+
+def test_pool_loss_healthy_local_publish_is_untouched(tmp_path):
+    """The healthy path: the local publish backs the claim → no plane read, no regression — even though
+    the persisted watermark lags (the mirror simply hasn't landed yet; that is the normal async window)."""
+    import json
+    from datetime import datetime, timezone
+
+    from duckstring.catchment.registry import pond_data_dir
+
+    f = "2026-06-02T00:00:00+00:00"
+    db, driver = _persist_driver(tmp_path, data_root=str(tmp_path / "durable"))
+    local = pond_data_dir(tmp_path, "sales", 1, None)
+    local.mkdir()
+    local.write_text(json.dumps({"t": {"mode": "overwrite", "f": f}}), "_trickle.json")
+    _set_freshness(db, driver, "sales@1", f, persisted_iso=None)  # mirror not yet landed
+    driver.reload()
+    assert driver.state.pond_states["sales@1"].end_f == datetime(2026, 6, 2, tzinfo=timezone.utc)
+
+
+def test_plane_truth_advances_persisted_after_adopt(tmp_path):
+    """The plane is truth: content adopted/hand-copied onto the durable plane (no recorded watermark, no
+    local publish) advances persisted_f to the plane's freshness instead of regressing — un-parking
+    cross-Pool Sinks without waiting for a first post-adopt mirror."""
+    import json
+    from datetime import datetime, timezone
+
+    from duckstring.catchment.registry import pond_data_dir
+
+    f = "2026-06-03T00:00:00+00:00"
+    db, driver = _persist_driver(tmp_path, data_root=str(tmp_path / "durable"))
+    plane = pond_data_dir(tmp_path, "sales", 1, str(tmp_path / "durable"))
+    plane.write_text(json.dumps({"t": {"mode": "overwrite", "f": f}}), "_trickle.json")
+    _set_freshness(db, driver, "sales@1", f, persisted_iso=None)  # adopt wrote freshness, no watermark
+    driver.reload()
+    ps = driver.state.pond_states["sales@1"]
+    want = datetime(2026, 6, 3, tzinfo=timezone.utc)
+    assert ps.end_f == want, "adopted content backed by the plane must NOT regress"
+    assert ps.persisted_f == want, "the plane's freshness must advance the watermark"
+    assert driver.persisted["sales@1"] == f
+
+
+def test_total_loss_regresses_to_never(tmp_path):
+    """Nothing survives anywhere (never mirrored, local gone) → a full cold regress: the honest state is
+    'this Pond has never published', and demand rebuilds from scratch."""
+    db, driver = _persist_driver(tmp_path, data_root=str(tmp_path / "durable"))
+    _set_freshness(db, driver, "sales@1", "2026-06-02T00:00:00+00:00", persisted_iso=None)
+    driver.reload()
+    from duckstring.engine import NEVER
+    assert driver.state.pond_states["sales@1"].end_f == NEVER
+
+
+def test_disk_pressure_evicts_idle_reconstructible_state(tmp_path, monkeypatch):
+    """Registry eviction under disk pressure (plans/persist.md phase 6): below the free-space floor, idle
+    Ponds shed their reconstructible hot state LRU — the registry whenever a publish backs it; the local
+    publish too only when the durable plane holds everything (persisted >= changed). A Pond whose registry
+    is the only copy of anything is never touched. No pressure → no eviction."""
+    import json
+    import os as _os
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+
+    from duckstring.catchment.registry import pond_data_dir, pond_registry_path
+
+    f = "2026-06-02T00:00:00+00:00"
+    db, driver = _persist_driver(tmp_path, data_root=str(tmp_path / "durable"))
+
+    class FakeLauncher:
+        manages_processes = True
+        def is_running(self, key): return False
+        def terminate(self, key, wait=False): pass
+    driver.launcher = FakeLauncher()
+
+    # An idle pond: registry on disk, local publish current, and FULLY MIRRORED to the plane.
+    reg = pond_registry_path(tmp_path, "sales", 1)
+    reg.parent.mkdir(parents=True, exist_ok=True)
+    reg.write_bytes(b"x" * 4096)
+    local = pond_data_dir(tmp_path, "sales", 1, None)
+    local.mkdir()
+    local.write_text(json.dumps({"t": {"mode": "overwrite", "f": f}}), "_trickle.json")
+    plane = pond_data_dir(tmp_path, "sales", 1, str(tmp_path / "durable"))
+    plane.write_text(json.dumps({"t": {"mode": "overwrite", "f": f}}), "_trickle.json")
+    _set_freshness(db, driver, "sales@1", f, persisted_iso=f)
+    driver.reload()
+    driver.launcher = FakeLauncher()  # reload does not touch the launcher, but be explicit
+    driver.state.pond_states["sales@1"].completion_times.append(datetime(2026, 6, 2, tzinfo=timezone.utc))
+
+    # No pressure → nothing evicted.
+    monkeypatch.setattr(_os, "statvfs", lambda p: SimpleNamespace(f_bavail=10**9, f_frsize=4096))
+    driver._last_evict_check = None
+    driver.scheduler_tick()
+    assert reg.exists() and (local.root / "_trickle.json").exists()
+
+    # Pressure → the mirrored pond sheds registry AND local publish (reads fall to the plane).
+    monkeypatch.setattr(_os, "statvfs", lambda p: SimpleNamespace(f_bavail=1, f_frsize=4096))
+    driver._last_evict_check = None
+    driver.scheduler_tick()
+    assert not reg.exists(), "the registry must be shed under pressure"
+    assert not (local.root / "_trickle.json").exists(), "a fully-mirrored local publish is shed too"
+
+    # Un-mirrored content (persisted behind changed): the registry is shed (local publish backs it) but
+    # the local publish MUST survive — it is the only copy.
+    reg.parent.mkdir(parents=True, exist_ok=True)
+    reg.write_bytes(b"x" * 4096)
+    local.mkdir()
+    local.write_text(json.dumps({"t": {"mode": "overwrite", "f": f}}), "_trickle.json")
+    _set_freshness(db, driver, "sales@1", f, persisted_iso=None)
+    driver.reload()
+    driver.launcher = FakeLauncher()
+    driver.state.pond_states["sales@1"].completion_times.append(datetime(2026, 6, 2, tzinfo=timezone.utc))
+    driver._last_evict_check = None
+    driver.scheduler_tick()
+    assert not reg.exists(), "the registry is reconstructible from the local publish"
+    assert (local.root / "_trickle.json").exists(), "an un-mirrored local publish must NEVER be evicted"

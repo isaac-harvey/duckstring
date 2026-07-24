@@ -252,19 +252,20 @@ def test_switch_data_root_migrate_copies_and_preserves_freshness(tmp_path):
     m = driver.meta[key]
     name, major, pond_id = m["name"], m["major"], m["pond_id"]
     driver.wave(key)  # demand that must survive the migrate
-    # The Catchment is currently fresh at F (migrate carries a verbatim copy, so this must be KEPT — not
-    # reset by re-reading the target sidecar).
+    # Populate plane A FIRST (bytes precede claims — the reload below reconciles freshness against the
+    # plane, and a claim no plane backs would be regressed as lost content; plans/persist.md phase 4):
+    # the flat, self-contained files (carried) + Iceberg catalog/namespace (skipped).
     F = "2026-06-06T00:00:00+00:00"
-    db.execute("UPDATE pond_state SET start_f=?, end_f=?, changed_f=? WHERE pond_id=?", (F, F, F, pond_id))
-    db.commit()
-    driver.reload()
-
-    # Populate plane A: the flat, self-contained files (carried) + Iceberg catalog/namespace (skipped).
     a = pond_data_dir(tmp_path, name, major, str(tmp_path / "planeA"))
     a.write_text(json.dumps({"orders": {"mode": "overwrite", "f": F}}), "_trickle.json")
     a.write_bytes(b"parquet-bytes", "orders.parquet")
     a.write_text("{}", "catalog.json")                       # Iceberg pointer — must NOT travel
     a.child("pond.db").write_bytes(b"meta", "v1.metadata.json")  # Iceberg namespace — must NOT travel
+    # The Catchment is currently fresh at F (migrate carries a verbatim copy, so this must be KEPT — not
+    # reset by re-reading the target sidecar).
+    db.execute("UPDATE pond_state SET start_f=?, end_f=?, changed_f=? WHERE pond_id=?", (F, F, F, pond_id))
+    db.commit()
+    driver.reload()
 
     driver.migrate(str(tmp_path / "planeB"))  # blocking: copies + re-points (runs to completion here)
 
