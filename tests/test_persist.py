@@ -424,3 +424,37 @@ def test_export_keeps_unhydrated_parts_and_prunes_only_below_floor(tmp_path):
     ParquetDataPlane().export(con, data_dir, f=ts(4))
     kept = sorted(p.name for p in (data_dir / "ev").glob("*.parquet"))
     assert kept == ["2026-01-04T00_00_00+00_00.parquet"], f"retention must prune below the floor: {kept}"
+
+
+def test_status_poll_lists_the_data_plane_once_per_data_version(tmp_path, monkeypatch):
+    """/api/status must stay off the storage layer on the hot poll path: the published-surface flags
+    (has_tables/has_objects) list the data plane ONCE per data_version, not per poll — for a Pond with
+    no local publish the resolve falls to the object store, and an un-cached LIST per Pond per ~1 s poll
+    is what made cloud-enabled status take seconds."""
+    import duckstring.dataplane as dp
+    import duckstring.objects as obj
+
+    db, driver = _persist_driver(tmp_path, data_root=str(tmp_path / "durable"))
+    calls = {"tables": 0, "objects": 0}
+
+    class FakePlane:
+        def list_tables(self, dd):
+            calls["tables"] += 1
+            return ["t"]
+
+    monkeypatch.setattr(dp, "get_data_plane", lambda: FakePlane())
+
+    def fake_objects(dd):
+        calls["objects"] += 1
+        return []
+
+    monkeypatch.setattr(obj, "list_objects", fake_objects)
+
+    for _ in range(5):
+        driver.status()
+    assert calls["tables"] == 1 and calls["objects"] == 1, \
+        f"the poll path re-listed storage: {calls}"
+    driver.data_version += 1  # new data (run/persist/draw) → one re-list
+    driver.status()
+    driver.status()
+    assert calls["tables"] == 2 and calls["objects"] == 2

@@ -78,6 +78,11 @@ def test_status_flags_ponds_with_exported_tables(tmp_path):
     con.execute(f"COPY (SELECT 1 AS id) TO '{data_dir / 'anything.parquet'}' (FORMAT PARQUET)")
     con.close()
 
+    # has_tables is cached per data_version (the ~1s status poll must never re-list storage — over an
+    # object store that made /api/status take seconds). Every real data arrival bumps it (run
+    # completion, persist, draw, deploy/reload); this test wrote the file BEHIND the driver's back, so
+    # it does what an operator hand-placing data would: reload.
+    d.reload()
     assert _pond(d.status(), "src")["has_tables"] is True
     assert _pond(d.status(), "snk")["has_tables"] is False  # only src exported
 

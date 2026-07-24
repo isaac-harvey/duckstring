@@ -243,6 +243,9 @@ class Driver:
         self.jobs: dict[str, list[dict]] = {}  # key -> queued Duck commands
         self.last_seen: dict[str, datetime] = {}  # key -> last Duck contact (jobs poll / event)
         self.persisted: dict[str, str] = {}  # key -> persisted_f ISO (the durable-mirror watermark)
+        # Status-poll caches for the published-surface flags, keyed on data_version — see _exported_tables.
+        self._tables_cache: dict[str, tuple[int, set]] = {}
+        self._objects_cache: dict[str, tuple[int, bool]] = {}
         self._idle_since: dict[str, datetime] = {}  # key -> when the Pond went idle (reap grace clock)
         # Pond Draw transfers awaiting the poller: (pond_key, F). A Draw run is not dispatched to a
         # Duck — the poller performs the parquet fetch out-of-lock, then reports completion.
@@ -3011,6 +3014,10 @@ class Driver:
                                 (f, meta["pond_id"]))
             if pond in self.state.pond_states:
                 record_persist(self.state, pond, datetime.fromisoformat(f))
+            # The durable plane just gained this line's output — the readable surface changed: refresh
+            # the status-poll caches (a Pool-run Pond's has_tables flips HERE, not at run completion,
+            # because the Catchment reads it from the plane) and the warm serving connections.
+            self.data_version += 1
         self.db.commit()
         if status == "success":
             self._process(now)  # a cross-Pool Sink waiting on this Source's mirror may now be runnable
@@ -3345,7 +3352,16 @@ class Driver:
     def _exported_tables(self, key: str) -> set[str]:
         """Names of the tables this major line has published to its data dir (the exported Parquet/
         Iceberg snapshot). Best-effort — a data-read hiccup must never break ``status()``; a Draw has
-        no local output. ``list_tables`` globs the flat sidecar, so it needs no Iceberg extension."""
+        no local output. ``list_tables`` globs the flat sidecar, so it needs no Iceberg extension.
+
+        **Cached per ``data_version``** — this runs per Pond on every ~1 s status poll, and for a line
+        with no local publish (a Pool/remote-run Pond) the resolve falls to the data root: an object-store
+        LIST per Pond per poll (the listings cache is off for cross-process correctness) made /api/status
+        take seconds under cloud. The published table set only changes when data does, and every such
+        change bumps ``data_version`` (run completion, persist landing, draw, reload)."""
+        cached = self._tables_cache.get(key)
+        if cached is not None and cached[0] == self.data_version:
+            return cached[1]
         from pathlib import Path
 
         from ..dataplane import get_data_plane
@@ -3356,12 +3372,18 @@ class Driver:
             return set()
         try:
             data_dir = resolve_data_dir(Path(self.root), meta["name"], meta["major"], self.data_root)
-            return set(get_data_plane().list_tables(data_dir))
+            out = set(get_data_plane().list_tables(data_dir))
         except Exception:
-            return set()
+            out = set()
+        self._tables_cache[key] = (self.data_version, out)
+        return out
 
     def _has_objects(self, key: str) -> bool:
-        """Whether this major line has published any non-tabular Object — gates the viewer's Objects tab."""
+        """Whether this major line has published any non-tabular Object — gates the viewer's Objects tab.
+        Cached per ``data_version``, same reasoning as :meth:`_exported_tables`."""
+        cached = self._objects_cache.get(key)
+        if cached is not None and cached[0] == self.data_version:
+            return cached[1]
         from pathlib import Path
 
         from ..objects import list_objects
@@ -3372,9 +3394,11 @@ class Driver:
             return False
         try:
             data_dir = resolve_data_dir(Path(self.root), meta["name"], meta["major"], self.data_root)
-            return bool(list_objects(data_dir))
+            out = bool(list_objects(data_dir))
         except Exception:
-            return False
+            out = False
+        self._objects_cache[key] = (self.data_version, out)
+        return out
 
     def status(self) -> dict:
         with self.lock:
