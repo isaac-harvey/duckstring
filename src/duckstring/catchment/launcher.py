@@ -140,6 +140,7 @@ class DispatchingLauncher:
         self.default_provider = default_provider
         self.data_root = getattr(local, "data_root", None)  # mirrors the backends' value (see set_data_root)
         self._owner: dict[str, object] = {}  # pond_key → the backend that spawned it
+        self.pools: dict[str, object] = {}  # named Pool → its PoolLauncher (one shared machine each)
 
     @property
     def base_url(self):
@@ -153,8 +154,59 @@ class DispatchingLauncher:
         provider = ((duck or {}).get("pool") or {}).get("provider") or self.default_provider
         return self.remotes.get(provider) or self.remotes.get(self.default_provider)
 
+    def pool_identity(self, duck: dict | None) -> str | None:
+        """The named Pool this spawn belongs to, or ``None`` for per-machine routing. A named,
+        non-preset pool is ONE shared machine (plans/pool-agent.md; presets/dedicated stay isolated
+        task-per-Pond by the settled taxonomy). Routable only when the durable plane exists (cross-Pool
+        reads go through it) and the pool's provider has a machine to offer: ``local`` needs only the
+        data root; ``fargate``/``ec2`` need their remote backend attached (cloud enabled)."""
+        if not duck or not duck.get("remote") or duck.get("preset"):
+            return None
+        target = duck.get("duck_target")
+        if not target or target == "dedicated":
+            return None
+        if self.data_root is None:
+            return None  # no durable plane — nothing cross-Pool could read; degrade to per-Pond routing
+        provider = ((duck.get("pool") or {}).get("provider")) or self.default_provider
+        if provider == "local":
+            return target
+        if self._remote_for(duck) is not None:
+            return target
+        return None
+
+    def pool_launcher(self, name: str):
+        """The PoolLauncher for a named pool (the routes' lookup) — ``None`` if none is live."""
+        return self.pools.get(name)
+
+    def _pool_backend(self, name: str, duck: dict):
+        from .pool_launcher import (
+            Ec2PoolMachine,
+            FargatePoolMachine,
+            LocalPoolMachine,
+            PoolLauncher,
+        )
+
+        pl = self.pools.get(name)
+        if pl is not None:
+            return pl
+        spec = duck.get("pool") or {}
+        provider = spec.get("provider") or self.default_provider
+        if provider == "local":
+            machine = LocalPoolMachine(
+                name, Path(self.local.root) / "pools" / name, self.local.base_url,
+                getattr(self.local, "token", ""), self.data_root, self.data_root)
+        elif provider == "ec2":
+            machine = Ec2PoolMachine(name, spec, self._remote_for(duck))
+        else:
+            machine = FargatePoolMachine(name, spec, self._remote_for(duck))
+        pl = self.pools[name] = PoolLauncher(name, machine)
+        return pl
+
     def _backend_for(self, duck: dict | None):
         if duck and duck.get("remote"):
+            pool_name = self.pool_identity(duck)
+            if pool_name is not None:
+                return self._pool_backend(pool_name, duck)
             remote = self._remote_for(duck)
             if remote is not None:
                 return remote
@@ -162,11 +214,15 @@ class DispatchingLauncher:
 
     def set_data_root(self, data_root: str | None) -> None:
         """Propagate a live data-root switch to every backend (the dispatcher itself reads none — its
-        local/remote backends carry the value into each Duck spawn)."""
+        local/remote backends carry the value into each Duck spawn). Named-Pool machines captured the
+        old root at start, so they are stopped and rebuilt lazily on the next spawn."""
         self.data_root = data_root
         self.local.data_root = data_root
         for remote in self.remotes.values():
             remote.data_root = data_root
+        for pl in self.pools.values():
+            pl.shutdown_all()
+        self.pools.clear()
 
     def attach_remotes(self, remotes, dialback=None) -> None:
         """Install remote backends onto a live launcher — runtime cloud-enable (creds / the data root
@@ -224,11 +280,16 @@ class DispatchingLauncher:
             self.local.terminate(pond_key, wait=wait)
             for remote in self.remotes.values():
                 remote.terminate(pond_key, wait=wait)
+            for pl in self.pools.values():
+                pl.terminate(pond_key, wait=wait)
 
     def shutdown_all(self) -> None:
         self.local.shutdown_all()
         for remote in self.remotes.values():
             remote.shutdown_all()
+        for pl in self.pools.values():
+            pl.shutdown_all()
+        self.pools.clear()
         if self.dialback is not None:
             self.dialback.stop()
 

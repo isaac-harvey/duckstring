@@ -176,7 +176,7 @@ IRREVERSIBLE_OPS = frozenset({"reset", "wipe", "remove"})
 # size means physically is the launcher's business (the local subprocess ignores it).
 FLOCK_MODES = ("off", "upgrade", "always")
 OOM_POLICIES = ("fail_up", "fail")
-POOL_PROVIDERS = ("fargate", "ec2")
+POOL_PROVIDERS = ("fargate", "ec2", "local")  # local = a shared Pool machine on this box (dev/test)
 
 # Built-in preset Duck Pools (plans/cloud-config.md §4b): Fargate task sizes, always available so a
 # `pond.toml duck = "M"` works with zero pool setup — and DSC ships the SAME names backed by its own
@@ -397,8 +397,11 @@ class Driver:
                     retry_immediately=imm, retry_on_change=onc, is_draw=bool(is_draw),
                     is_spout=bool(is_spout), has_missing_source=has_missing_source, always_run=always_run,
                     pool=pool,
-                    async_persist=(pool == "catchment" and self.data_root is not None
-                                   and not (is_draw or is_spout)),
+                    # Local-first publish + async Persist applies on every SHARED filesystem — the
+                    # Catchment Pool and named Pools (whose agent passes --persist-root). Only a
+                    # per-Pond remote Duck ("duck:*" — preset/dedicated) publishes the plane directly.
+                    async_persist=(self.data_root is not None and not (is_draw or is_spout)
+                                   and not pool.startswith("duck:")),
                 )
                 pond_states[key] = self._load_pond_state(pond_id)
                 if is_spout:
@@ -1369,7 +1372,22 @@ class Driver:
                 )
                 self.duck_overrides[pond] = new
             self.db.commit()
+            self._refresh_pool_identities()  # the target moved → the engine's Pool/persist model follows
             self.state_version += 1  # the config shows in /api/status
+
+    def _refresh_pool_identities(self) -> None:
+        """Recompute each Pond's Pool identity + persist mode in the live engine after a compute-config
+        change (a duck override, a pool created/removed) — cheaper than a full reload, and demand-safe
+        (freshness/demand state untouched; only the visibility/persist model updates)."""
+        for key, pond in self.state.ponds.items():
+            if pond.is_draw or pond.is_spout:
+                continue
+            pond.pool = self._pool_of(key)
+            pond.async_persist = (self.data_root is not None
+                                  and not pond.pool.startswith("duck:"))
+            ps = self.state.pond_states.get(key)
+            if ps is not None and not pond.async_persist:
+                ps.persisted_f = ps.end_f  # durable at completion — the watermark tracks end_f
 
     def _pool_of(self, pond: str) -> str:
         """The Pool (one shared filesystem — plans/persist.md) this Pond's Duck runs on, mirroring the
@@ -1385,6 +1403,13 @@ class Driver:
             return "catchment"
         if not duck.get("remote"):
             return "catchment"
+        # A named, non-preset pool the dispatcher would route to a shared machine → the SHARED Pool
+        # identity: every Pond on it sees the others at end_f (plans/pool-agent.md).
+        pool_identity = getattr(self.launcher, "pool_identity", None)
+        if pool_identity is not None:
+            shared = pool_identity(duck)
+            if shared is not None:
+                return f"pool:{shared}"
         remote_for = getattr(self.launcher, "_remote_for", None)
         if remote_for is None or remote_for(duck) is None:
             return "catchment"  # no backend to take it — the dispatcher runs it locally
@@ -1412,6 +1437,7 @@ class Driver:
         return {
             "duck_target": target,
             "remote": target != "catchment",
+            "preset": target in PRESET_POOLS,  # presets are isolated task-per-Pond, never a shared Pool
             "pool": pool,
             "dedicated_instance_type": o["dedicated_instance_type"],
             "dedicated_auto_stop": o["dedicated_auto_stop"],
@@ -1495,6 +1521,7 @@ class Driver:
             self.db.commit()
             self.duck_pool_names.add(name)
             self._pool_cache = None
+            self._refresh_pool_identities()
             self.state_version += 1
         return self.get_pool(name)
 
@@ -1516,6 +1543,7 @@ class Driver:
             self.db.commit()
             self.duck_pool_names.discard(name)
             self._pool_cache = None
+            self._refresh_pool_identities()
             self.state_version += 1
 
     # ─── Data serving: the exposure model + the served-major pointer (plans/data-serving.md) ──
@@ -3461,6 +3489,9 @@ class Driver:
                     # plane through this freshness (= end_f for a Pond whose publish is durable at
                     # completion). Cross-Pool Sinks gate on it (source_visible_f).
                     "persisted_f": ts(ps.persisted_f),
+                    # The Pool (shared filesystem) this Pond's Duck runs on — "catchment", "pool:{name}"
+                    # (a shared named Pool), or "duck:{key}" (an isolated preset/dedicated machine).
+                    "pool": self.state.ponds[key].pool,
                     "d_ms": int(ps.d.total_seconds() * 1000),
                     "trigger": trigger,
                     "is_failed": ps.is_failed,

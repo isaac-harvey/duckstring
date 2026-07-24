@@ -239,6 +239,57 @@ def test_local_first_publish_persists_to_data_root(runtime, tmp_path_factory):
     assert r.json()["count"] > 0
 
 
+@pytest.mark.timeout(120)
+def test_named_pool_runs_co_resident_ducks(runtime, tmp_path_factory):
+    """Phase 5 offline e2e (plans/pool-agent.md): a named Pool with provider 'local' is ONE shared
+    machine — a real Pool-agent subprocess with its OWN root — hosting every targeted Pond's Duck as a
+    co-resident child. The whole chain runs on the Pool (publishes land under the AGENT'S root, not the
+    Catchment's — the shared-filesystem handoff), the engine models the shared Pool identity, and each
+    line async-persists to the durable plane, which is where the Catchment (a different Pool) reads it.
+    This exercises every seam of the agent protocol except the ~30 lines that start a Fargate/EC2
+    machine — the real-AWS gate run's job."""
+    url, root = runtime
+    durable = tmp_path_factory.mktemp("pool_durable")
+    r = httpx.put(f"{url}/api/catchment/settings",
+                  json={"data_root": str(durable), "mode": "empty"}, timeout=10.0)
+    assert r.status_code == 200, r.text
+    r = httpx.post(f"{url}/api/catchment/duck-pools",
+                   json={"name": "devpool", "provider": "local"}, timeout=10.0)
+    assert r.status_code == 200, r.text
+
+    _deploy_demo(url)
+    for name in _PONDS:
+        r = httpx.post(f"{url}/api/ponds/{name}/duck", json={"duck_target": "devpool"}, timeout=10.0)
+        assert r.status_code == 200, r.text
+
+    # The engine models every Pond on the SHARED Pool identity (same-Pool end_f gating between them).
+    for p in httpx.get(f"{url}/api/status", timeout=5.0).json()["ponds"]:
+        assert p["pool"] == "pool:devpool", f"{p['name']} not on the shared Pool: {p['pool']}"
+
+    httpx.post(f"{url}/api/ponds/reports/pulse", timeout=5.0)
+    assert _wait(lambda: (_pond_status(url, "reports") or {}).get("end_f") is not None, timeout=90.0), \
+        "the chain never completed on the Pool"
+
+    agent_root = root / "pools" / "devpool"
+    for name in _PONDS:
+        # Published on the POOL's filesystem (the co-resident handoff), not the Catchment's.
+        assert (agent_root / "ponds" / name / "m1" / "data" / "_trickle.json").exists(), \
+            f"{name}: no publish under the Pool agent's root"
+        assert not (root / "ponds" / name / "m1" / "data" / "_trickle.json").exists(), \
+            f"{name}: published under the Catchment root — it did not run on the Pool"
+    # Each line persists to the durable plane (a Pool Duck is async_persist, like a Catchment-Pool one).
+    for name in _PONDS:
+        assert _wait(lambda n=name: (_pond_status(url, n) or {}).get("persisted_f") is not None,
+                     timeout=45.0), f"{name}: persisted_f never advanced"
+        assert (durable / name / "m1" / "data" / "_trickle.json").exists(), \
+            f"{name}: no durable mirror"
+    # The Catchment (a different Pool) reads the output from the durable plane.
+    r = httpx.post(f"{url}/api/query/count", json={"pond": "reports", "table": "daily_summary"}, timeout=10.0)
+    if r.status_code != 200:  # table name differs per demo — fall back to the table list
+        tables = httpx.get(f"{url}/api/ponds/reports/tables", timeout=10.0).json()["tables"]
+        assert tables, "reports published no readable tables to the durable plane"
+
+
 _TPCDS_PONDS = ("tpcds_sales", "tpcds_items", "tpcds_stores", "tpcds_priced",
                 "tpcds_category_revenue", "tpcds_store_revenue")
 _GHARCHIVE_PONDS = ("gh_events", "gh_actors", "gh_pushes", "gh_repo_activity", "gh_stars", "gh_trending")

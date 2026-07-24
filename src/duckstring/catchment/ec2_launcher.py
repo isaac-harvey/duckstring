@@ -177,6 +177,46 @@ class Ec2Launcher:
         self._instances[pond_key] = {"instance_id": instance_id, "pool": target}
         log.info("ec2: launched %s for %s (%s)", instance_id, pond_key, instance_type)
 
+    def start_pool_instance(self, pool: str, pool_spec: dict, module_cmd: str) -> str:
+        """Launch ONE instance running an arbitrary ``python3 -m <module> <args>`` command — the Pool
+        machine (plans/pool-agent.md): the agent boots via userdata just like a Duck would, using the
+        pool's deploy_config over the env defaults. Returns the instance id; raises on any failure (the
+        caller records the error). Real-AWS validation is the gate run's job."""
+        spec = pool_spec or {}
+        dc = spec.get("deploy_config") or {}
+        ami = dc.get("ami") or self.ami
+        if not ami:
+            raise RuntimeError(_EC2_NO_AMI)
+        instance_type = (spec.get("instance_type") or dc.get("instance_type")
+                         or os.environ.get("DUCKSTRING_EC2_INSTANCE_TYPE") or "m6i.large")
+        pip_spec = dc.get("pip_spec") if dc.get("pip_spec") is not None else self.pip_spec
+        lines = ["#!/bin/bash", "set -euo pipefail", f"mkdir -p {_REMOTE_ROOT}"]
+        if pip_spec:
+            lines.append(f"pip3 install --quiet {shlex.quote(pip_spec)}")
+        lines.append(f"exec python3 -m {module_cmd}")
+        kwargs = {
+            "ImageId": ami, "InstanceType": instance_type, "MinCount": 1, "MaxCount": 1,
+            "UserData": base64.b64encode(("\n".join(lines) + "\n").encode()).decode(),
+            "TagSpecifications": [{
+                "ResourceType": "instance",
+                "Tags": [{"Key": "Name", "Value": f"duckstring-pool-{pool}"},
+                         {"Key": "duckstring:pool", "Value": pool},
+                         {"Key": "duckstring:role", "Value": "pool-agent"}],
+            }],
+        }
+        instance_profile = dc.get("instance_profile") or self.instance_profile
+        if instance_profile:
+            kwargs["IamInstanceProfile"] = {"Name": instance_profile}
+        region = spec.get("region") or dc.get("region")
+        if region and self.region is None:
+            self.region = region
+        resp = self._ec2().run_instances(**kwargs)
+        return resp["Instances"][0]["InstanceId"]
+
+    def terminate_instance(self, instance_id: str) -> None:
+        """Terminate one instance by id (the Pool machine's stop)."""
+        self._ec2().terminate_instances(InstanceIds=[instance_id])
+
     def launch_error(self, pond_key: str) -> str | None:
         """The reason the last spawn attempt for ``pond_key`` failed (missing config / an AWS error), so
         the driver can attribute the Pond failure to it instead of a generic "process not running"."""
