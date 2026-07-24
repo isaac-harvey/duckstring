@@ -33,10 +33,26 @@
 > pseudocode. Tests: engine `test_cross_pool_sink_gates_on_persisted_f_same_pool_on_end_f` (+
 > monotonicity, both completion modes), driver `test_driver_persist_event_releases_cross_pool_sink`.
 >
-> **Not yet built:** phase 4 (Pool-loss rollback — freshness regression to `persisted_f`), phase 5
-> (named Pools as shared machines — task-per-Pool launcher), phase 6 (registry eviction). One accepted
-> conservatism: a Pond whose data was adopted onto the plane but that has not run since (async,
-> `persisted_f` = NEVER) holds cross-Pool Sinks until its first post-adopt mirror.
+> **Built (phase 4):** Pool-loss rollback. `Driver._reconcile_lost_publishes` (runs on every reload,
+> thus every boot) reconciles each async_persist Pond's claims against surviving bytes: healthy = one
+> local file read (the local sidecar backs `changed_f` — content-anchored, never `end_f`: passes publish
+> nothing); suspicious = read the plane sidecar, and **the plane is truth** — it advances `persisted_f`
+> if ahead (this dissolved the adopt conservatism previously noted here), and a claim neither local nor
+> plane backs regresses (Pond + Ripples) to the surviving floor, failure episodes above it cleared,
+> normal demand re-running the gap. Fate-sharing (argued in "The correctness core" below) is what makes
+> the regression coherent. Deterministic from (DB, disk); re-runs are no-ops.
+>
+> **Built (phase 6):** registry eviction under disk pressure. Below `DUCKSTRING_MIN_FREE_BYTES` free
+> (default 1 GiB; 0 disables; one statvfs per 30 s tick), idle demand-free Ponds shed reconstructible
+> hot state LRU: the registry when a publish backs it; the local publish too only when fully mirrored
+> (`persisted_f >= changed_f` — reads fall to the plane). Never touches the only copy of anything.
+>
+> **NOT built — phase 5** (named Pools as shared machines): the task-per-Pool launcher needs a new
+> in-container component (a Pool agent supervising multiple co-resident Ducks, with spawn/stop plumbing
+> from the Catchment) and **real-AWS iteration to validate** — the same gate that deferred warm-pool
+> reuse before. Until it lands, a named pool spawns one machine per Pond (a Pool-of-one), which the
+> phase-3 gating already models correctly; nothing is wrong, co-location off the Catchment is simply
+> not yet available. This is the one remaining phase.
 
 ## The reframing
 
