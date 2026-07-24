@@ -75,6 +75,21 @@ function StatusPill({ status }: { status: string }) {
   );
 }
 
+function PersistField({ p }: { p: NonNullable<import('../lib/types').PondRun['persist']> }) {
+  const ok = p.status === 'success';
+  const dur = durationOf(p.startedAt, p.finishedAt);
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+      <span style={{ fontSize: 9, fontWeight: 700, color: '#52525b', letterSpacing: '0.1em', textTransform: 'uppercase' }}>
+        Persisted
+      </span>
+      <span style={{ fontSize: 12, color: ok ? '#4ade80' : '#f87171' }}>
+        {ok ? `✓ ${dur || 'done'}` : `✗ ${p.error || 'failed'}`}
+      </span>
+    </div>
+  );
+}
+
 function Field({ label, value }: { label: string; value: string }) {
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
@@ -142,6 +157,11 @@ export function RunDetail() {
             <Field label="Duration" value={durationOf(run.startedAt, run.finishedAt) || '—'} />
             <Field label="Started" value={clock(run.startedAt)} />
             <Field label="Finished" value={clock(run.finishedAt)} />
+            {/* The Persist — the async mirror to the durable plane, its own log item landing after the
+                run (which closes at local publish). Absent field = no cloud / direct-to-plane Duck. */}
+            {run.persist !== undefined && run.persist !== null && (
+              <PersistField p={run.persist} />
+            )}
           </div>
 
           <div style={{ fontSize: 9, fontWeight: 700, color: '#52525b', letterSpacing: '0.1em', textTransform: 'uppercase', marginBottom: 4 }}>

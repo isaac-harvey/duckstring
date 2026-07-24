@@ -54,11 +54,12 @@ def serve(core: DuckCore, executor: RippleExecutor, client: CatchmentClient) -> 
 
         def _run(f=f):
             err = None
+            started = _now()
             try:
                 executor.persist()
             except Exception as exc:
                 err = _msg(exc)
-            q.put(("persisted", (f, err)))
+            q.put(("persisted", (f, err, started, _now())))
 
         threading.Thread(target=_run, daemon=True).start()
 
@@ -127,11 +128,12 @@ def serve(core: DuckCore, executor: RippleExecutor, client: CatchmentClient) -> 
                         if ev.kind == "run_completed":
                             _start_persist(ev.f)
                 elif kind == "persisted":
-                    pf, perr = data
+                    pf, perr, pstarted, pfinished = data
                     if perr:
                         print(f"[duck:{core.pond_name}] persist at {pf} failed: {perr}", flush=True)
                     core.events.append(Event(kind="persist", f=pf,
-                                             status="failed" if perr else "success", error=perr))
+                                             status="failed" if perr else "success", error=perr,
+                                             started_at=pstarted, finished_at=pfinished))
                     persist_state["running"] = False
                     if persist_state["pending"] is not None:
                         nf, persist_state["pending"] = persist_state["pending"], None

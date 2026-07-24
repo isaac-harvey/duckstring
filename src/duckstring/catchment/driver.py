@@ -2332,7 +2332,9 @@ class Driver:
                 # The Duck mirrored its local publish to the durable layer (plans/persist.md). A separate
                 # log item from the Pond Run (which closed at local publish); success advances the
                 # persisted_f watermark. Pure observability in phase 2 — no engine state changes.
-                self._record_persist(pond, f, payload.get("status", "success"), payload.get("error"), now)
+                self._record_persist(pond, f, payload.get("status", "success"), payload.get("error"), now,
+                                     started_at=payload.get("started_at"),
+                                     finished_at=payload.get("finished_at"))
             elif kind == "contract_failed":
                 # The Duck refused to publish: the output broke the major line's additive contract.
                 # Fail the Pond at this Run (keeping last-good data) and block downstream, like any failure.
@@ -2990,7 +2992,8 @@ class Driver:
         )
         self.db.commit()
 
-    def _record_persist(self, pond: str, f: str | None, status: str, error: str | None, now: datetime) -> None:
+    def _record_persist(self, pond: str, f: str | None, status: str, error: str | None, now: datetime,
+                        started_at: str | None = None, finished_at: str | None = None) -> None:
         """Record a Duck's persist report (plans/persist.md): upsert the ``pond_persist`` log row and, on
         success, advance the ``persisted_f`` watermark (monotonic — a replayed/stale report never regresses
         it) in the DB **and the engine** — cross-Pool Sinks gate on it (``source_visible_f``), so the
@@ -3002,9 +3005,9 @@ class Driver:
         if meta is None:
             return
         self.db.execute(
-            "INSERT OR REPLACE INTO pond_persist (pond_id, f, status, error, finished_at) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (meta["pond_id"], f, status, error, _iso(now)),
+            "INSERT OR REPLACE INTO pond_persist (pond_id, f, status, error, started_at, finished_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (meta["pond_id"], f, status, error, started_at, finished_at or _iso(now)),
         )
         if status == "success":
             prev = self.persisted.get(pond)
@@ -3691,12 +3694,30 @@ class Driver:
                 (*params, limit),
             ).fetchall()
 
+            # The runs' Persist outcomes (plans/persist.md — a separate log item from the Pond Run: the
+            # run closes at local publish; the mirror to the durable plane lands after, with its own
+            # timings/status). One query for the whole page, matched by (pond_id, f).
+            pond_ids = {self.meta[pond_key(pn, mj)]["pond_id"]
+                        for pn, mj, *_ in rows if pond_key(pn, mj) in self.meta}
+            persists: dict[tuple[int, str], dict] = {}
+            if pond_ids:
+                for pid, pf, pst, perr, psa, pfa in self.db.execute(
+                    f"SELECT pond_id, f, status, error, started_at, finished_at FROM pond_persist "
+                    f"WHERE pond_id IN ({','.join('?' * len(pond_ids))})", tuple(pond_ids),
+                ):
+                    persists[(pid, pf)] = {"status": pst, "error": perr,
+                                           "started_at": psa, "finished_at": pfa}
+
             runs = []
             for pname, major, version, pv_id, f, started_at, finished_at, status, error, tb in rows:
+                key = pond_key(pname, major)
                 run = {
-                    "pond": pname, "major": major, "id": pond_key(pname, major), "version": version, "f": f,
+                    "pond": pname, "major": major, "id": key, "version": version, "f": f,
                     "started_at": started_at, "finished_at": finished_at, "status": status,
                     "error": error, "traceback": tb,
+                    # null = no mirror recorded for this run: no cloud, a remote direct-to-plane Duck,
+                    # or the async mirror hasn't completed/coalesced past this f yet.
+                    "persist": persists.get((self.meta.get(key, {}).get("pond_id"), f)),
                 }
                 if ripples:
                     rrows = self.db.execute(

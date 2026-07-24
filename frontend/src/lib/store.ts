@@ -83,6 +83,10 @@ export function mapRun(r: RawPondRun): PondRun {
     status: r.status,
     error: r.error,
     traceback: r.traceback,
+    persist: r.persist
+      ? { status: r.persist.status, error: r.persist.error,
+          startedAt: r.persist.started_at, finishedAt: r.persist.finished_at }
+      : r.persist,
     ripples: r.ripples?.map((rr) => ({
       ripple: rr.ripple,
       startedAt: rr.started_at,

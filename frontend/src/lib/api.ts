@@ -225,7 +225,17 @@ export interface RawPondRun {
   status: string;
   error: string | null;
   traceback: string | null;
+  // The run's Persist (the async mirror to the durable plane — a separate log item from the run, which
+  // closes at local publish). null = no mirror recorded (no cloud / direct-to-plane / not landed yet).
+  persist?: RawPersist | null;
   ripples?: RawRippleRun[];
+}
+
+export interface RawPersist {
+  status: string; // success | failed
+  error: string | null;
+  started_at: string | null;
+  finished_at: string | null;
 }
 
 export interface RawWindow {

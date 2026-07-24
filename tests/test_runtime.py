@@ -238,6 +238,14 @@ def test_local_first_publish_persists_to_data_root(runtime, tmp_path_factory):
     assert r.status_code == 200, r.text
     assert r.json()["count"] > 0
 
+    # 5. The Persist surfaces in RUN HISTORY as its own log item on the run it covered — status +
+    #    wall-clock timings (the run itself closed at local publish; the mirror landed after).
+    runs = httpx.get(f"{url}/api/runs?pond=orders", timeout=10.0).json()["runs"]
+    persisted = [x for x in runs if x.get("persist")]
+    assert persisted, "no run carries its persist outcome in /api/runs"
+    p = persisted[0]["persist"]
+    assert p["status"] == "success" and p["started_at"] and p["finished_at"], p
+
 
 @pytest.mark.timeout(120)
 def test_named_pool_runs_co_resident_ducks(runtime, tmp_path_factory):
