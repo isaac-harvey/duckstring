@@ -392,8 +392,14 @@ class ParquetDataPlane(DataPlane):
 def _export_parts(con, data_dir, table: str, f) -> None:
     """Publish an append-only ``table`` as a directory of per-run Parquet parts. Writes one
     ``_duckstring_f``-homogeneous file per registry freshness not already on disk (so a normal run writes
-    just its new slice, and a rebuild/restore backfills any missing parts), and drops parts whose freshness
-    is no longer in the registry (mirroring retention). Idempotent on replay.
+    just its new slice, and a rebuild/restore backfills any missing parts). Idempotent on replay.
+
+    **Pruning is floor-anchored, never absence-inferred** (plans/s3-resident-state.md step 1): a published
+    part is dropped only when its freshness fell below the table's **floor** — the explicit, positive
+    signal every genuine drop advances (retention ``_apply_retention`` → floor; a warm fold → floor; a
+    checkpoint/refresh re-bootstrap → floor). A part the registry merely *lacks* is KEPT: absence is what a
+    partially-hydrated registry looks like (a fresh box that pulled only the hot window — the future
+    no-hydration path), and inferring a drop from it deletes real history.
 
     When the table is **empty** (a bootstrap-only changelog with no rows yet), a schema-only marker part is
     still written at the run's ``f`` so the table stays readable as an empty relation — a consumer covered
@@ -416,9 +422,21 @@ def _export_parts(con, data_dir, table: str, f) -> None:
                 f'COPY (SELECT * FROM "{table}" WHERE "{trickle.F_COL}" = {trickle._ts(fi)}) '
                 f"TO '{uri}' (FORMAT PARQUET)"
             )
-    for fi, name in existing.items():  # drop parts the registry no longer retains (or the superseded marker)
-        if fi not in reg_fs:
-            part_store.remove(name)
+    from datetime import datetime
+
+    floor_iso = trickle.read_meta(con).get(trickle.base_table_name(table), {}).get("floor")
+    floor = datetime.fromisoformat(floor_iso) if floor_iso else None
+    # The floor's boundary is INCLUSIVE only for a merge __changelog: a warm fold moves the slice
+    # `(lo, target]` into the band and sets floor = target, so the boundary part must go (keeping it
+    # would double-count on read). For an append history/droplog the boundary stays STRICT — retention
+    # keeps its cutoff rows in the registry (shielded by `fi in reg_fs`), and pruning an at-floor part
+    # that is merely un-hydrated would lose real rows from full reads.
+    inclusive = table.endswith(trickle.CHANGELOG_SUFFIX)
+    for fi, name in existing.items():
+        if fi in reg_fs or floor is None:
+            continue
+        if fi <= floor if inclusive else fi < floor:
+            part_store.remove(name)  # genuinely dropped (retention / fold / re-bootstrap raised the floor)
 
 
 def _export_companions(con, data_dir, f) -> None:
@@ -673,10 +691,46 @@ def persist_tree(local_dir, dest) -> int:
     **Safety guard**: a local dir with no ``_trickle.json`` sidecar has published nothing — the mirror
     refuses to touch the destination at all (a fresh/lost box must never wipe the durable layer).
     Replayable: a mirror that dies mid-way re-runs idempotently (parts by name, wholesale re-upload)."""
+    import json
+    from datetime import datetime
+
+    from .trickle.io import base_table_name
+
     local = _as_storage(local_dir)
     root = local.root  # persist mirrors FROM a local publish dir by definition
     if not (root / "_trickle.json").exists():
         return 0  # nothing published locally — never touch the durable layer from an empty source
+    try:
+        sidecar = json.loads((root / "_trickle.json").read_text())
+    except Exception:
+        sidecar = {}
+
+    def _drop_before(dirname: str):
+        """The prune watermark for a directory of freshness-named files — **retention is an explicit
+        signal, never inferred from absence** (plans/s3-resident-state.md step 1): a destination part is
+        removed only when the LOCAL SIDECAR's floor (or, for base chunks, ``f_base``) says its freshness
+        was genuinely dropped (retention / warm fold / checkpoint token supersession / re-bootstrap). A
+        part merely absent locally is KEPT — absence is what a partial local (a future partially-hydrated
+        box) looks like, and pruning on it would delete real history from the durable plane. ``None`` =
+        no watermark → never prune this dir's files."""
+        from .trickle.io import BASE_SUFFIX
+
+        entry = sidecar.get(base_table_name(dirname))
+        if not isinstance(entry, dict):
+            return None
+        from .trickle.io import CHANGELOG_SUFFIX
+
+        if dirname.endswith(BASE_SUFFIX):
+            # Base chunks: a checkpoint's token supersession — STRICTLY older tokens only. The CURRENT
+            # token equals f_base, and pruning it when merely absent locally would delete the live base.
+            iso = entry.get("f_base")
+            return (datetime.fromisoformat(iso), False) if iso else None
+        # Per-run parts: the floor. INCLUSIVE only for a merge __changelog (a warm fold moves the
+        # boundary part's rows into the band — leaving it would double-count on plane reads); STRICT for
+        # an append history/droplog (an at-floor part holds real rows a full read needs).
+        iso = entry.get("floor")
+        return (datetime.fromisoformat(iso), dirname.endswith(CHANGELOG_SUFFIX)) if iso else None
+
     copied = 0
     local_dirs: set[str] = set()
     files: list = []
@@ -691,41 +745,68 @@ def persist_tree(local_dir, dest) -> int:
             files.append(p)
         elif p.is_dir():
             local_dirs.add(p.name)
-            copied += _mirror_dir(p, dest, (p.name,))
+            copied += _mirror_dir(p, dest, (p.name,), drop_before=_drop_before(p.name))
     for p in sorted(files, key=lambda q: q.name == "_trickle.json"):  # sidecar sorts last
         dest.put_file(p, p.name)
         copied += 1
-    # Prune destination directories that no longer exist locally (skip-set aside) — e.g. a warm tier
-    # folded into the cold base, or a table dropped locally. Guarded by the sidecar check above.
+    # Prune destination directories only for tables the local sidecar no longer DECLARES (a table
+    # dropped/unpublished — an explicit signal); a declared table's missing local dir is left alone.
     for name in dest.subdir_names():
-        if name not in local_dirs and name not in _PERSIST_SKIP:
+        if name in local_dirs or name in _PERSIST_SKIP or name == "state":
+            continue
+        if base_table_name(name) not in sidecar:
             dest.rmtree(name)
     return copied
 
 
-def _mirror_dir(src: Path, dest, parts: tuple[str, ...]) -> int:
-    """Reconcile one directory of immutable, name-addressed files (parts/chunks/snapshots): upload the
-    locally-present-but-missing, prune the remotely-present-but-gone, recurse into subdirs (``state/``)."""
+def _mirror_dir(src: Path, dest, parts: tuple[str, ...], drop_before=None) -> int:
+    """Reconcile one directory of immutable, name-addressed files: upload the locally-present-but-missing;
+    prune a destination file only when ``drop_before`` (the explicit retention/fold/checkpoint watermark)
+    covers its parsed freshness — with one exception: the ``state/`` snapshot tree (``drop_before`` None
+    at its root) keeps exact keep-latest semantics, pruning what local no longer holds (each snapshot dir
+    is rewritten wholesale every run, so local is always complete there)."""
+    from .trickle.io import part_f
+
     copied = 0
     existing = set(dest.names(*parts))
     local_files: set[str] = set()
     local_dirs: set[str] = set()
+    state_tree = parts[0] == "state"
     for p in sorted(src.iterdir()):
         if p.name.endswith(".tmp"):
             continue
         if p.is_dir():
             local_dirs.add(p.name)
-            copied += _mirror_dir(p, dest, parts + (p.name,))
+            copied += _mirror_dir(p, dest, parts + (p.name,), drop_before=drop_before)
             continue
         local_files.add(p.name)
         if p.name not in existing:
             dest.put_file(p, *parts, p.name)
             copied += 1
     for name in existing - local_files:
-        dest.remove(*parts, name)
+        if state_tree:
+            dest.remove(*parts, name)  # keep-latest snapshots: local is authoritative + complete
+        elif drop_before is not None:
+            mark, inclusive = drop_before
+            ff = _file_f(name, part_f)
+            if ff is not None and (ff <= mark if inclusive else ff < mark):
+                dest.remove(*parts, name)  # genuinely dropped — the watermark says so
     for name in set(dest.child(*parts).subdir_names()) - local_dirs:
-        dest.rmtree(*parts, name)
+        if state_tree:
+            dest.rmtree(*parts, name)
     return copied
+
+
+def _file_f(name: str, part_f) -> "datetime | None":  # noqa: F821 - forward ref for the docstring type
+    """The freshness encoded in a published file name: a per-run part (``{f}.parquet``) or a base chunk
+    (``{token}__{i}.parquet``, token = the checkpoint f). ``None`` if unparseable (never pruned)."""
+    stem = name[: -len(".parquet")] if name.endswith(".parquet") else name
+    if "__" in stem:
+        stem = stem.rsplit("__", 1)[0]  # a base chunk's token
+    try:
+        return part_f(stem)
+    except Exception:
+        return None
 
 
 def _compact_threshold(con=None, main=None) -> int:

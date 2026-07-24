@@ -1,6 +1,23 @@
 # Plan: S3-resident state — hydrate nothing, read what you touch
 
-> **Status: step 2 (base-as-view) IMPLEMENTED and verified; steps 1/3/4 designed, not built.** The target is
+> **Status: steps 1 (retention decoupling) and 2 (base-as-view) IMPLEMENTED and verified; steps 3/4
+> designed, not built.**
+>
+> **Done (step 1 — the keystone):** pruning is **floor-anchored, never absence-inferred**, at BOTH prune
+> sites. `_export_parts` drops a published part only when the table's floor covers it (the explicit
+> signal every genuine drop advances — retention, warm fold, re-bootstrap); a part the registry merely
+> lacks (what a partially-hydrated box looks like) is KEPT. `persist_tree` prunes the durable plane by
+> the LOCAL SIDECAR's watermarks the same way (this mattered: the mirror's absence-prune had silently
+> recreated the coupling at the plane level). Boundary semantics discovered in implementation:
+> **inclusive** (`<=` floor) only for a merge `__changelog` (a fold moves the boundary part's rows into
+> the band — keeping it double-counts); **strict** (`<`) for an append history/droplog (the at-floor
+> part holds real rows a full read needs; retention's own boundary is shielded by registry presence);
+> base chunks prune **strictly older checkpoint tokens** only (the current token IS the live base);
+> whole-table dirs go only when the sidecar stops declaring the table; the `state/` snapshot tree keeps
+> exact keep-latest semantics (rewritten wholesale every run — local is authoritative there). Tests:
+> `test_export_keeps_unhydrated_parts_and_prunes_only_below_floor`,
+> `test_persist_tree_incremental_and_floor_anchored_pruning`,
+> `test_persist_tree_base_chunks_prune_strictly_older_tokens`. The target is
 > a Duck that holds no persistent state on its own disk: all durable tiers (merge base, changelog, warm bands,
 > agg/acc accumulators) live on the data plane (S3), and a run reads only the slice its delta touches. The
 > registry becomes per-run scratch. This supersedes the narrower "base as a reference" idea — the same

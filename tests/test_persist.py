@@ -40,17 +40,25 @@ def test_persist_tree_mirrors_flat_layout_and_skips_iceberg(tmp_path):
     assert not (d / "catalog.json").exists() and not (d / "pond").exists()
 
 
-def test_persist_tree_incremental_and_pruning(tmp_path):
+def test_persist_tree_incremental_and_floor_anchored_pruning(tmp_path):
+    """The mirror prunes on EXPLICIT signals only (plans/s3-resident-state.md step 1): a destination part
+    goes when the local sidecar's floor covers it (retention/fold — inclusive) or, for a whole table
+    directory, when the sidecar no longer declares the table. A part merely ABSENT locally is kept —
+    absence is what a partial local looks like, and pruning on it would delete plane history. The
+    ``state/`` snapshot tree keeps exact keep-latest semantics (rewritten wholesale every run)."""
+    import shutil
+
     local, dest = tmp_path / "local", LocalStorage(tmp_path / "durable")
     _seed_local(local)
     persist_tree(LocalStorage(local), dest)
     d = tmp_path / "durable"
 
-    # Parts are idempotent by name: a re-mirror does not rewrite them (mtime probe via content marker).
+    # Parts are idempotent by name: a re-mirror does not rewrite them (content marker probe).
     (d / "t" / "2026-01-01T00_00_00+00_00.parquet").write_bytes(b"REMOTE-KEPT")
     # Wholesale files are always re-uploaded (rewritten per run).
     (local / "whole.parquet").write_bytes(b"v2")
-    # A new part appears; an old one is retention-trimmed locally; the state snapshot rolls forward.
+    # A new part appears; one goes ABSENT locally with NO floor (the partial-local case); the state
+    # snapshot rolls forward (keep-latest).
     (local / "t" / "2026-01-03T00_00_00+00_00.parquet").write_bytes(b"p3")
     (local / "t" / "2026-01-02T00_00_00+00_00.parquet").unlink()
     (local / "state" / "agg" / "t" / "2026-01-02T00_00_00+00_00.parquet").unlink()
@@ -60,15 +68,66 @@ def test_persist_tree_incremental_and_pruning(tmp_path):
     assert (d / "t" / "2026-01-01T00_00_00+00_00.parquet").read_bytes() == b"REMOTE-KEPT"  # not re-sent
     assert (d / "whole.parquet").read_bytes() == b"v2"  # wholesale re-uploaded
     assert sorted(p.name for p in (d / "t").glob("*.parquet")) == [
-        "2026-01-01T00_00_00+00_00.parquet", "2026-01-03T00_00_00+00_00.parquet"]  # add + prune
+        "2026-01-01T00_00_00+00_00.parquet", "2026-01-02T00_00_00+00_00.parquet",
+        "2026-01-03T00_00_00+00_00.parquet"], \
+        "an absent-with-no-floor part must be KEPT (absence is not a retention signal)"
     assert sorted(p.name for p in (d / "state" / "agg" / "t").glob("*.parquet")) == [
-        "2026-01-03T00_00_00+00_00.parquet"]  # snapshot pruned + rolled
+        "2026-01-03T00_00_00+00_00.parquet"]  # snapshots: keep-latest — local is authoritative
 
-    # A directory dropped locally (warm fold / table delete) is pruned at the destination.
-    import shutil
+    # Retention raises the FLOOR → append parts strictly below it are genuinely dropped everywhere; the
+    # AT-floor part survives (it holds real rows a full read needs — strict boundary for append).
+    (local / "_trickle.json").write_text(json.dumps(
+        {"t": {"mode": "append", "floor": "2026-01-02T00:00:00+00:00"}}))
+    (local / "t" / "2026-01-01T00_00_00+00_00.parquet").unlink(missing_ok=True)
+    persist_tree(LocalStorage(local), dest)
+    assert sorted(p.name for p in (d / "t").glob("*.parquet")) == [
+        "2026-01-02T00_00_00+00_00.parquet", "2026-01-03T00_00_00+00_00.parquet"], \
+        "below-floor pruned; the at-floor append part survives (strict boundary)"
+
+    # A merge __changelog's floor is INCLUSIVE: a warm fold moved the boundary part's rows into the
+    # band, so the at-floor part is pruned (keeping it would double-count on plane reads).
+    (local / "_trickle.json").write_text(json.dumps(
+        {"t": {"mode": "append", "floor": "2026-01-02T00:00:00+00:00"},
+         "m": {"mode": "merge", "pk": ["id"], "floor": "2026-01-02T00:00:00+00:00"}}))
+    (local / "m__changelog").mkdir()
+    (local / "m__changelog" / "2026-01-03T00_00_00+00_00.parquet").write_bytes(b"hot")
+    persist_tree(LocalStorage(local), dest)
+    (d / "m__changelog" / "2026-01-02T00_00_00+00_00.parquet").write_bytes(b"folded")  # absent locally
+    persist_tree(LocalStorage(local), dest)
+    assert sorted(p.name for p in (d / "m__changelog").glob("*.parquet")) == [
+        "2026-01-03T00_00_00+00_00.parquet"], "an at-floor changelog part is fold-covered — pruned"
+
+    # A table the sidecar no longer DECLARES (dropped/unpublished) loses its directory; a declared
+    # table with a merely-missing local dir keeps it.
     shutil.rmtree(local / "t")
     persist_tree(LocalStorage(local), dest)
+    assert (d / "t").exists(), "a declared table's missing local dir must not nuke the plane copy"
+    (local / "_trickle.json").write_text(json.dumps({}))
+    # (an empty sidecar still exists → the mirror runs; the table is undeclared → its dir goes)
+    persist_tree(LocalStorage(local), dest)
     assert not (d / "t").exists()
+
+
+def test_persist_tree_base_chunks_prune_strictly_older_tokens(tmp_path):
+    """Base chunks (``{token}__{i}.parquet``): a checkpoint supersedes STRICTLY older tokens; the current
+    token (== f_base) is never pruned even when absent locally — it is the live base."""
+    import json as _json
+
+    local, dest = tmp_path / "local", LocalStorage(tmp_path / "durable")
+    local.mkdir(parents=True)
+    (local / "_trickle.json").write_text(_json.dumps(
+        {"m": {"mode": "merge", "pk": ["id"], "f_base": "2026-01-02T00:00:00+00:00"}}))
+    (local / "m__base").mkdir()
+    (local / "m__base" / "2026-01-02T00_00_00+00_00__0.parquet").write_bytes(b"cur0")
+    persist_tree(LocalStorage(local), dest)
+    d = tmp_path / "durable"
+    # The destination also holds an older token's chunk and a current-token chunk absent locally.
+    (d / "m__base" / "2026-01-01T00_00_00+00_00__0.parquet").write_bytes(b"old")
+    (d / "m__base" / "2026-01-02T00_00_00+00_00__1.parquet").write_bytes(b"cur1")
+    persist_tree(LocalStorage(local), dest)
+    names = sorted(p.name for p in (d / "m__base").glob("*.parquet"))
+    assert "2026-01-01T00_00_00+00_00__0.parquet" not in names, "older tokens are superseded"
+    assert "2026-01-02T00_00_00+00_00__1.parquet" in names, "the current token is never pruned"
 
 
 def test_persist_tree_refuses_an_empty_local(tmp_path):
@@ -331,3 +390,37 @@ def test_disk_pressure_evicts_idle_reconstructible_state(tmp_path, monkeypatch):
     driver.scheduler_tick()
     assert not reg.exists(), "the registry is reconstructible from the local publish"
     assert (local.root / "_trickle.json").exists(), "an un-mirrored local publish must NEVER be evicted"
+
+
+def test_export_keeps_unhydrated_parts_and_prunes_only_below_floor(tmp_path):
+    """The registry-side half of the decoupling (`_export_parts`): a published part the registry merely
+    LACKS (a partially-hydrated box) is kept; only a part below the floor (genuine retention) is pruned."""
+    from datetime import datetime, timezone
+
+    import duckdb
+
+    from duckstring import trickle_io as T
+    from duckstring.dataplane import ParquetDataPlane
+
+    def ts(d):
+        return datetime(2026, 1, d, tzinfo=timezone.utc)
+
+    con = duckdb.connect()
+    con.execute("SET TimeZone='UTC'")
+    data_dir = tmp_path / "data"
+    for d in (1, 2, 3):
+        T.append_table(con, "ev", con.sql(f"SELECT {d} AS id"), ts(d), ("id",))
+    ParquetDataPlane().export(con, data_dir, f=ts(3))
+    assert len(list((data_dir / "ev").glob("*.parquet"))) == 3
+
+    # Simulate partial hydration: the registry loses the f1/f2 rows WITHOUT retention (floor unmoved).
+    con.execute("DELETE FROM ev WHERE id IN (1, 2)")
+    ParquetDataPlane().export(con, data_dir, f=ts(3))
+    assert len(list((data_dir / "ev").glob("*.parquet"))) == 3, \
+        "registry absence must NOT prune published parts (partial hydration is not retention)"
+
+    # Genuine retention: keep only the newest run → the floor advances → below-floor parts pruned.
+    T.append_table(con, "ev", con.sql("SELECT 4 AS id"), ts(4), ("id",), retain_n=1)
+    ParquetDataPlane().export(con, data_dir, f=ts(4))
+    kept = sorted(p.name for p in (data_dir / "ev").glob("*.parquet"))
+    assert kept == ["2026-01-04T00_00_00+00_00.parquet"], f"retention must prune below the floor: {kept}"
