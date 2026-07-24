@@ -89,6 +89,11 @@ class SubprocessLauncher:
                 "--root", str(self.root),
                 "--source-path", source_path,
                 f"--data-root={self.data_root or ''}",
+                # A Catchment-Pool Duck publishes LOCALLY (the fast handoff co-located Sinks + the viewer
+                # read) and async-mirrors to the data root — the Persist (plans/persist.md). Remote
+                # launchers do NOT pass persist-root: a remote Duck's local disk is unreachable to
+                # everyone else, so it publishes straight to the data root as before.
+                f"--persist-root={self.data_root or ''}",
             ],
             env=env,
         )

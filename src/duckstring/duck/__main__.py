@@ -17,7 +17,7 @@ from pathlib import Path
 from ..engine import NEVER
 from ..engine import pond as ledger
 from .client import CatchmentClient
-from .core import DuckCore
+from .core import DuckCore, Event
 from .executor import RippleExecutor, load_topology
 
 
@@ -37,6 +37,30 @@ def serve(core: DuckCore, executor: RippleExecutor, client: CatchmentClient) -> 
     stop = threading.Event()
     inflight = 0  # Ripple Runs currently executing in the pool
     last_progress = _now()  # last time a Ripple was launched or finished
+    # Async Persist (plans/persist.md): after a run publishes locally (run_completed already buffered —
+    # co-located Sinks are NOT delayed), mirror the output to the durable layer off-loop, then buffer a
+    # `persist` event. One mirror at a time, COALESCING: runs completing mid-mirror set `pending`, and the
+    # finished mirror immediately re-runs at the newest f (a mirror is a reconcile — persisting at f2
+    # covers f1, so only the latest pending f matters).
+    persist_state = {"running": False, "pending": None}
+
+    def _start_persist(f):
+        if getattr(executor, "persist_dir", None) is None:
+            return  # no durable layer configured — publish is the only copy (exact pre-persist behaviour)
+        if persist_state["running"]:
+            persist_state["pending"] = f
+            return
+        persist_state["running"] = True
+
+        def _run(f=f):
+            err = None
+            try:
+                executor.persist()
+            except Exception as exc:
+                err = _msg(exc)
+            q.put(("persisted", (f, err)))
+
+        threading.Thread(target=_run, daemon=True).start()
 
     def _poll_loop():
         while not stop.is_set():
@@ -93,10 +117,25 @@ def serve(core: DuckCore, executor: RippleExecutor, client: CatchmentClient) -> 
                     inflight -= 1
                     last_progress = _now()
                     name, started, finished, lineage = data
+                    events_before = len(core.events)
                     _launch(core.ripple_completed(
                         name, _now(), started_at=started, finished_at=finished, export=executor.export,
                         lineage=lineage,
                     ))
+                    # A run just completed (locally published) → kick off/queue the async persist for it.
+                    for ev in core.events[events_before:]:
+                        if ev.kind == "run_completed":
+                            _start_persist(ev.f)
+                elif kind == "persisted":
+                    pf, perr = data
+                    if perr:
+                        print(f"[duck:{core.pond_name}] persist at {pf} failed: {perr}", flush=True)
+                    core.events.append(Event(kind="persist", f=pf,
+                                             status="failed" if perr else "success", error=perr))
+                    persist_state["running"] = False
+                    if persist_state["pending"] is not None:
+                        nf, persist_state["pending"] = persist_state["pending"], None
+                        _start_persist(nf)
                 elif kind == "error":
                     inflight -= 1
                     last_progress = _now()
@@ -130,7 +169,10 @@ def serve(core: DuckCore, executor: RippleExecutor, client: CatchmentClient) -> 
                 _report_pond_failure(core, client, "stuck: active Pond Run with no running Ripple")
                 break
 
-            if shutdown_requested and core.idle() and not core.events:
+            # Shutdown only when idle, events drained, AND no persist is in flight or queued — a killed
+            # mid-mirror persist is replay-safe but would leave persisted_f needlessly behind.
+            if shutdown_requested and core.idle() and not core.events \
+                    and not persist_state["running"] and persist_state["pending"] is None:
                 break
     finally:
         stop.set()
@@ -176,10 +218,14 @@ def main() -> None:
     ap.add_argument("--source-path", required=True, help="pond source dir relative to root")
     ap.add_argument("--data-root", default="", help="data-plane root URI (object store / Volume / path); "
                                                     "empty = under the state root")
+    ap.add_argument("--persist-root", default="", help="durable persist layer (plans/persist.md): publish "
+                                                       "locally, async-mirror here; empty = publish to "
+                                                       "--data-root directly (remote Duck / no cloud)")
     args = ap.parse_args()
 
     root = Path(args.root)
     data_root = args.data_root or None
+    persist_root = args.persist_root or None
     source_dir = root / args.source_path
     client = CatchmentClient(args.catchment, args.pond, args.major, args.token)
     if not source_dir.is_dir():
@@ -198,9 +244,11 @@ def main() -> None:
     from ..dbt_mode import dbt_project_subpath
     if dbt_project_subpath(read_pond_toml(source_dir)):
         from .dbt_executor import DbtExecutor
-        executor = DbtExecutor(args.pond, args.major, args.version, args.source_path, root, data_root=data_root)
+        executor = DbtExecutor(args.pond, args.major, args.version, args.source_path, root,
+                               data_root=data_root, persist_root=persist_root)
     else:
-        executor = RippleExecutor(args.pond, args.major, args.version, args.source_path, root, data_root=data_root)
+        executor = RippleExecutor(args.pond, args.major, args.version, args.source_path, root,
+                                  data_root=data_root, persist_root=persist_root)
     serve(core, executor, client)
 
 

@@ -184,6 +184,61 @@ def test_trickle_chain_runs_end_to_end(runtime):
         assert n > 0, f"{name}: empty reconstructed main"
 
 
+@pytest.mark.timeout(120)
+def test_local_first_publish_persists_to_data_root(runtime, tmp_path_factory):
+    """Local-first publish + async Persist (plans/persist.md phase 2), on real Duck subprocesses: with a
+    data root attached, a chain still PUBLISHES to the local layout (the fast handoff — co-located Sinks
+    and the viewer never wait on the durable mirror), and the Persist then mirrors every line's output to
+    the data root and reports ``persisted_f``. This is the 'attached a bucket and everything got slow'
+    fix: the durable copy is off the run's critical path."""
+    import json
+
+    url, root = runtime
+    durable = tmp_path_factory.mktemp("durable_root")
+    # Attach the data root BEFORE anything publishes (fresh catchment → no confirm needed).
+    r = httpx.put(f"{url}/api/catchment/settings",
+                  json={"data_root": str(durable), "mode": "empty"}, timeout=10.0)
+    assert r.status_code == 200, r.text
+
+    _deploy(url, _TRICKLE_PONDS)
+    httpx.post(f"{url}/api/ponds/revenue/pulse", timeout=5.0)
+    assert _wait(lambda: (_pond_status(url, "revenue") or {}).get("end_f") is not None), \
+        "revenue never became fresh"
+
+    # 1. The publish is LOCAL — the catchment-root layout, exactly as with no cloud attached.
+    for name in _TRICKLE_PONDS:
+        assert (root / "ponds" / name / "m1" / "data" / "_trickle.json").exists(), \
+            f"{name}: no local publish (local-first violated)"
+
+    # 2. The async Persist mirrors each line to the data root and advances its persisted_f watermark.
+    def _persisted(name):
+        st = _pond_status(url, name) or {}
+        return st.get("persisted_f") is not None
+    for name in _TRICKLE_PONDS:
+        assert _wait(lambda n=name: _persisted(n)), f"{name}: persisted_f never advanced"
+        mirrored = durable / name / "m1" / "data" / "_trickle.json"
+        assert mirrored.exists(), f"{name}: no durable mirror at the data root"
+    # The mirrored layout is a readable flat publish (parts travel by name).
+    sidecar = json.loads((durable / "orders" / "m1" / "data" / "_trickle.json").read_text())
+    assert sidecar["order_line"]["mode"] == "append"
+    assert list((durable / "orders" / "m1" / "data" / "order_line").glob("*.parquet")), \
+        "orders: no mirrored history parts"
+
+    # 3. The persist log exists per line (a separate item from the pond_run — plans/persist.md).
+    import sqlite3
+    db = sqlite3.connect(root / "duck.db")
+    try:
+        n = db.execute("SELECT count(*) FROM pond_persist WHERE status = 'success'").fetchone()[0]
+        assert n >= len(_TRICKLE_PONDS), f"expected a persist row per line, got {n}"
+    finally:
+        db.close()
+
+    # 4. The data viewer reads (local-first) still work with the root attached.
+    r = httpx.post(f"{url}/api/query/count", json={"pond": "orders", "table": "order_line"}, timeout=10.0)
+    assert r.status_code == 200, r.text
+    assert r.json()["count"] > 0
+
+
 _TPCDS_PONDS = ("tpcds_sales", "tpcds_items", "tpcds_stores", "tpcds_priced",
                 "tpcds_category_revenue", "tpcds_store_revenue")
 _GHARCHIVE_PONDS = ("gh_events", "gh_actors", "gh_pushes", "gh_repo_activity", "gh_stars", "gh_trending")

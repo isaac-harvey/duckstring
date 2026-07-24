@@ -38,3 +38,23 @@ def pond_data_dir(root: Path, pond_name: str, major: int, data_root: str | None 
 
 def pond_connect(root: Path, pond_name: str, major: int) -> duckdb.DuckDBPyConnection:
     return connect(pond_registry_path(root, pond_name, major))
+
+
+def resolve_data_dir(root: Path, pond_name: str, major: int, data_root: str | None = None) -> Storage:
+    """The data-plane location to **read** one major line from, resolved local-first (plans/persist.md):
+    a Pond co-located on this Pool (its Duck publishes to the local layout) is read from the local root —
+    the fast handoff — and only a Pond with no local publish (a remote-Pool Duck writing straight to the
+    data root) is read from ``data_root``. The local ``_trickle.json`` sidecar is the publish marker:
+    every export writes one, so its presence = this line publishes here.
+
+    Writers never use this — a publish location is explicit (:func:`pond_data_dir`), not probed.
+
+    Known edge (accepted until Pool-aware resolution, plans/persist.md phase 3): a line *moved* from the
+    local Pool to a remote one leaves a stale local sidecar shadowing the fresher remote data until its
+    local dir is cleaned; a `force`/redeploy re-publishes and self-heals."""
+    if data_root is not None:
+        local = pond_data_dir(root, pond_name, major, None)
+        if not local.exists("_trickle.json"):
+            return pond_data_dir(root, pond_name, major, data_root)
+        return local
+    return pond_data_dir(root, pond_name, major, None)

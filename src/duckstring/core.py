@@ -532,7 +532,9 @@ class Pond:
     def _source_data_dir(self, source_pond: str):
         """The published data location for a foreign Source as a :class:`~duckstring.storage.Storage`,
         honouring this Pond's major pin and the configured data root (or the flat puddles layout in local
-        runs, which have no majors)."""
+        runs, which have no majors). Resolved **local-first** (plans/persist.md): a Source co-located on
+        this Pool published locally — read that (the fast handoff, no object-store round trip); only a
+        Source with no local publish is read from the data root."""
         from pathlib import Path as _Path
 
         from .storage import LocalStorage
@@ -540,9 +542,9 @@ class Pond:
         major = self.source_majors.get(source_pond)
         if major is None:  # flat puddles layout (local runs have no majors) — always under the local root
             return LocalStorage(_Path(self.root) / "ponds" / source_pond / "data")
-        from .catchment.registry import pond_data_dir
+        from .catchment.registry import resolve_data_dir
 
-        return pond_data_dir(_Path(self.root), source_pond, major, self.data_root)
+        return resolve_data_dir(_Path(self.root), source_pond, major, self.data_root)
 
     def read_table(self, ref: str):
         """A relation over a table — own (``"name"``) or a Source's (``"source.table"``). A Source

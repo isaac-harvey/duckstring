@@ -38,11 +38,11 @@ def _egress_spout(root: Path, job: dict, data_root: str | None = None) -> None:
     from ..egress.base import get_egress
     from ..trickle.context import NEVER
     from ..trickle_io import load_sidecar, read_delta
-    from .registry import pond_data_dir
+    from .registry import resolve_data_dir
 
     driver = get_egress(job["destination"])  # resolves the scheme's driver (+ validates the URI)
     caps = driver.capabilities()
-    data_dir = pond_data_dir(Path(root), job["pond_name"], job["major"], data_root)
+    data_dir = resolve_data_dir(Path(root), job["pond_name"], job["major"], data_root)
     dp = get_data_plane()
     # The data + the CDC cursor ride the **source's** real freshness; the Spout's run freshness (job["f"])
     # is only the engine/throttle clock (the window end, when windowed) — used for completion, not the data.

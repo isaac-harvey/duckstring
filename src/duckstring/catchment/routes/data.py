@@ -66,10 +66,12 @@ def _resolve_major(request: Request, pond_name: str, major: Optional[int], versi
 
 
 def _data_dir(request: Request, pond_name: str, major: int):
-    from ..registry import pond_data_dir
+    # Local-first read (plans/persist.md): a line publishing on this Pool is read from the local layout
+    # (fast, and fresher than the async persist); only a remote-published line reads the data root.
+    from ..registry import resolve_data_dir
 
     data_root = getattr(request.app.state, "data_root", None)
-    return pond_data_dir(Path(request.app.state.root), pond_name, major, data_root)
+    return resolve_data_dir(Path(request.app.state.root), pond_name, major, data_root)
 
 
 def _tune_read_con(con) -> None:

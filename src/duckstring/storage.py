@@ -165,6 +165,11 @@ class Storage:
         """Atomically write ``data`` to the addressed file."""
         raise NotImplementedError
 
+    def put_file(self, local: Path, *parts: str) -> None:
+        """Upload one local file to the addressed location — streaming (never whole-file-in-memory),
+        atomic at the destination. The Persist mirror's per-file primitive (plans/persist.md)."""
+        raise NotImplementedError
+
     @contextmanager
     def copy_to(self, *parts: str) -> Iterator[str]:
         """Yield a URI for DuckDB to ``COPY … TO``, committing the result **atomically** to the addressed
@@ -269,6 +274,17 @@ class LocalStorage(Storage):
         dest.parent.mkdir(parents=True, exist_ok=True)
         tmp = dest.with_name(dest.name + ".tmp")
         tmp.write_bytes(data)
+        tmp.replace(dest)
+
+    def put_file(self, local: Path, *parts: str) -> None:
+        """Upload one local file to this storage at ``parts`` — streaming (never whole-file-in-memory),
+        atomic at the destination. The Persist mirror's per-file primitive (plans/persist.md)."""
+        import shutil
+
+        dest = self._abs(*parts)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        tmp = dest.with_name(dest.name + ".tmp")
+        shutil.copyfile(local, tmp)
         tmp.replace(dest)
 
     @contextmanager
@@ -477,6 +493,11 @@ class ObjectStorage(Storage):
 
     def write_bytes(self, data: bytes, *parts: str) -> None:
         self.fs.pipe_file(self._key(*parts), data)  # single-object PUT — atomic
+
+    def put_file(self, local: Path, *parts: str) -> None:
+        """Upload one local file — fsspec streams it (multipart for a large object), and a single-object
+        PUT is atomic, so no tmp+rename is needed."""
+        self.fs.put_file(str(local), self._key(*parts))
 
     @contextmanager
     def copy_to(self, *parts: str) -> Iterator[str]:

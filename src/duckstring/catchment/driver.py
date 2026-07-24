@@ -241,6 +241,7 @@ class Driver:
         self.meta: dict[str, dict] = {}  # key -> {name, major, version_id, version, source_path, ...}
         self.jobs: dict[str, list[dict]] = {}  # key -> queued Duck commands
         self.last_seen: dict[str, datetime] = {}  # key -> last Duck contact (jobs poll / event)
+        self.persisted: dict[str, str] = {}  # key -> persisted_f ISO (the durable-mirror watermark)
         self._idle_since: dict[str, datetime] = {}  # key -> when the Pond went idle (reap grace clock)
         # Pond Draw transfers awaiting the poller: (pond_key, F). A Draw run is not dispatched to a
         # Duck — the poller performs the parquet fetch out-of-lock, then reports completion.
@@ -458,6 +459,13 @@ class Driver:
             # is_blocked may be stale. Re-derive for every Pond (propagates to Sinks).
             for pid in self.state.pond_states:
                 derive_blocked(self.state, pid)
+            # The persist watermark (plans/persist.md): the freshness through which each line's published
+            # output is mirrored to the data root. Observability in phase 2 (no engine gating yet).
+            self.persisted = {}
+            for pid, pf in db.execute("SELECT pond_id, persisted_f FROM pond_state WHERE persisted_f IS NOT NULL"):
+                key = pondid_to_key.get(pid)
+                if key:
+                    self.persisted[key] = pf
             self.jobs = {key: self.jobs.get(key, []) for key in ponds}
             self.state_version += 1  # topology/config (deploy, ducts, windows) changed
 
@@ -605,7 +613,11 @@ class Driver:
                 drop_table(con, table)
             finally:
                 con.close()
-            unpublish_table(pond_data_dir(Path(self.root), name, major, self.data_root), table)
+            # Local-first publish (plans/persist.md): the table may exist BOTH locally and on the persist
+            # layer — unpublish from both, or the stale local copy would shadow the deletion on reads.
+            unpublish_table(pond_data_dir(Path(self.root), name, major, None), table)
+            if self.data_root is not None:
+                unpublish_table(pond_data_dir(Path(self.root), name, major, self.data_root), table)
             self.state_version += 1
 
     def reset_pond(self, pond: str, clear_history: bool = False) -> None:
@@ -744,6 +756,21 @@ class Driver:
             self._idle_since.clear()
             lines = [(m["name"], m["major"], m["pond_id"]) for m in self.meta.values()
                      if not m.get("is_draw") and not m.get("is_spout")]
+            # Local-first publish (plans/persist.md): while a data root is attached, the local layout is a
+            # PUBLISH CACHE of that plane (mirrored to it by the Persist) — and reads resolve local-first.
+            # On a switch away from a non-local plane, that cache belongs to the OLD plane: left in place it
+            # would shadow the new plane's (empty or adopted) truth. Scrub it — the old plane itself remains
+            # intact as the backup. When the old plane IS local (old_root None), the local layout is the old
+            # location and is kept untouched, exactly per the backup contract above.
+            if self.data_root is not None:
+                from pathlib import Path as _Path
+
+                from .registry import pond_data_dir as _pdd
+                for name, major, _pid in lines:
+                    try:
+                        _pdd(_Path(self.root), name, major, None).rmtree()
+                    except Exception:
+                        pass
             # 2. Re-point future spawns (publish + read) at the new plane. NOTE: the OLD location is not
             #    touched — no scrub — so it remains a hand-migration source / switch-back backup.
             self.data_root = new_root
@@ -788,7 +815,7 @@ class Driver:
         from pathlib import Path
 
         from ..storage import copy_tree, tree_size
-        from .registry import pond_data_dir
+        from .registry import pond_data_dir, resolve_data_dir
 
         root = Path(self.root)
         # Phase 1 (locked): quiesce, plan the copy, seed progress totals.
@@ -805,7 +832,11 @@ class Driver:
             total_files = total_bytes = 0
             plan = []
             for name, major, _pid in lines:
-                src = pond_data_dir(root, name, major, old_root)
+                # Copy from the LOCAL-FIRST source (plans/persist.md): a locally-publishing line's local
+                # layout is complete and at end_f — the old plane's mirror may lag behind it (persisted_f
+                # ≤ end_f), so copying from the plane could miss the un-persisted tail. resolve gives the
+                # local layout when it publishes here, the old plane otherwise (a remote-Duck line).
+                src = resolve_data_dir(root, name, major, old_root)
                 dst = pond_data_dir(root, name, major, new_root)
                 if src.uri() == dst.uri():  # same physical location — nothing to copy
                     continue
@@ -1625,9 +1656,9 @@ class Driver:
         from pathlib import Path
 
         from ..trickle_io import load_sidecar
-        from .registry import pond_data_dir
+        from .registry import resolve_data_dir
 
-        sidecar = load_sidecar(pond_data_dir(Path(self.root), name, major, self.data_root))
+        sidecar = load_sidecar(resolve_data_dir(Path(self.root), name, major, self.data_root))
         targets = [table] if table else list(sidecar)
         for t in targets:
             meta = sidecar.get(t)
@@ -2149,6 +2180,11 @@ class Driver:
                 self._process(now)
                 self._advance_repair(pond, now)  # if this Pond was a repair step, release its children
                 self._signal_egress()  # the Pond published → wake the egress worker for its Spouts
+            elif kind == "persist":
+                # The Duck mirrored its local publish to the durable layer (plans/persist.md). A separate
+                # log item from the Pond Run (which closed at local publish); success advances the
+                # persisted_f watermark. Pure observability in phase 2 — no engine state changes.
+                self._record_persist(pond, f, payload.get("status", "success"), payload.get("error"), now)
             elif kind == "contract_failed":
                 # The Duck refused to publish: the output broke the major line's additive contract.
                 # Fail the Pond at this Run (keeping last-good data) and block downstream, like any failure.
@@ -2707,6 +2743,28 @@ class Driver:
         )
         self.db.commit()
 
+    def _record_persist(self, pond: str, f: str | None, status: str, error: str | None, now: datetime) -> None:
+        """Record a Duck's persist report (plans/persist.md): upsert the ``pond_persist`` log row and, on
+        success, advance the ``persisted_f`` watermark (monotonic — a replayed/stale report never regresses
+        it). Idempotent on ``(pond, f)`` so event replay after a reconnect is safe."""
+        if not f:
+            return
+        meta = self.meta.get(pond)
+        if meta is None:
+            return
+        self.db.execute(
+            "INSERT OR REPLACE INTO pond_persist (pond_id, f, status, error, finished_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (meta["pond_id"], f, status, error, _iso(now)),
+        )
+        if status == "success":
+            prev = self.persisted.get(pond)
+            if prev is None or f > prev:  # ISO-8601 UTC sorts lexically
+                self.persisted[pond] = f
+                self.db.execute("UPDATE pond_state SET persisted_f = ? WHERE pond_id = ?",
+                                (f, meta["pond_id"]))
+        self.db.commit()
+
     def _record_pass(self, pond: str, f: datetime, now: datetime) -> None:
         """An engine-synthesised pass (no Duck): record an instant, successful no-change pond_run so the
         history is honest and reload's run counts stay correct (see plans/no-change-skip.md)."""
@@ -3041,13 +3099,13 @@ class Driver:
         from pathlib import Path
 
         from ..dataplane import get_data_plane
-        from .registry import pond_data_dir
+        from .registry import resolve_data_dir
 
         meta = self.meta.get(key, {})
         if meta.get("is_draw"):
             return set()
         try:
-            data_dir = pond_data_dir(Path(self.root), meta["name"], meta["major"], self.data_root)
+            data_dir = resolve_data_dir(Path(self.root), meta["name"], meta["major"], self.data_root)
             return set(get_data_plane().list_tables(data_dir))
         except Exception:
             return set()
@@ -3057,13 +3115,13 @@ class Driver:
         from pathlib import Path
 
         from ..objects import list_objects
-        from .registry import pond_data_dir
+        from .registry import resolve_data_dir
 
         meta = self.meta.get(key, {})
         if meta.get("is_draw"):
             return False
         try:
-            data_dir = pond_data_dir(Path(self.root), meta["name"], meta["major"], self.data_root)
+            data_dir = resolve_data_dir(Path(self.root), meta["name"], meta["major"], self.data_root)
             return bool(list_objects(data_dir))
         except Exception:
             return False
@@ -3177,6 +3235,9 @@ class Driver:
                     "start_f": ts(ps.start_f),
                     "end_f": ts(ps.end_f),
                     "changed_f": ts(ps.changed_f),  # content freshness: held across a pass (no-change run)
+                    # The durable-mirror watermark (plans/persist.md): output persisted to the data root
+                    # through this freshness. null = never persisted / no cloud.
+                    "persisted_f": self.persisted.get(key),
                     "d_ms": int(ps.d.total_seconds() * 1000),
                     "trigger": trigger,
                     "is_failed": ps.is_failed,

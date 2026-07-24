@@ -646,6 +646,81 @@ def hydrate_registry(con, data_dir, tables=None) -> list[str]:
     return hydrated
 
 
+# The Iceberg catalog layer is LOCAL-ONLY under local-first publish: its metadata files embed absolute
+# warehouse paths, so byte-copying them to another location yields pointers into the producer's filesystem.
+# The persisted layer is the FLAT layout (parts + wholesale files + sidecar) — complete and canonical; every
+# reader falls back to the flat read when no catalog.json is present (`IcebergDataPlane._load` → None).
+_PERSIST_SKIP = frozenset({"catalog.json", "pond"})
+
+
+def persist_tree(local_dir, dest) -> int:
+    """Mirror a Pond's locally-published output to its durable **persist layer** (plans/persist.md) —
+    the async Duck-side reconcile behind ``persisted_f``. Returns the number of files uploaded.
+
+    Semantics per entry kind:
+
+    - **top-level files** (the sidecar, wholesale ``{table}.parquet`` overwrite output) — always uploaded
+      (rewritten per run; small, or the table's whole content by design);
+    - **directory files** (append/changelog/band parts, base chunks, state snapshots) — immutable and
+      idempotent **by name**: upload only what the destination lacks, and prune destination files their
+      local directory no longer holds (retention trims, checkpoint token swaps, warm folds, snapshot
+      pruning all propagate);
+    - **directories removed locally** (a folded-away ``__band/``, a dropped table's parts) — removed at
+      the destination;
+    - the **Iceberg catalog** (``catalog.json`` + the ``pond/`` warehouse) — skipped: local-only (its
+      metadata embeds absolute local paths; the flat layer is the canonical persisted form).
+
+    **Safety guard**: a local dir with no ``_trickle.json`` sidecar has published nothing — the mirror
+    refuses to touch the destination at all (a fresh/lost box must never wipe the durable layer).
+    Replayable: a mirror that dies mid-way re-runs idempotently (parts by name, wholesale re-upload)."""
+    local = _as_storage(local_dir)
+    root = local.root  # persist mirrors FROM a local publish dir by definition
+    if not (root / "_trickle.json").exists():
+        return 0  # nothing published locally — never touch the durable layer from an empty source
+    copied = 0
+    local_dirs: set[str] = set()
+    for p in sorted(root.iterdir()):
+        if p.name in _PERSIST_SKIP or p.name.endswith(".tmp"):
+            continue
+        if p.is_file():
+            dest.put_file(p, p.name)
+            copied += 1
+        elif p.is_dir():
+            local_dirs.add(p.name)
+            copied += _mirror_dir(p, dest, (p.name,))
+    # Prune destination directories that no longer exist locally (skip-set aside) — e.g. a warm tier
+    # folded into the cold base, or a table dropped locally. Guarded by the sidecar check above.
+    for name in dest.subdir_names():
+        if name not in local_dirs and name not in _PERSIST_SKIP:
+            dest.rmtree(name)
+    return copied
+
+
+def _mirror_dir(src: Path, dest, parts: tuple[str, ...]) -> int:
+    """Reconcile one directory of immutable, name-addressed files (parts/chunks/snapshots): upload the
+    locally-present-but-missing, prune the remotely-present-but-gone, recurse into subdirs (``state/``)."""
+    copied = 0
+    existing = set(dest.names(*parts))
+    local_files: set[str] = set()
+    local_dirs: set[str] = set()
+    for p in sorted(src.iterdir()):
+        if p.name.endswith(".tmp"):
+            continue
+        if p.is_dir():
+            local_dirs.add(p.name)
+            copied += _mirror_dir(p, dest, parts + (p.name,))
+            continue
+        local_files.add(p.name)
+        if p.name not in existing:
+            dest.put_file(p, *parts, p.name)
+            copied += 1
+    for name in existing - local_files:
+        dest.remove(*parts, name)
+    for name in set(dest.child(*parts).subdir_names()) - local_dirs:
+        dest.rmtree(*parts, name)
+    return copied
+
+
 def _compact_threshold(con=None, main=None) -> int:
     """The checkpoint floor / target base-chunk size in bytes. A merge main checkpoints when its
     changelog-since-the-fold-watermark outgrows ``max(base size, this)`` — so it never checkpoints below

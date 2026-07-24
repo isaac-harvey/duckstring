@@ -25,7 +25,7 @@ from .executor import _export_data
 
 class DbtExecutor:
     def __init__(self, pond_name: str, major: int, version: str, source_path: str, root: Path,
-                 data_root: str | None = None):
+                 data_root: str | None = None, persist_root: str | None = None):
         from ..core import read_pond_toml
         from ..dbt_mode import parse_manifest, project_dir, write_profile
         from ..keys import spec_major
@@ -37,7 +37,13 @@ class DbtExecutor:
         self.data_root = data_root
         self.registry_path = pond_registry_path(root, pond_name, major)
         self.registry_path.parent.mkdir(parents=True, exist_ok=True)
-        self.own_data_dir = pond_data_dir(root, pond_name, major, data_root)
+        # Local-first publish + async persist, same as RippleExecutor (plans/persist.md).
+        if persist_root:
+            self.own_data_dir = pond_data_dir(root, pond_name, major, None)
+            self.persist_dir = pond_data_dir(root, pond_name, major, persist_root)
+        else:
+            self.own_data_dir = pond_data_dir(root, pond_name, major, data_root)
+            self.persist_dir = None
 
         source_dir = root / source_path
         info = read_pond_toml(source_dir)
@@ -125,6 +131,14 @@ class DbtExecutor:
         with self._lock:
             con = duckdb.connect(str(self.registry_path))
             return _export_data(con.cursor(), self.own_data_dir, f, contract)
+
+    def persist(self) -> int:
+        """Mirror the local publish to the durable layer — see :meth:`RippleExecutor.persist`."""
+        if self.persist_dir is None:
+            return 0
+        from ..dataplane import persist_tree
+
+        return persist_tree(self.own_data_dir, self.persist_dir)
 
     def wipe(self) -> None:
         """A Refresh's cold reset: drop the model tables so the next run rebuilds from scratch. Source

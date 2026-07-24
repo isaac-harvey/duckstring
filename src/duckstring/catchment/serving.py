@@ -47,7 +47,7 @@ def build_serving_con(driver, *, sandboxed: bool):
 
     from ..dataplane import get_data_plane
     from ..keys import pond_key
-    from .registry import pond_data_dir
+    from .registry import resolve_data_dir
 
     con = duckdb.connect()
     # Spill instead of OOM (materialising a large serviceable table over S3) + keep Parquet footers warm.
@@ -70,7 +70,7 @@ def build_serving_con(driver, *, sandboxed: bool):
             tables = driver.serviceable(key) if sandboxed else driver._output_tables(pv_id)
             if not tables:
                 continue
-            data_dir = pond_data_dir(root, name, major, driver.data_root)
+            data_dir = resolve_data_dir(root, name, major, driver.data_root)
             data_dir.duckdb_setup(con)  # object store → httpfs + creds (before we lock external access)
             schema = f"{name}_v{major}"
             con.execute(f"CREATE SCHEMA IF NOT EXISTS {_qi(schema)}")

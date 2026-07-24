@@ -123,7 +123,7 @@ def _export_data(con, data_dir, f: datetime | None, contract=None) -> dict | Non
 
 class RippleExecutor:
     def __init__(self, pond_name: str, major: int, version: str, source_path: str, root: Path,
-                 max_workers: int = 8, data_root: str | None = None):
+                 max_workers: int = 8, data_root: str | None = None, persist_root: str | None = None):
         import duckdb
 
         from ..core import read_pond_toml
@@ -139,7 +139,17 @@ class RippleExecutor:
         self.registry_path.parent.mkdir(parents=True, exist_ok=True)
         # Object (non-tabular output) staging + own published location — see objects.py.
         self.staging_dir = pond_major_dir(root, pond_name, major) / STAGING_DIR
-        self.own_data_dir = pond_data_dir(root, pond_name, major, data_root)
+        # LOCAL-FIRST PUBLISH (plans/persist.md): with `persist_root` set (a Duck on the Catchment Pool,
+        # cloud enabled) the run publishes to the LOCAL layout — the fast handoff co-located Sinks read —
+        # and `persist()` asynchronously mirrors it to the durable layer afterwards. Without it (no cloud,
+        # or a remote-Pool Duck whose local disk nothing else can reach) the publish target is data_root
+        # directly, exactly as before.
+        if persist_root:
+            self.own_data_dir = pond_data_dir(root, pond_name, major, None)
+            self.persist_dir = pond_data_dir(root, pond_name, major, persist_root)
+        else:
+            self.own_data_dir = pond_data_dir(root, pond_name, major, data_root)
+            self.persist_dir = None
         # Registry-loss recovery: the registry FILE is gone (host loss / migration / scale-to-zero)
         # but published state survives → rebuild the registry from it (tiers + meta + the Extension-1
         # agg/acc snapshots), so the next run resumes *incrementally* instead of re-bootstrapping.
@@ -167,10 +177,17 @@ class RippleExecutor:
         if recover:
             from ..dataplane import hydrate_registry
 
-            hydrated = hydrate_registry(self._registry, self.own_data_dir)
+            # Hydrate from the local publish first (co-located, cheap). A true box loss (local publish
+            # gone too) falls back to the durable persist layer — the whole point of always-persist.
+            source_dir = self.own_data_dir
+            if self.persist_dir is not None and not self.own_data_dir.exists("_trickle.json") \
+                    and self.persist_dir.exists("_trickle.json"):
+                source_dir = self.persist_dir
+            hydrated = hydrate_registry(self._registry, source_dir)
             if hydrated:
+                where = "persist layer" if source_dir is self.persist_dir else "published state"
                 print(f"[executor] registry file was missing — hydrated {len(hydrated)} table(s) "
-                      f"from the published state: {', '.join(hydrated)}", flush=True)
+                      f"from the {where}: {', '.join(hydrated)}", flush=True)
         self._cursor_lock = threading.Lock()
         # Which major line of each Source this Pond's reads resolve to (its pond.toml pins).
         sources = read_pond_toml(root / source_path).get("sources", {})
@@ -232,6 +249,17 @@ class RippleExecutor:
         # last-good Object intact (the staged writes are discarded on the next run / wipe).
         commit_objects(self.staging_dir, self.own_data_dir, f)
         return schema
+
+    def persist(self) -> int:
+        """Mirror the locally-published output to the durable persist layer (plans/persist.md) — the
+        async step behind ``persisted_f``. Reconciles by file name (parts idempotent, wholesale re-upload,
+        prunes what local no longer holds); replay-safe. No-op (0) when there is no persist layer.
+        Runs off the serve loop — it touches only published files, never the registry."""
+        if self.persist_dir is None:
+            return 0
+        from ..dataplane import persist_tree
+
+        return persist_tree(self.own_data_dir, self.persist_dir)
 
     def wipe(self) -> None:
         """Drop every table in the Pond's registry — a Refresh's cold reset. The next run then reads its
