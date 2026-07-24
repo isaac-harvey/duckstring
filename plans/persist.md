@@ -1,8 +1,9 @@
 # Plan: Persist — local-first publish, async durability, Pool-aware freshness
 
-> **Status: phase 2 IMPLEMENTED and verified; phases 3–6 designed, not built.** Settled with the author
-> 2026-07-24. Companion to `plans/s3-resident-state.md` (the *hydration* direction; this plan is the
-> *publish* direction and the Pool model both rest on).
+> **Status: ALL PHASES (2–6) IMPLEMENTED and offline-verified.** Settled with the author 2026-07-24.
+> Companion to `plans/s3-resident-state.md` (the *hydration* direction; this plan is the *publish*
+> direction and the Pool model both rest on). The one remaining validation is the **real-AWS gate run**
+> (the Fargate/EC2 machine-start calls + remote dial-back in reality).
 >
 > **Built (phase 2):** local-first publish + the Duck-side async Persist + `persisted_f`. A Catchment-Pool
 > Duck publishes to the local layout (`--persist-root`, passed by `SubprocessLauncher`; remote launchers
