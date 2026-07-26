@@ -55,6 +55,35 @@ FLOCK_MODES = (None, "always", "upgrade", "off")
 _ROWS_PER_GIB = 500_000
 _DEFAULT_MIN_ROWS = 4_000_000  # when the memory cap is unknown (a stock local Duck)
 
+# Process-lifetime dispatch counters (this module runs inside the Duck). Shipped on the Duck's
+# run_completed event so a *degrading* Flock is visible from the Catchment (/metrics, /api/status) —
+# the fallback contract means a failed dispatch still produces a correct run, which otherwise looks
+# identical to a working Flock while quietly paying full local compute every time.
+_stats = {"dispatched": 0, "failed": 0, "last_error": None}
+
+
+def stats() -> dict | None:
+    """A snapshot of this Duck's Flock dispatch counters — ``None`` while nothing was ever attempted
+    (the common no-Flock case ships no field at all)."""
+    if not _stats["dispatched"] and not _stats["failed"]:
+        return None
+    return dict(_stats)
+
+
+def _record_dispatch(engine, result) -> None:
+    if result is None:
+        _stats["failed"] += 1
+        _stats["last_error"] = getattr(engine, "last_error", None) or "dispatch failed (see the Duck log)"
+    else:
+        _stats["dispatched"] += 1
+        _stats["last_error"] = None
+
+
+def _dispatch(engine, builder, out_pk):
+    result = engine.dispatch(builder, out_pk)
+    _record_dispatch(engine, result)
+    return result
+
 
 class FlockEngine(Protocol):
     """A serverless big-compute backend behind the Flock tier. One implementation per engine
@@ -156,12 +185,12 @@ def comprehensive(builder, out_pk, *, pond_mode: str | None, comprehensive_bound
         log.info("flock: not dispatching (%s)", reason)
         return None
     if mode == "always":
-        return engine.dispatch(builder, out_pk)
+        return _dispatch(engine, builder, out_pk)
     # upgrade: comprehensive-bound runs only; dispatch when clearly over, else local + OOM fail-up.
     if not comprehensive_bound:
         return None
     if engine.estimate_rows(builder) >= _min_rows():
-        return engine.dispatch(builder, out_pk)
+        return _dispatch(engine, builder, out_pk)
     try:
         return _probe_local(builder)
     except Exception as exc:
@@ -174,7 +203,7 @@ def comprehensive(builder, out_pk, *, pond_mode: str | None, comprehensive_bound
             log.warning("flock: local comprehensive hit the memory limit and oom_policy=fail — not offloading")
             raise
         log.warning("flock: local comprehensive hit the memory limit (%s) — failing up", str(exc)[:200])
-        remote = engine.dispatch(builder, out_pk)
+        remote = _dispatch(engine, builder, out_pk)
         if remote is None:  # the engine also failed — surface the real problem, don't loop
             raise
         return remote

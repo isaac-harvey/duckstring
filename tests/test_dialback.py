@@ -54,6 +54,22 @@ def test_relay_defers_until_ready_then_drains():
     assert d.url == "https://relay.example:7474" and drained == [True]
 
 
+def test_hostless_public_url_is_rejected_at_boot():
+    """The gate-run landmine: an IMDSv2-less metadata read builds PUBLIC_URL='http://:7474', which is
+    accepted silently and surfaces a minute later as a heartbeat failure on an unrelated Pond. Reject it
+    where it enters, with the actual problem named."""
+    import pytest
+
+    from duckstring.catchment.cloud_backends import _validated_public_url
+
+    assert _validated_public_url(None) is None
+    assert _validated_public_url("") is None
+    assert _validated_public_url("http://10.0.1.5:7474") == "http://10.0.1.5:7474"
+    for bad in ("http://:7474", "10.0.1.5:7474", "ftp://host:7474", "http://"):
+        with pytest.raises(ValueError, match="PUBLIC_URL"):
+            _validated_public_url(bad)
+
+
 def test_create_app_wires_public_url_into_the_dialback(tmp_path, monkeypatch):
     # The end-to-end wiring the Fargate run exposed: create_app must thread PUBLIC_URL into the launcher's
     # dial-back so a cloud Duck dials the tunnel, not the bind. The launcher is built in the lifespan, so

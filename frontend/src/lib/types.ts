@@ -72,6 +72,9 @@ export interface PondInfo {
   sourceRetries: number; // live budget: Runs retried on a Source change
   // Effective compute config (Duck target/size + Flock posture) + declared/override; null for Draws/Spouts.
   duck: import('./api').DuckConfig | null;
+  // The most recent Flock dispatch failure — a failed dispatch still completes the run on local
+  // compute, so this warning is the only visible tell that the Flock is degrading. Null when clean.
+  flockError: string | null;
   // Spout nodes only: its egress config + standing-Wake armed state.
   spout?: { destination: string; table: string | null; mode: string; armed: boolean } | null;
 }

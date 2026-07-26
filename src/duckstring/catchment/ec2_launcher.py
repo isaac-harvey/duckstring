@@ -222,6 +222,25 @@ class Ec2Launcher:
         the driver can attribute the Pond failure to it instead of a generic "process not running"."""
         return self._launch_errors.get(pond_key)
 
+    def diagnose(self, pond_key: str) -> str | None:
+        """Ask EC2 what happened to this Duck's instance — the liveness sweep's silent branch, so a box
+        that terminated/never booted surfaces its state ("terminated: Server.SpotInstanceTermination")
+        instead of only "lost contact". Best-effort: any DescribeInstances problem → None."""
+        rec = self._instances.get(pond_key)
+        if rec is None:
+            return None
+        try:
+            resp = self._ec2().describe_instances(InstanceIds=[rec["instance_id"]])
+            inst = resp["Reservations"][0]["Instances"][0]
+            parts = [f"instance {inst.get('State', {}).get('Name', 'unknown')}"]
+            reason = inst.get("StateReason", {}).get("Message")
+            if reason:
+                parts.append(str(reason))
+            return "ec2: " + "; ".join(parts)
+        except Exception:
+            log.debug("ec2: describe_instances failed for %s", pond_key, exc_info=True)
+            return None
+
     def terminate(self, pond_key: str, wait: bool = False) -> None:
         self._pending.pop(pond_key, None)
         self._launch_errors.pop(pond_key, None)

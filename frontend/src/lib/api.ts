@@ -114,6 +114,7 @@ export interface RawPond {
   // The effective compute config (Duck target/size + Flock posture) with declared/override provenance;
   // null for Draws/Spouts (no Duck runs them). See plans/cloud-config.md.
   duck: DuckConfig | null;
+  flock_error?: string | null; // most recent Flock dispatch failure (the run still completed, locally)
   ripples: RawRipple[];
   ripple_edges: [string, string][]; // [sourceName, sinkName] within the Pond
 }

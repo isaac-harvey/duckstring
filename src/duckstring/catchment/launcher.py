@@ -254,6 +254,14 @@ class DispatchingLauncher:
             return owner.launch_error(pond_key)
         return None
 
+    def diagnose(self, pond_key: str) -> str | None:
+        """The owning backend's post-launch diagnosis (remote backends only): what the provider says
+        happened to a Duck that went silent (ECS stoppedReason / EC2 instance state)."""
+        owner = self._owner.get(pond_key)
+        if owner is not None and hasattr(owner, "diagnose"):
+            return owner.diagnose(pond_key)
+        return None
+
     def is_running(self, pond_key: str) -> bool:
         owner = self._owner.get(pond_key)
         if owner is not None:

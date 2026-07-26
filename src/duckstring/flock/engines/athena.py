@@ -53,6 +53,7 @@ class AthenaEngine:
         self.database = env.get("DUCKSTRING_FLOCK_ATHENA_DATABASE") or None
         self.scratch = (env.get("DUCKSTRING_FLOCK_ATHENA_SCRATCH") or "").rstrip("/") or None
         self.region = env.get("DUCKSTRING_FLOCK_ATHENA_REGION") or None
+        self.last_error: str | None = None  # last dispatch failure (read by flock's dispatch counters)
 
     # ── FlockEngine protocol ──────────────────────────────────────────────────
 
@@ -92,8 +93,11 @@ class AthenaEngine:
         or ``None`` on any Athena-side failure (the caller runs local). Never raises for an
         engine problem — classic is the oracle."""
         try:
-            return self._run(builder)
+            result = self._run(builder)
+            self.last_error = None
+            return result
         except Exception as exc:  # noqa: BLE001 — the fallback contract
+            self.last_error = f"{type(exc).__name__}: {str(exc)[:300]}"
             log.warning("flock/athena: dispatch failed (%s: %s) — running local",
                         type(exc).__name__, str(exc)[:300])
             return None

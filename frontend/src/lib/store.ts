@@ -169,6 +169,7 @@ function transformStatus(payload: StatusPayload): Omit<StatusSlice, 'cloud'> {
       immediateRetries: p.immediate_retries,
       sourceRetries: p.source_retries,
       duck: p.duck ?? null,
+      flockError: p.flock_error ?? null,
       spout: p.spout ?? null,
     };
     pondViews[p.id] = nodeView(p, p.d_ms);

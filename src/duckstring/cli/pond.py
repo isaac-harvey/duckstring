@@ -144,6 +144,7 @@ def demo(
     tpcds: bool = typer.Option(False, "--tpcds", help="The TPC-DS real-data Trickle pipeline (generated)."),
     gharchive: bool = typer.Option(False, "--gharchive", help="The GHArchive real-data Trickle pipeline (streamed)."),
     dbt: bool = typer.Option(False, "--dbt", help="A dbt-mode Pond (a dbt project as a Pond) + its Source."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation prompt (scripted use)."),
 ) -> None:
     """Create a demo pipeline as subdirectories: the overwrite-Ripple set (default / --ripple), the
     incremental-Trickle set (--trickle), a real-data Trickle set (--tpcds / --gharchive), or a dbt-mode
@@ -174,7 +175,8 @@ def demo(
 
     pond_list = ", ".join(f"[bold]{name}/[/bold]" for name, _ in ponds)
     console.print(f"Will create {pond_list} in {cwd}")
-    typer.confirm("Continue?", default=True, abort=True)
+    if not yes:
+        typer.confirm("Continue?", default=True, abort=True)
 
     for name, _ in ponds:
         shutil.copytree(_DEMO_DIR / name, cwd / name)

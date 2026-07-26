@@ -45,6 +45,10 @@ class Event:
     lineage: dict | None = None  # the Ripple's observed reads/writes ({"reads": [[source|None, table]…],
                                  # "writes": [name…]}) — persisted per attempt at the Catchment
                                  # (plans/lineage.md Phase 1).
+    flock: dict | None = None  # this Duck's Flock dispatch counters ({dispatched, failed, last_error}),
+                               # shipped on run_completed so a degrading Flock is visible Catchment-side
+                               # (/metrics + /api/status) — a failed dispatch still runs local, so it is
+                               # otherwise indistinguishable from a working one. Observability only.
 
     def payload(self) -> dict:
         d = {"kind": self.kind, "f": self.f.isoformat(), "status": self.status, "retry": self.retry,
@@ -67,6 +71,8 @@ class Event:
             d["table"] = self.table
         if self.lineage is not None:
             d["lineage"] = self.lineage
+        if self.flock is not None:
+            d["flock"] = self.flock
         return d
 
 
@@ -159,7 +165,10 @@ class DuckCore:
                     return self._advance(now)
             ledger.record_pond_run_finish(self.con, rc.f, now)
             self._previous_f.pop(rc.f, None)  # the Run is done; drop its carried previous_f
-            self.events.append(Event(kind="run_completed", f=rc.f, schema=schema, changed=changed))
+            from .. import flock as _flock  # dispatch counters — None (field omitted) unless Flock ran
+
+            self.events.append(Event(kind="run_completed", f=rc.f, schema=schema, changed=changed,
+                                     flock=_flock.stats()))
         return self._advance(now)
 
     def ripple_failed(

@@ -19,6 +19,25 @@ _CRED_TTL = 300.0        # seconds — re-validate credentials at most this ofte
 _cred_lock = threading.Lock()  # guards kicking a single background validation at a time
 
 
+def _validated_public_url(url: str | None) -> str | None:
+    """Fail FAST on a malformed ``DUCKSTRING_CATCHMENT_PUBLIC_URL``. Every remote Duck dials this back,
+    so a host-less value (the classic: an un-tokened IMDSv2 metadata read yielding ``http://:7474``)
+    doesn't error here or at launch — it surfaces a minute later as a silent-Duck heartbeat failure on
+    some unrelated Pond. Reject it at boot with the actual problem named."""
+    if not url:
+        return None
+    from urllib.parse import urlparse
+
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise ValueError(
+            f"DUCKSTRING_CATCHMENT_PUBLIC_URL is not a dialable URL: {url!r} — it needs a scheme and a "
+            "host (e.g. http://10.0.1.5:7474). A missing host usually means the value was built from an "
+            "empty variable (e.g. an EC2 metadata lookup without an IMDSv2 token)."
+        )
+    return url
+
+
 def build_remote_backends(root: Path, base_url: str | None, token: str, data_root: str | None,
                           secret_store) -> tuple[dict, object | None]:
     """Return ``(remotes, dialback)`` — the ``{provider: backend}`` map + the shared dial-back — when
@@ -37,7 +56,7 @@ def build_remote_backends(root: Path, base_url: str | None, token: str, data_roo
     # A local Catchment (a laptop behind NAT) can't be dialed back — the auto-relay bridges it. Built
     # only when needed + configured; a public DUCKSTRING_CATCHMENT_PUBLIC_URL wins and skips the relay.
     relay = None
-    has_public = os.environ.get("DUCKSTRING_CATCHMENT_PUBLIC_URL")
+    has_public = _validated_public_url(os.environ.get("DUCKSTRING_CATCHMENT_PUBLIC_URL"))
     relay_off = os.environ.get("DUCKSTRING_RELAY", "").lower() in ("off", "0", "false")
     if not has_public and not relay_off and needs_relay(base_url):
         candidate = RelayManager(bind_url=base_url)

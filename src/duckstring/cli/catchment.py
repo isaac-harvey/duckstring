@@ -232,8 +232,13 @@ def init(
     ),
     header: Optional[list[str]] = typer.Option(None, "--header", help=_HEADER_HELP),
     yes: bool = typer.Option(False, "--yes", "-y", help="Automatically set as default catchment."),
+    no_start: bool = typer.Option(
+        False, "--no-start",
+        help="Register (and mint keys) without starting the server — for scripted provisioning where a "
+             "supervisor (systemd, a container runtime) owns the process via `catchment start`.",
+    ),
 ) -> None:
-    """Create and register a new local Catchment, then start the server."""
+    """Create and register a new local Catchment, then start the server (or stop short with --no-start)."""
     from .config import CONFIG_DIR, list_catchments
 
     if generate_key and key:
@@ -283,6 +288,9 @@ def init(
         _register_or_abort(name, url=url, kind="local", root=str(root_dir), key=key, headers=headers, **store_kw)
         _offer_default(name, yes)
 
+    if no_start:
+        typer.echo(f"Registered '{name}' (not started). Start it with:  duckstring catchment start {name}")
+        return
     _launch(name, url, root_dir, key, **store_kw)
 
 

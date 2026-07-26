@@ -242,6 +242,9 @@ class Driver:
         self.meta: dict[str, dict] = {}  # key -> {name, major, version_id, version, source_path, ...}
         self.jobs: dict[str, list[dict]] = {}  # key -> queued Duck commands
         self.last_seen: dict[str, datetime] = {}  # key -> last Duck contact (jobs poll / event)
+        # key -> the Duck's Flock dispatch counters ({dispatched, failed, last_error}), from run_completed.
+        # Observability only (in-memory; a restart just waits for the next run's report).
+        self.flock_status: dict[str, dict] = {}
         self.persisted: dict[str, str] = {}  # key -> persisted_f ISO (the durable-mirror watermark)
         # Status-poll caches for the published-surface flags, keyed on data_version — see _exported_tables.
         self._tables_cache: dict[str, tuple[int, set]] = {}
@@ -747,10 +750,12 @@ class Driver:
             shutil.rmtree(pond_major_dir(Path(self.root), name, major), ignore_errors=True)
             if self.data_root is not None:  # published data lives outside the state root (bucket/Volume)
                 pond_data_dir(Path(self.root), name, major, self.data_root).rmtree()
-            # 2. Rewind freshness/fault in duck.db (keep demand + operational config).
+            # 2. Rewind freshness/fault in duck.db (keep demand + operational config). persisted_f rewinds
+            #    too — the durable mirror was just scrubbed, so a surviving watermark would let cross-Pool
+            #    Sinks read a gap (plans/persist.md).
             self.db.execute(
                 "UPDATE pond_state SET start_f=?, end_f=?, changed_f=?, d_ms=0, is_failed=0, is_blocked=0, "
-                "failed_f=?, failures=0, is_killed=0, refresh_pending=0 WHERE pond_id=?",
+                "failed_f=?, failures=0, is_killed=0, refresh_pending=0, persisted_f=NULL WHERE pond_id=?",
                 (_iso(NEVER), _iso(NEVER), _iso(NEVER), _iso(NEVER), meta["pond_id"]),
             )
             if clear_history:
@@ -761,6 +766,7 @@ class Driver:
             # 3. Rewind the in-memory engine state (keep demand: has_pull/pull_m/targets/standing_wake).
             if ps is not None:
                 ps.start_f = ps.end_f = ps.changed_f = NEVER
+                ps.persisted_f = NEVER
                 ps.d = timedelta()
                 ps.is_failed = ps.is_blocked = ps.is_killed = False
                 ps.failed_f = NEVER
@@ -777,6 +783,8 @@ class Driver:
                         rs.started_at = None
                         rs.runs_completed = 0
                 derive_blocked(self.state, pond)  # re-derive this Pond + propagate to its Sinks
+            self.persisted.pop(pond, None)
+            self.data_version += 1  # the published surface changed → drop the has_tables/objects caches
             self.state_version += 1
             self._process(_now())
 
@@ -816,9 +824,10 @@ class Driver:
                     except Exception:
                         pass
             # 3. Rewind all runtime rows in duck.db (keep demand + topology + operational config + secrets).
+            #    persisted_f rewinds with the rest — the mirror was scrubbed with the data.
             self.db.execute(
                 "UPDATE pond_state SET start_f=?, end_f=?, changed_f=?, d_ms=0, is_failed=0, is_blocked=0, "
-                "failed_f=?, failures=0, is_killed=0, refresh_pending=0",
+                "failed_f=?, failures=0, is_killed=0, refresh_pending=0, persisted_f=NULL",
                 (_iso(NEVER), _iso(NEVER), _iso(NEVER), _iso(NEVER)),
             )
             self.db.execute("DELETE FROM alert_delivery")  # the notification outbox is runtime, not config
@@ -887,7 +896,8 @@ class Driver:
                 # so the pipeline stays idle — pull tokens, push targets, and standing Wave/Tide triggers.
                 self.db.execute(
                     "UPDATE pond_state SET start_f=?, end_f=?, changed_f=?, d_ms=0, is_failed=0, is_blocked=0, "
-                    "failed_f=?, failures=0, is_killed=0, refresh_pending=1, has_pull=0, has_received_pull=0",
+                    "failed_f=?, failures=0, is_killed=0, refresh_pending=1, has_pull=0, has_received_pull=0, "
+                    "persisted_f=NULL",  # the watermark belonged to the OLD plane — the new one starts empty
                     (_iso(NEVER), _iso(NEVER), _iso(NEVER), _iso(NEVER)),
                 )
                 self.db.execute("DELETE FROM pond_target")   # push demand
@@ -1065,7 +1075,7 @@ class Driver:
             # 3. Delete the pond(id)-keyed config + the pond selection row. Keep pond_version / ripple /
             #    ripple_run / pond_run / pond_version_schema / pond_name (the retained record).
             for tbl in ("pond_state", "pond_target", "pond_open", "pond_trigger", "pond_retry",
-                        "pond_window", "pond_spout", "pond_duck", "pond_to_pond"):
+                        "pond_window", "pond_spout", "pond_duck", "pond_to_pond", "pond_serve_override"):
                 self.db.execute(f"DELETE FROM {tbl} WHERE pond_id = ?", (pond_id,))
             self.db.execute("DELETE FROM pond WHERE id = ?", (pond_id,))
             # 3b. --wipe: purge the deployment record + run history + {version}/ artifacts for this major,
@@ -1080,6 +1090,7 @@ class Driver:
                     self.db.execute(f"DELETE FROM ripple_run WHERE pond_version_id IN ({ph})", vids)
                     self.db.execute(f"DELETE FROM pond_run WHERE pond_version_id IN ({ph})", vids)
                     self.db.execute(f"DELETE FROM pond_version_schema WHERE pond_version_id IN ({ph})", vids)
+                    self.db.execute(f"DELETE FROM pond_version_serve WHERE pond_version_id IN ({ph})", vids)
                     self.db.execute(f"DELETE FROM ripple_run_lineage WHERE pond_version_id IN ({ph})", vids)
                     self.db.execute(
                         f"DELETE FROM pond_version_column_lineage WHERE pond_version_id IN ({ph})", vids)
@@ -1088,7 +1099,12 @@ class Driver:
                         f"(SELECT id FROM ripple WHERE pond_version_id IN ({ph}))", vids)
                     self.db.execute(f"DELETE FROM ripple WHERE pond_version_id IN ({ph})", vids)
                     self.db.execute(f"DELETE FROM pond_version WHERE id IN ({ph})", vids)
-                # Drop the pond_name once its last major is gone and no live sink still sources it.
+                # Drop the pond_name once its last major is gone and no live sink still sources it —
+                # its served-major pointer (pond_serve, an FK on pond_name) goes with it.
+                self.db.execute(
+                    "DELETE FROM pond_serve WHERE pond_name_id = ? "
+                    "AND NOT EXISTS (SELECT 1 FROM pond_version WHERE pond_name_id = ?)",
+                    (pn_id, pn_id))
                 self.db.execute(
                     "DELETE FROM pond_name WHERE id = ? "
                     "AND NOT EXISTS (SELECT 1 FROM pond_version WHERE pond_name_id = ?) "
@@ -2319,6 +2335,8 @@ class Driver:
             elif kind == "run_completed":
                 self.state = clear_missing_asset(self.state, pond)  # a clean read → the wait (if any) is over
                 self.data_version += 1  # the Pond published new output → the serving surface changed
+                if payload.get("flock"):  # the Duck's Flock dispatch counters — see metrics_snapshot/status
+                    self.flock_status[pond] = payload["flock"]
                 self._finish_pond_run(pond, f, now, changed=payload.get("changed", True))
                 # Freeze the published output schema as the version's contract (the substrate the
                 # additive gate and min_version enforcement build on).
@@ -2852,9 +2870,18 @@ class Driver:
                 # Prefer the launcher's specific spawn-failure reason (e.g. a remote pool missing its
                 # image/AMI/IAM) over the generic crash message, so the operator sees the real cause.
                 reason = getattr(self.launcher, "launch_error", lambda _k: None)(pond)
+                self.launcher.terminate(pond)  # clear any dead record so a retry re-spawns
                 self._fail_whole_pond(pond, now, reason or "Duck process is not running (it crashed or exited)")
             elif silent:
-                self._fail_whole_pond(pond, now, "Lost contact with the Duck (no events received)")
+                # A remote Duck that launched but never (or no longer) dials back: ask its backend what the
+                # provider knows (e.g. ECS stoppedReason) — the single most opaque failure otherwise.
+                detail = getattr(self.launcher, "diagnose", lambda _k: None)(pond)
+                # Tear the Duck down BEFORE failing: _fail_whole_pond's cascade may re-dispatch a
+                # retry-on-change Run, and a stale task/instance record would make the backend's ensure()
+                # a silent no-op — the Pond then wedges failing this same way forever.
+                self.launcher.terminate(pond)
+                msg = "Lost contact with the Duck (no events received)"
+                self._fail_whole_pond(pond, now, f"{msg}: {detail}" if detail else msg)
 
     # ─── Core processing ──────────────────────────────────────────────────────
 
@@ -3539,6 +3566,10 @@ class Driver:
                     # provenance. Draws/Spouts are not run by a Duck, so they carry none.
                     "duck": (None if self.meta[key].get("is_draw") or self.meta[key].get("is_spout")
                              else self.duck_config(key)),
+                    # The most recent Flock dispatch failure (None while dispatching cleanly / no Flock).
+                    # A failed dispatch still completes the run locally, so without this a broken Flock is
+                    # indistinguishable from a working one. Sanitised engine message, never a traceback.
+                    "flock_error": (self.flock_status.get(key) or {}).get("last_error"),
                     "ripples": ripples,
                     "ripple_edges": ripple_edges,
                 })
@@ -3578,6 +3609,10 @@ class Driver:
                     node["duck_target"] = dc["duck_target"]
                     node["flock_mode"] = dc["flock_mode"]
                     node["flock_engine"] = dc["flock_engine"] or "none"
+                    fs = self.flock_status.get(key)
+                    if fs:  # the Duck's dispatch counters — a degrading Flock shows up as failures
+                        node["flock_dispatched"] = fs.get("dispatched", 0)
+                        node["flock_dispatch_failures"] = fs.get("failed", 0)
                 nodes.append(node)
             # Cumulative Duck execution seconds per (name, major) — summed Ripple-Run wall-clock spans
             # (the closest compute-cost proxy without tracking instance uptime). Monotonic across restarts.

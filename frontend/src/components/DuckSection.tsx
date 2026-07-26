@@ -44,7 +44,9 @@ function Tag({ from }: { from: string | null }) {
   return <span style={{ fontSize: 9, color: '#52525b', letterSpacing: '0.04em' }}>({from})</span>;
 }
 
-export function DuckSection({ pondId, duck }: { pondId: string; duck: DuckConfig }) {
+export function DuckSection({ pondId, duck, flockError }: {
+  pondId: string; duck: DuckConfig; flockError?: string | null;
+}) {
   const setDuck = useLiveStore((s) => s.setDuck);
   const cloud = useLiveStore((s) => s.cloud);
   const [pools, setPools] = useState<DuckPool[]>([]);
@@ -115,6 +117,14 @@ export function DuckSection({ pondId, duck }: { pondId: string; duck: DuckConfig
           </button>
         ))}
       </div>
+
+      {/* A failed Flock dispatch still completes the run locally, so this warning is the only visible
+          tell that the Flock is degrading (quietly paying full local compute). */}
+      {duck.flock_mode !== 'off' && flockError && (
+        <div style={{ ...row, color: THEME_PULL, fontSize: 11 }} title={flockError}>
+          ⚠ Flock degraded to local: {flockError.length > 90 ? `${flockError.slice(0, 90)}…` : flockError}
+        </div>
+      )}
 
       {duck.flock_mode !== 'off' && (
         <div style={row}>

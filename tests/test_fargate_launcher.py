@@ -115,6 +115,37 @@ def test_terminate_stops_the_task(tmp_path):
     assert ecs.stopped[0]["task"] == "arn:task/1" and not lch.is_running("a@1")
 
 
+def test_diagnose_reports_the_stopped_reason(tmp_path):
+    ecs = FakeEcs()
+    ecs.describe_tasks = lambda **kw: {"tasks": [{
+        "lastStatus": "STOPPED", "stopCode": "TaskFailedToStart",
+        "stoppedReason": "ResourceInitializationError: failed to validate logger args",
+        "containers": [{"exitCode": None, "reason": None}],
+    }]}
+    lch = _fargate(ecs)
+    lch.ensure("a@1", "1", "ponds/a/1", duck=_duck())
+    diag = lch.diagnose("a@1")
+    assert "TaskFailedToStart" in diag and "logger args" in diag
+    assert lch.diagnose("unknown@1") is None  # no record → nothing to say
+    del ecs.describe_tasks  # a client without the API (or any error) degrades to None
+    assert lch.diagnose("a@1") is None
+
+
+def test_terminate_after_silent_failure_lets_ensure_respawn(tmp_path):
+    """The wedge regression at the launcher level: a task record for a Duck that died before dialling
+    back made every later ensure() a no-op. After terminate (the liveness sweep now calls it), ensure
+    must issue a fresh RunTask."""
+    ecs = FakeEcs()
+    lch = _fargate(ecs)
+    lch.ensure("a@1", "1", "ponds/a/1", duck=_duck())
+    assert len(ecs.ran) == 1
+    lch.ensure("a@1", "1", "ponds/a/1", duck=_duck())
+    assert len(ecs.ran) == 1  # a live record: ensure is idempotent
+    lch.terminate("a@1")  # the liveness sweep tears the silent Duck down
+    lch.ensure("a@1", "1", "ponds/a/1", duck=_duck())
+    assert len(ecs.ran) == 2  # a retry now actually launches
+
+
 def test_defers_until_dialback_resolves(tmp_path):
     ecs = FakeEcs()
     dialback = RemoteDialback(None)  # unknown bind, no relay → URL resolves via set_base_url

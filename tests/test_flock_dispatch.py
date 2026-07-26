@@ -72,6 +72,32 @@ def test_runtime_default_is_upgrade():
     assert flock.resolve_mode(None, {}) == "upgrade"
 
 
+# ─── dispatch counters (the degrade-visibly surface) ─────────────────────────────
+
+
+@pytest.fixture(autouse=True)
+def _reset_flock_stats():
+    flock._stats.update({"dispatched": 0, "failed": 0, "last_error": None})
+    yield
+
+
+def test_stats_start_empty_and_omitted():
+    assert flock.stats() is None  # no field ships on run_completed until Flock actually ran
+
+
+def test_stats_count_dispatches_and_failures():
+    good = FakeEngine(result_fn=lambda b: object())
+    bad = FakeEngine()  # dispatch → None = the engine failed (the fallback contract)
+    bad.last_error = "InvalidRequestException: Unable to verify/create output bucket"
+    flock._dispatch(good, None, None)
+    assert flock.stats() == {"dispatched": 1, "failed": 0, "last_error": None}
+    flock._dispatch(bad, None, None)
+    s = flock.stats()
+    assert s["failed"] == 1 and "output bucket" in s["last_error"]
+    flock._dispatch(good, None, None)  # a clean dispatch clears the sticky error
+    assert flock.stats()["last_error"] is None
+
+
 # ─── the terminal hook, end to end against a real registry ──────────────────────
 
 

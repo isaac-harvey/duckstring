@@ -204,6 +204,36 @@ class FargateLauncher:
         the driver can attribute the Pond failure to it instead of a generic "process not running"."""
         return self._launch_errors.get(pond_key)
 
+    def diagnose(self, pond_key: str) -> str | None:
+        """Ask ECS what happened to this Duck's task — called by the liveness sweep when a launched Duck
+        never dialled back (the silent branch), so the Pond failure carries the provider's real reason
+        (``TaskFailedToStart: … not authorized to perform: logs:CreateLogGroup …``) instead of only
+        "lost contact". Best-effort: any DescribeTasks problem → None (the generic message stands)."""
+        task_arn = self._tasks.get(pond_key)
+        if task_arn is None:
+            return None
+        try:
+            resp = self._ecs().describe_tasks(cluster=self.cluster, tasks=[task_arn])
+            task = (resp.get("tasks") or [None])[0]
+            if task is None:
+                return None
+            parts = []
+            if task.get("lastStatus"):
+                parts.append(f"task {task['lastStatus']}")
+            if task.get("stopCode"):
+                parts.append(str(task["stopCode"]))
+            if task.get("stoppedReason"):
+                parts.append(str(task["stoppedReason"]))
+            for c in task.get("containers") or []:
+                if c.get("exitCode") is not None:
+                    parts.append(f"container exit {c['exitCode']}")
+                if c.get("reason"):
+                    parts.append(str(c["reason"]))
+            return "fargate: " + "; ".join(parts) if parts else None
+        except Exception:
+            log.debug("fargate: describe_tasks failed for %s", pond_key, exc_info=True)
+            return None
+
     def terminate(self, pond_key: str, wait: bool = False) -> None:
         self._pending.pop(pond_key, None)
         self._launch_errors.pop(pond_key, None)

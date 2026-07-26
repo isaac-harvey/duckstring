@@ -187,6 +187,9 @@ A VM / container with a local disk and the data plane in an S3 bucket.
        --data-root 's3://acme-lake/duckstring?region=eu-west-1' \
        --generate-key
    ```
+   Provisioning under a supervisor (systemd, a container entrypoint)? Add `--no-start`: `init` then
+   registers and mints the keys **without** serving in the foreground, and the supervisor owns the
+   process via `duckstring catchment start prod`.
 4. **(Ephemeral disk only) add a state backup** so a redeploy / scale-to-zero survives:
    ```bash
    DUCKSTRING_STATE_BACKUP_URI=s3://acme-lake/duckstring-state
@@ -329,7 +332,10 @@ duckstring_pond_failed{pond="sales",major="1"}                  # 0/1
 duckstring_pond_failures_total{pond="sales",major="1"}          # cumulative failed runs
 duckstring_spout_delivery_lag_seconds{spout="sales#warehouse"}  # egress lag
 duckstring_alert_deliveries_total{status="failed"}              # notification health
+duckstring_flock_dispatch_failures_total{pond="priced"}         # Flock degrading to local compute
 ```
+
+A note on that last one: a failed Flock dispatch still completes the run on local compute (by design — the engine is never load-bearing), which means a misconfigured Flock produces correct results while silently paying full local compute every run. The failure counter — and the `flock_error` field on `/api/status` — is how you notice.
 
 ## Restart behaviour
 

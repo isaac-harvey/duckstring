@@ -564,7 +564,7 @@ function PondOptionsModal({ pond, canControl, onClose }: { pond: Pond; canContro
           {canControl && cloudEnabled && info?.duck && (
             <Section>
               <Label>Compute</Label>
-              <DuckSection pondId={pond.id} duck={info.duck} />
+              <DuckSection pondId={pond.id} duck={info.duck} flockError={info.flockError} />
             </Section>
           )}
           {/* Egress Spouts — a Draw can't be a source. */}

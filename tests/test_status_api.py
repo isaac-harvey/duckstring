@@ -193,6 +193,54 @@ def test_clear_failed_pond_is_not_refailed_by_liveness(tmp_path):
     assert d.state.pond_states["src@1"].start_f == d.state.pond_states["src@1"].end_f  # idle, not in-flight
 
 
+def test_silent_duck_clears_launcher_record_and_carries_diagnosis(tmp_path):
+    """The gate-run wedge: a remote Duck that launched but never dialled back must (a) be torn down so
+    the backend's ensure() re-spawns on the next attempt — a stale task record made every retry a silent
+    no-op — and (b) carry the provider's diagnosis (e.g. ECS stoppedReason) in the failure message."""
+    from datetime import timedelta
+
+    from duckstring.catchment.driver import _now
+
+    terminated = []
+
+    class _SilentLauncher(NoopLauncher):
+        manages_processes = True
+
+        def is_running(self, pond_name: str) -> bool:
+            return True  # a live task record — the wedge precondition
+
+        def diagnose(self, pond_name: str) -> str:
+            return "fargate: task STOPPED; TaskFailedToStart; boom"
+
+        def terminate(self, pond_name: str, wait: bool = False) -> None:
+            terminated.append(pond_name)
+
+    d = _inlet_driver(tmp_path, "silent.db", _SilentLauncher())
+    d.pulse("src@1")  # a Run in flight
+    d.last_seen["src@1"] = _now() - timedelta(seconds=120)  # contact aged past the heartbeat
+    d._check_liveness(_now())
+    assert d.state.pond_states["src@1"].is_failed
+    assert "src@1" in terminated, "the silent Duck's record must be cleared so a retry re-spawns"
+    (error,) = d.db.execute("SELECT error FROM pond_run WHERE status = 'failed'").fetchone()
+    assert "Lost contact" in error and "TaskFailedToStart" in error  # the provider's reason travels
+
+
+def test_dead_duck_clears_launcher_record(tmp_path):
+    from duckstring.catchment.driver import _now
+
+    terminated = []
+
+    class _DeadRecordingLauncher(_DeadLauncher):
+        def terminate(self, pond_name: str, wait: bool = False) -> None:
+            terminated.append(pond_name)
+
+    d = _inlet_driver(tmp_path, "deadrec.db", _DeadRecordingLauncher())
+    d.pulse("src@1")
+    d._check_liveness(_now())
+    assert d.state.pond_states["src@1"].is_failed
+    assert "src@1" in terminated
+
+
 def test_kill_terminates_duck_and_parks(tmp_path):
     terminated = []
 

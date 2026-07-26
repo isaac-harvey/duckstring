@@ -230,7 +230,7 @@ All full-gated. A notification **channel** delivers failures and staleness to an
 GET /metrics
 ```
 
-A Prometheus text-exposition endpoint at the **root** (not under `/api`) and **unauthenticated** — the exporter convention; a scraper sends no key. Pond names appear as labels, so network-restrict it if those are sensitive. Families (`duckstring_*`): `up`; `pond_freshness_lag_seconds` (the headline — seconds since a Pond last became fresh); `pond_failed`/`blocked`/`killed`; `pond_runs_completed_total`; `pond_failures_total`; `spout_delivery_lag_seconds`; `spout_failed`; `alert_deliveries_total{status}`.
+A Prometheus text-exposition endpoint at the **root** (not under `/api`) and **unauthenticated** — the exporter convention; a scraper sends no key. Pond names appear as labels, so network-restrict it if those are sensitive. Families (`duckstring_*`): `up`; `pond_freshness_lag_seconds` (the headline — seconds since a Pond last became fresh); `pond_failed`/`blocked`/`killed`; `pond_runs_completed_total`; `pond_failures_total`; `pond_run_seconds_total`; `pond_duck_target`; `pond_flock`; `flock_dispatched_total`/`flock_dispatch_failures_total` (a failed Flock dispatch still completes the run on local compute, so the failure counter is the only tell that the Flock is degrading); `spout_delivery_lag_seconds`; `spout_failed`; `alert_deliveries_total{status}`.
 
 ## Data
 

@@ -129,3 +129,23 @@ def test_cost_families_target_flock_runtime(tmp_path):
     assert samples['duckstring_pond_duck_target{pond="sales",major="1",target="heavy"}'] == 1
     assert samples['duckstring_pond_flock{pond="sales",major="1",mode="upgrade",engine="athena"}'] == 1
     assert samples['duckstring_pond_run_seconds_total{pond="sales",major="1"}'] == pytest.approx(12, abs=0.1)
+
+
+def test_flock_dispatch_counters_ride_run_completed(tmp_path):
+    """A failed Flock dispatch still completes the run locally — the counters (shipped by the Duck on
+    run_completed) are the only tell it is degrading. They surface on /metrics and as the pond's
+    flock_error on /api/status; absent entirely until a Duck ever reports them."""
+    d = _driver(tmp_path)
+    key = pond_key("sales", 1)
+    text = render_metrics(d.metrics_snapshot())
+    assert "flock_dispatched_total{" not in text  # nothing reported yet → no samples
+    d.pulse(key)
+    f = d.state.pond_states[key].start_f.isoformat()
+    d.on_event(key, {"kind": "ripple", "ripple": "agg", "f": f, "status": "success"})
+    d.on_event(key, {"kind": "run_completed", "f": f, "status": "success",
+                     "flock": {"dispatched": 3, "failed": 2, "last_error": "AccessDenied: nope"}})
+    samples = _parse(render_metrics(d.metrics_snapshot()))
+    assert samples['duckstring_flock_dispatched_total{pond="sales",major="1"}'] == 3
+    assert samples['duckstring_flock_dispatch_failures_total{pond="sales",major="1"}'] == 2
+    pond = next(p for p in d.status()["ponds"] if p["id"] == key)
+    assert pond["flock_error"] == "AccessDenied: nope"
