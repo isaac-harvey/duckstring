@@ -11,6 +11,17 @@ lives in the shared object store (``--data-root`` = the S3 URI); only hot state 
 **IAM:** the instance gets an **instance profile** (worker-side role) for S3/engine access — the
 Catchment's own AWS creds (control plane) launch/terminate here, but are never copied onto the box.
 
+**Placement:** ``DUCKSTRING_EC2_SUBNET`` / ``DUCKSTRING_EC2_SECURITY_GROUPS`` (or a pool's
+``deploy_config``) put the instance where it can actually reach the Catchment. Omitting them is a
+trap worth naming: AWS drops the instance into the default VPC's **default security group**, so the
+Duck boots, installs, and is then failed by the silent-Duck heartbeat — a networking problem that
+presents as a mysteriously dead worker. The launcher warns once when no group is configured.
+
+**AMI:** the userdata runs ``pip3 install <pip_spec>`` then ``python3 -m duckstring.duck``, so the image's
+*default* ``python3`` must be ≥3.10 (duckstring's floor) with a matching ``pip3`` — a stock AL2023 image
+ships 3.9 and will not boot a Duck. Either bake an image that carries duckstring, or point the AMI at one
+whose default interpreter is new enough.
+
 **Scope (v1):** one instance per Pond spawn, honouring the pool's ``instance_type``/``region``. Warm-pool
 reuse + the floor/ceiling/idle/keep-warm autoscaler are a deferred follow-up (the pool *config* exists;
 the scheduler that pools instances across Ponds does not yet). Liveness leans on the Duck heartbeat: we
@@ -34,8 +45,14 @@ log = logging.getLogger("duckstring.ec2")
 _REMOTE_ROOT = "/var/lib/duckstring"  # the Duck's local hot-state root on the EC2 box
 _EC2_NO_AMI = (
     "EC2 cannot launch — no AMI configured (DUCKSTRING_EC2_AMI). An EC2 pool needs the Duck AMI + IAM set "
-    "as Catchment env: DUCKSTRING_EC2_AMI, DUCKSTRING_EC2_INSTANCE_PROFILE. Without them, set the Pond's "
+    "as Catchment env: DUCKSTRING_EC2_AMI, DUCKSTRING_EC2_INSTANCE_PROFILE, plus DUCKSTRING_EC2_SUBNET and "
+    "DUCKSTRING_EC2_SECURITY_GROUPS so the Duck can reach the Catchment. Without them, set the Pond's "
     "compute to the Catchment (local) target.")
+
+
+def _csv(value: str | None) -> list[str]:
+    """A comma-separated config value → a list (blank entries dropped)."""
+    return [v.strip() for v in value.split(",") if v.strip()] if value else []
 
 
 def _userdata(*, pond: str, major: int, version: str, source_path: str, catchment_url: str,
@@ -62,7 +79,8 @@ class Ec2Launcher:
 
     def __init__(self, root: Path, base_url: str | None, token: str = "", data_root: str | None = None,
                  *, ami: str | None = None, instance_profile: str | None = None,
-                 dialback=None, pip_spec: str | None = None,
+                 dialback=None, pip_spec: str | None = None, subnet: str | None = None,
+                 security_groups: str | None = None, assign_public_ip: str | None = None,
                  region: str | None = None, ec2_client=None):
         from .dialback import RemoteDialback
 
@@ -78,6 +96,13 @@ class Ec2Launcher:
         self.ami = ami or os.environ.get("DUCKSTRING_EC2_AMI")
         self.instance_profile = instance_profile or os.environ.get("DUCKSTRING_EC2_INSTANCE_PROFILE")
         self.pip_spec = pip_spec if pip_spec is not None else os.environ.get("DUCKSTRING_EC2_PIP_SPEC")
+        # Placement. Without these an instance lands in the default VPC's default subnet + DEFAULT
+        # security group, which in any sensibly-configured account cannot reach the Catchment's port —
+        # the Duck boots, installs, and is then failed by the silent-Duck heartbeat with no clue why.
+        self.subnet = subnet or os.environ.get("DUCKSTRING_EC2_SUBNET")
+        self.security_groups = _csv(security_groups or os.environ.get("DUCKSTRING_EC2_SECURITY_GROUPS"))
+        self.assign_public_ip = assign_public_ip or os.environ.get("DUCKSTRING_EC2_ASSIGN_PUBLIC_IP")
+        self._warned_no_sg = False
         self.region = region
         self._client = ec2_client
         self._instances: dict[str, dict] = {}   # pond_key → {"instance_id", "pool"}
@@ -164,6 +189,7 @@ class Ec2Launcher:
         }
         if instance_profile:  # worker-side IAM (never the Catchment's keys on the box)
             kwargs["IamInstanceProfile"] = {"Name": instance_profile}
+        kwargs.update(self._placement(dc))
         if region and self.region is None:
             self.region = region
         try:
@@ -176,6 +202,40 @@ class Ec2Launcher:
         self._launch_errors.pop(pond_key, None)  # launched cleanly
         self._instances[pond_key] = {"instance_id": instance_id, "pool": target}
         log.info("ec2: launched %s for %s (%s)", instance_id, pond_key, instance_type)
+
+    def _placement(self, dc: dict) -> dict:
+        """The network placement for a launch: subnet + security groups (per-spawn deploy_config over the
+        launcher's env defaults), and a public IP when asked for.
+
+        Given both, they go in a NetworkInterface spec — the only form ``RunInstances`` accepts when a
+        public-IP override is set, and harmless otherwise. Given neither, the instance falls into the
+        default VPC's default security group, which normally cannot reach the Catchment: warn once, since
+        the symptom (a Duck that boots and is then failed as silent) points nowhere near the cause."""
+        subnet = dc.get("subnet") or self.subnet
+        groups = _csv(dc.get("security_groups")) or self.security_groups
+        public = str(dc.get("assign_public_ip") or self.assign_public_ip or "").upper()
+        if not groups and not self._warned_no_sg:
+            self._warned_no_sg = True
+            log.warning(
+                "ec2: launching Ducks with no security group (DUCKSTRING_EC2_SECURITY_GROUPS / the pool's "
+                "deploy_config) — the instance gets the VPC's DEFAULT security group, which usually cannot "
+                "reach the Catchment. Ducks will boot and then fail as silent.")
+        if not subnet and not groups and not public:
+            return {}
+        if public in ("ENABLED", "DISABLED", "TRUE", "FALSE"):
+            nic: dict = {"DeviceIndex": 0,
+                         "AssociatePublicIpAddress": public in ("ENABLED", "TRUE")}
+            if subnet:
+                nic["SubnetId"] = subnet
+            if groups:
+                nic["Groups"] = groups
+            return {"NetworkInterfaces": [nic]}
+        out: dict = {}
+        if subnet:
+            out["SubnetId"] = subnet
+        if groups:
+            out["SecurityGroupIds"] = groups
+        return out
 
     def start_pool_instance(self, pool: str, pool_spec: dict, module_cmd: str) -> str:
         """Launch ONE instance running an arbitrary ``python3 -m <module> <args>`` command — the Pool
@@ -207,6 +267,7 @@ class Ec2Launcher:
         instance_profile = dc.get("instance_profile") or self.instance_profile
         if instance_profile:
             kwargs["IamInstanceProfile"] = {"Name": instance_profile}
+        kwargs.update(self._placement(dc))  # a Pool agent dials back too — same placement rules
         region = spec.get("region") or dc.get("region")
         if region and self.region is None:
             self.region = region

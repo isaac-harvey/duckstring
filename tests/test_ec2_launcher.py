@@ -14,6 +14,16 @@ from duckstring.catchment.launcher import DispatchingLauncher
 pytestmark = pytest.mark.timeout(5)
 
 
+@pytest.fixture(autouse=True)
+def _clean_ec2_env(monkeypatch):
+    """The launcher reads its defaults from the environment — clear them so a developer's shell can't
+    change what these tests assert."""
+    for k in ("DUCKSTRING_EC2_AMI", "DUCKSTRING_EC2_INSTANCE_PROFILE", "DUCKSTRING_EC2_PIP_SPEC",
+              "DUCKSTRING_EC2_SUBNET", "DUCKSTRING_EC2_SECURITY_GROUPS",
+              "DUCKSTRING_EC2_ASSIGN_PUBLIC_IP", "DUCKSTRING_EC2_INSTANCE_TYPE"):
+        monkeypatch.delenv(k, raising=False)
+
+
 class RecordingBackend:
     """A launcher backend that records calls — the dispatcher's routing target in tests."""
 
@@ -109,6 +119,77 @@ class FakeEc2:
 def _launcher(tmp_path, client, **kw):
     return Ec2Launcher(tmp_path, "http://cat:7474", token="tok", data_root="s3://bucket/data",
                        ami="ami-123", ec2_client=client, **kw)
+
+
+# ─── placement: the subnet + security groups a Duck needs to reach the Catchment ────
+
+
+def test_placement_from_env_rides_the_launch(tmp_path, monkeypatch):
+    """Without these, AWS puts the instance in the default VPC's DEFAULT security group, which normally
+    cannot reach the Catchment — the Duck boots and is then failed as silent, pointing nowhere near the
+    real cause. Found on the live gate box, where an EC2 pool could not have worked at all."""
+    monkeypatch.setenv("DUCKSTRING_EC2_SUBNET", "subnet-abc")
+    monkeypatch.setenv("DUCKSTRING_EC2_SECURITY_GROUPS", "sg-1, sg-2")
+    ec2 = FakeEc2()
+    lch = _launcher(tmp_path, ec2, instance_profile="ds-worker")
+    lch.ensure("a@1", "1", "ponds/a/1", duck=_duck("heavy"))
+    _iid, kw = ec2.launched[0]
+    assert kw["SubnetId"] == "subnet-abc"
+    assert kw["SecurityGroupIds"] == ["sg-1", "sg-2"]
+    assert "NetworkInterfaces" not in kw  # the flat form while no public-IP override is asked for
+
+
+def test_pool_deploy_config_overrides_env_placement(tmp_path, monkeypatch):
+    monkeypatch.setenv("DUCKSTRING_EC2_SUBNET", "subnet-env")
+    monkeypatch.setenv("DUCKSTRING_EC2_SECURITY_GROUPS", "sg-env")
+    ec2 = FakeEc2()
+    lch = _launcher(tmp_path, ec2, instance_profile="ds-worker")
+    pool = {"instance_type": "m6i.large", "provider": "ec2",
+            "deploy_config": {"subnet": "subnet-pool", "security_groups": "sg-pool"}}
+    lch.ensure("a@1", "1", "ponds/a/1", duck=_duck("heavy", pool=pool))
+    _iid, kw = ec2.launched[0]
+    assert kw["SubnetId"] == "subnet-pool" and kw["SecurityGroupIds"] == ["sg-pool"]
+
+
+def test_public_ip_override_uses_the_network_interface_form(tmp_path, monkeypatch):
+    """RunInstances only accepts a public-IP override inside a NetworkInterface spec, and then the subnet
+    and groups must move in there too (mixing the flat form with it is an API error)."""
+    monkeypatch.setenv("DUCKSTRING_EC2_SUBNET", "subnet-abc")
+    monkeypatch.setenv("DUCKSTRING_EC2_SECURITY_GROUPS", "sg-1")
+    monkeypatch.setenv("DUCKSTRING_EC2_ASSIGN_PUBLIC_IP", "ENABLED")
+    ec2 = FakeEc2()
+    lch = _launcher(tmp_path, ec2, instance_profile="ds-worker")
+    lch.ensure("a@1", "1", "ponds/a/1", duck=_duck("heavy"))
+    _iid, kw = ec2.launched[0]
+    assert kw["NetworkInterfaces"] == [
+        {"DeviceIndex": 0, "AssociatePublicIpAddress": True, "SubnetId": "subnet-abc", "Groups": ["sg-1"]}
+    ]
+    assert "SubnetId" not in kw and "SecurityGroupIds" not in kw
+
+
+def test_no_placement_config_still_launches_and_warns(tmp_path, caplog):
+    """Back-compat: an account whose default SG happens to allow the Catchment port keeps working — but
+    the silence is what cost an afternoon, so it warns."""
+    ec2 = FakeEc2()
+    lch = _launcher(tmp_path, ec2, instance_profile="ds-worker")
+    with caplog.at_level("WARNING", logger="duckstring.ec2"):
+        lch.ensure("a@1", "1", "ponds/a/1", duck=_duck("heavy"))
+        lch.ensure("b@1", "1", "ponds/b/1", duck=_duck("heavy"))
+        warned = sum("no security group" in r.getMessage() for r in caplog.records)
+    _iid, kw = ec2.launched[0]
+    assert "SubnetId" not in kw and "SecurityGroupIds" not in kw and "NetworkInterfaces" not in kw
+    assert warned == 1, "warn once, not once per spawn"
+
+
+def test_pool_agent_launch_gets_the_same_placement(tmp_path, monkeypatch):
+    """The Pool agent dials back exactly like a Duck, so it needs the same network placement."""
+    monkeypatch.setenv("DUCKSTRING_EC2_SUBNET", "subnet-abc")
+    monkeypatch.setenv("DUCKSTRING_EC2_SECURITY_GROUPS", "sg-1")
+    ec2 = FakeEc2()
+    lch = _launcher(tmp_path, ec2, instance_profile="ds-worker")
+    lch.start_pool_instance("devpool", {"instance_type": "m6i.large"}, "duckstring.duck.pool_agent --x 1")
+    _iid, kw = ec2.launched[0]
+    assert kw["SubnetId"] == "subnet-abc" and kw["SecurityGroupIds"] == ["sg-1"]
 
 
 def test_pool_deploy_config_supplies_ami_and_profile(tmp_path):

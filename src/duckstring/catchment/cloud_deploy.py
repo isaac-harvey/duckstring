@@ -15,7 +15,7 @@ FARGATE_FIELDS = (
     "image", "task_definition", "cluster", "subnets", "security_groups",
     "execution_role", "task_role", "assign_public_ip", "cpu_arch",
 )
-EC2_FIELDS = ("ami", "instance_profile", "pip_spec")
+EC2_FIELDS = ("ami", "instance_profile", "pip_spec", "subnet", "security_groups", "assign_public_ip")
 
 # What each Fargate/EC2 launcher reads from the environment (field → env var). The effective config
 # coalesces the UI blob over these, so a Catchment configured purely by env stays valid with an empty blob.
@@ -28,7 +28,9 @@ _FARGATE_ENV = {
 }
 _EC2_ENV = {
     "ami": "DUCKSTRING_EC2_AMI", "instance_profile": "DUCKSTRING_EC2_INSTANCE_PROFILE",
-    "pip_spec": "DUCKSTRING_EC2_PIP_SPEC",
+    "pip_spec": "DUCKSTRING_EC2_PIP_SPEC", "subnet": "DUCKSTRING_EC2_SUBNET",
+    "security_groups": "DUCKSTRING_EC2_SECURITY_GROUPS",
+    "assign_public_ip": "DUCKSTRING_EC2_ASSIGN_PUBLIC_IP",
 }
 
 # Fields required for a launch (a missing one → the Duck can't start). cluster defaults to "default";
