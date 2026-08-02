@@ -242,8 +242,9 @@ class Driver:
         self.meta: dict[str, dict] = {}  # key -> {name, major, version_id, version, source_path, ...}
         self.jobs: dict[str, list[dict]] = {}  # key -> queued Duck commands
         self.last_seen: dict[str, datetime] = {}  # key -> last Duck contact (jobs poll / event)
-        # key -> the Duck's Flock dispatch counters ({dispatched, failed, last_error}), from run_completed.
-        # Observability only (in-memory; a restart just waits for the next run's report).
+        # key -> cumulative Flock dispatch counters ({dispatched, failed, last_error}), accumulated from
+        # the per-Ripple-Run deltas Ducks report (see _record_flock). Observability only (in-memory; a
+        # restart just waits for the next report).
         self.flock_status: dict[str, dict] = {}
         self.persisted: dict[str, str] = {}  # key -> persisted_f ISO (the durable-mirror watermark)
         # Status-poll caches for the published-surface flags, keyed on data_version — see _exported_tables.
@@ -2288,6 +2289,8 @@ class Driver:
                     )
                     if payload.get("lineage"):
                         self._record_lineage(pond, rname, f, payload.get("retry", 0), payload["lineage"])
+                    if payload.get("flock"):
+                        self._record_flock(pond, payload["flock"])
                     self._process(now)
             elif kind == "failed":
                 # The Pond Run gave up at this Ripple's freshness: fail the Pond (and block downstream).
@@ -2335,8 +2338,6 @@ class Driver:
             elif kind == "run_completed":
                 self.state = clear_missing_asset(self.state, pond)  # a clean read → the wait (if any) is over
                 self.data_version += 1  # the Pond published new output → the serving surface changed
-                if payload.get("flock"):  # the Duck's Flock dispatch counters — see metrics_snapshot/status
-                    self.flock_status[pond] = payload["flock"]
                 self._finish_pond_run(pond, f, now, changed=payload.get("changed", True))
                 # Freeze the published output schema as the version's contract (the substrate the
                 # additive gate and min_version enforcement build on).
@@ -3283,6 +3284,19 @@ class Driver:
                     (vid, table, column, type_),
                 )
         self.db.commit()
+
+    def _record_flock(self, pond: str, delta: dict) -> None:
+        """Accumulate a Duck's Flock dispatch delta (shipped per Ripple Run). Cumulative counters live
+        here rather than in the Duck because a Duck is per-run and can be restarted mid-run; the Duck
+        only ever reports what it just did. Observability only — a bad payload must never touch a Run,
+        hence the defensive coercion."""
+        cur = self.flock_status.setdefault(pond, {"dispatched": 0, "failed": 0, "last_error": None})
+        try:
+            cur["dispatched"] += int(delta.get("dispatched") or 0)
+            cur["failed"] += int(delta.get("failed") or 0)
+            cur["last_error"] = delta.get("last_error")  # None after a clean dispatch → the warning clears
+        except (TypeError, ValueError):
+            pass  # a malformed report is dropped, never raised into a Pond Run
 
     def _fail_whole_pond(
         self, pond: str, now: datetime, error: str | None = None, tb: str | None = None,

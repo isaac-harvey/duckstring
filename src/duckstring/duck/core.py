@@ -45,10 +45,11 @@ class Event:
     lineage: dict | None = None  # the Ripple's observed reads/writes ({"reads": [[source|None, table]…],
                                  # "writes": [name…]}) — persisted per attempt at the Catchment
                                  # (plans/lineage.md Phase 1).
-    flock: dict | None = None  # this Duck's Flock dispatch counters ({dispatched, failed, last_error}),
-                               # shipped on run_completed so a degrading Flock is visible Catchment-side
-                               # (/metrics + /api/status) — a failed dispatch still runs local, so it is
-                               # otherwise indistinguishable from a working one. Observability only.
+    flock: dict | None = None  # Flock dispatches during THIS Ripple Run ({dispatched, failed, last_error}
+                               # — a delta, see flock.take_stats), accumulated Catchment-side so a
+                               # degrading Flock is visible (/metrics + /api/status): a failed dispatch
+                               # still runs local, so it is otherwise indistinguishable from a working
+                               # one. Observability only — never engine state.
 
     def payload(self) -> dict:
         d = {"kind": self.kind, "f": self.f.isoformat(), "status": self.status, "retry": self.retry,
@@ -141,8 +142,11 @@ class DuckCore:
         end_f = self.state.states[name].start_f
         ledger.record_ripple_complete(self.con, name, end_f)
         self.state, rc = worker.complete_ripple(self.state, name, now)
+        from .. import flock as _flock  # the Flock dispatch delta for THIS Ripple Run (None if it never ran)
+
         ripple_event = Event(kind="ripple", ripple=name, f=end_f, retry=self.attempts.pop(name, 0),
-                             started_at=started_at, finished_at=finished_at, lineage=lineage)
+                             started_at=started_at, finished_at=finished_at, lineage=lineage,
+                             flock=_flock.take_stats())
         self.events.append(ripple_event)
         if rc is not None:
             # The Run completed at this Ripple — decide whether its output changed and stamp it on this
@@ -165,10 +169,7 @@ class DuckCore:
                     return self._advance(now)
             ledger.record_pond_run_finish(self.con, rc.f, now)
             self._previous_f.pop(rc.f, None)  # the Run is done; drop its carried previous_f
-            from .. import flock as _flock  # dispatch counters — None (field omitted) unless Flock ran
-
-            self.events.append(Event(kind="run_completed", f=rc.f, schema=schema, changed=changed,
-                                     flock=_flock.stats()))
+            self.events.append(Event(kind="run_completed", f=rc.f, schema=schema, changed=changed))
         return self._advance(now)
 
     def ripple_failed(

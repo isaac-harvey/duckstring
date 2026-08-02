@@ -82,7 +82,49 @@ def _reset_flock_stats():
 
 
 def test_stats_start_empty_and_omitted():
-    assert flock.stats() is None  # no field ships on run_completed until Flock actually ran
+    assert flock.stats() is None  # no field ships on the ripple event until Flock actually ran
+    assert flock.take_stats() is None
+
+
+def test_take_stats_is_a_delta_that_resets():
+    """The Duck reports per Ripple Run and the Catchment accumulates — so each report must cover only
+    what happened since the last one. A snapshot here would double-count across a Pond's Ripples and be
+    lost entirely when a Duck is replaced mid-run."""
+    good = FakeEngine(result_fn=lambda b: object())
+    flock._dispatch(good, None, None)
+    assert flock.take_stats() == {"dispatched": 1, "failed": 0, "last_error": None}
+    assert flock.take_stats() is None  # drained
+    flock._dispatch(good, None, None)
+    assert flock.take_stats()["dispatched"] == 1  # the next window counts from zero
+
+
+def test_a_raising_engine_degrades_instead_of_failing_the_run():
+    """The fallback contract must not depend on every engine remembering to catch: an engine that raises
+    is counted as a failed dispatch and returns None (→ local compute), never propagating."""
+    class Boom:
+        last_error = None
+
+        def dispatch(self, builder, out_pk):
+            raise RuntimeError("engine exploded")
+
+    assert flock._dispatch(Boom(), None, None) is None
+    s = flock.take_stats()
+    assert s["failed"] == 1 and "engine exploded" in s["last_error"]
+
+
+# ─── the engine seam ─────────────────────────────────────────────────────────────
+
+
+def test_engine_seam_loads_a_module_class_spec():
+    engine = flock.get_engine({"DUCKSTRING_FLOCK_ENGINE": "flock_fake_engine:FakeFlockEngine"})
+    assert engine is not None and engine.__class__.__name__ == "FakeFlockEngine"
+
+
+def test_unloadable_engine_spec_degrades_rather_than_raises():
+    """Unlike the launcher seam (which fails loud), a broken Flock spec turns the Flock off: the Flock is
+    never load-bearing, so a typo must not take the pipeline down with it."""
+    assert flock.get_engine({"DUCKSTRING_FLOCK_ENGINE": "no_such_module:Nope"}) is None
+    assert flock.get_engine({"DUCKSTRING_FLOCK_ENGINE": "flock_fake_engine:Missing"}) is None
 
 
 def test_stats_count_dispatches_and_failures():

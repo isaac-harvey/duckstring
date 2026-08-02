@@ -150,6 +150,58 @@ def test_pulse_runs_chain_end_to_end(runtime):
     assert reports["end_f"] is not None and sales["end_f"] is not None
 
 
+def _use_fake_flock(monkeypatch, **extra):
+    """Point Ducks at the fake Flock engine (tests/flock_fake_engine.py). Ducks are spawned per run and
+    inherit the current environment, so setting this before the run is enough; PYTHONPATH carries tests/
+    into the subprocess so the module is importable there."""
+    monkeypatch.setenv("DUCKSTRING_FLOCK_ENGINE", "flock_fake_engine:FakeFlockEngine")
+    monkeypatch.setenv("PYTHONPATH", str(Path(__file__).parent))
+    for k, v in extra.items():
+        monkeypatch.setenv(k, v)
+
+
+def _metric(metrics: str, prefix: str) -> float | None:
+    for line in metrics.splitlines():
+        if line.startswith(prefix):
+            return float(line.rsplit(" ", 1)[1])
+    return None
+
+
+@pytest.mark.parametrize("failing", ["none", "returns-none", "raises"])
+def test_flock_dispatch_is_reported_not_silent(runtime, monkeypatch, failing):
+    """The Flock's reporting surface, through real Duck subprocesses — the path that only a live cloud
+    box could exercise before the engine seam opened.
+
+    All three outcomes are indistinguishable without a report: a dispatch that SUCCEEDS should show as
+    work that ran remotely; one that FAILS — whether the engine returns None per the protocol or breaks
+    its contract and raises — still completes the run on local compute while quietly paying full local
+    cost. The Duck ships the delta on each ripple event; the Catchment accumulates it onto /metrics and
+    (for a failure) the pond's flock_error."""
+    url, _root = runtime
+    modes = {"returns-none": {"FAKE_FLOCK_FAIL": "1"}, "raises": {"FAKE_FLOCK_RAISE": "1"}}
+    _use_fake_flock(monkeypatch, **modes.get(failing, {}))
+
+    _deploy(url, _TRICKLE_PONDS)
+    # `always` dispatches every eligible terminal; priced is the builder Pond.
+    assert httpx.post(f"{url}/api/ponds/priced/duck", json={"flock_mode": "always"},
+                      timeout=10.0).status_code == 200
+
+    httpx.post(f"{url}/api/ponds/revenue/pulse", timeout=5.0)
+    assert _wait(lambda: (_pond_status(url, "priced") or {}).get("end_f") is not None, timeout=90.0), \
+        "priced never became fresh — a Flock dispatch (even a failing one) must still complete the run"
+
+    priced = _pond_status(url, "priced")
+    metrics = httpx.get(f"{url}/metrics", timeout=5.0).text
+    ok = _metric(metrics, 'duckstring_flock_dispatched_total{pond="priced",major="1"}')
+    bad = _metric(metrics, 'duckstring_flock_dispatch_failures_total{pond="priced",major="1"}')
+    if failing == "none":
+        assert ok and ok >= 1, f"a successful dispatch must be counted; got:\n{metrics}"
+        assert priced["flock_error"] is None
+    else:
+        assert bad and bad >= 1, f"the degrade must be counted; got:\n{metrics}"
+        assert priced["flock_error"], "a failed dispatch must surface as flock_error, not silence"
+
+
 def test_trickle_chain_runs_end_to_end(runtime):
     """The incremental-Trickle demo on real Duck subprocesses: a pulse on the revenue Outlet cascades
     up through the builder Pond to the append + merge inlets, every Pond runs, and the published layout

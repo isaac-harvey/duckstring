@@ -63,25 +63,49 @@ _stats = {"dispatched": 0, "failed": 0, "last_error": None}
 
 
 def stats() -> dict | None:
-    """A snapshot of this Duck's Flock dispatch counters — ``None`` while nothing was ever attempted
-    (the common no-Flock case ships no field at all)."""
+    """A peek at this Duck's dispatch counters — ``None`` while nothing was ever attempted."""
     if not _stats["dispatched"] and not _stats["failed"]:
         return None
     return dict(_stats)
 
 
-def _record_dispatch(engine, result) -> None:
+def take_stats() -> dict | None:
+    """The dispatches since the last call, **and reset** — the per-Ripple-Run delta the Duck ships on its
+    ripple event, which the Catchment accumulates.
+
+    A delta rather than a process-lifetime snapshot, and carried by the *ripple* event rather than run
+    completion, because neither the process nor the run is a reliable carrier: a Duck killed mid-run
+    (OOM, a reaped box) is respawned and resumes from its ledger, so the process that dispatched is often
+    NOT the one that completes the Pond Run — a snapshot read at completion would silently be zero."""
+    if not _stats["dispatched"] and not _stats["failed"]:
+        return None
+    out = dict(_stats)
+    _stats.update({"dispatched": 0, "failed": 0, "last_error": None})
+    return out
+
+
+def _record_dispatch(engine, result, error: str | None = None) -> None:
     if result is None:
         _stats["failed"] += 1
-        _stats["last_error"] = getattr(engine, "last_error", None) or "dispatch failed (see the Duck log)"
+        _stats["last_error"] = (error or getattr(engine, "last_error", None)
+                                or "dispatch failed (see the Duck log)")
     else:
         _stats["dispatched"] += 1
         _stats["last_error"] = None
 
 
 def _dispatch(engine, builder, out_pk):
-    result = engine.dispatch(builder, out_pk)
-    _record_dispatch(engine, result)
+    """Dispatch + record. The engine protocol says ``dispatch`` returns ``None`` on an engine-side
+    failure, but the fallback contract (the Flock is NEVER load-bearing) must not depend on every engine
+    remembering to catch — an engine that raises would fail the Pond Run instead of degrading. So the
+    catch-all lives here too."""
+    try:
+        result = engine.dispatch(builder, out_pk)
+        error = None
+    except Exception as exc:  # noqa: BLE001 — the fallback contract: degrade to local, never fail the run
+        log.warning("flock: engine raised (%s: %s) — running local", type(exc).__name__, str(exc)[:300])
+        result, error = None, f"{type(exc).__name__}: {str(exc)[:300]}"
+    _record_dispatch(engine, result, error)
     return result
 
 
@@ -97,10 +121,26 @@ class FlockEngine(Protocol):
 
 
 def get_engine(env=None) -> FlockEngine | None:
-    """The configured engine, or ``None`` when the Flock is off (no engine / not enabled)."""
+    """The configured engine, or ``None`` when the Flock is off (no engine / not enabled).
+
+    ``DUCKSTRING_FLOCK_ENGINE`` is either a built-in name (``athena``) or a ``module:Class`` spec — the
+    open engine seam, mirroring ``DUCKSTRING_DUCK_LAUNCHER``. The class is constructed with the env
+    mapping and must satisfy :class:`FlockEngine`. Unlike the launcher seam this **degrades rather than
+    raises**: the Flock is never load-bearing (a missing engine just means local compute), so an
+    unimportable spec warns and turns the Flock off instead of failing the Pond."""
     e = env if env is not None else os.environ
-    name = (e.get("DUCKSTRING_FLOCK_ENGINE") or "athena").lower()
-    if name == "athena":
+    name = (e.get("DUCKSTRING_FLOCK_ENGINE") or "athena").strip()
+    if ":" in name:
+        import importlib
+
+        module_name, _, class_name = name.partition(":")
+        try:
+            engine = getattr(importlib.import_module(module_name), class_name)(e)
+        except Exception as exc:  # noqa: BLE001 — a bad spec must not fail a Pond Run
+            log.warning("flock: cannot load DUCKSTRING_FLOCK_ENGINE=%r (%s) — off", name, exc)
+            return None
+        return engine if engine.enabled() else None
+    if name.lower() == "athena":
         from .engines.athena import AthenaEngine
 
         engine = AthenaEngine(e)

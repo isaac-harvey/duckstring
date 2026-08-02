@@ -15,7 +15,7 @@ Metric families (all `duckstring_*`):
   pond_run_seconds_total        — cumulative Duck execution seconds (summed Ripple-Run spans) — cost signal
   pond_duck_target              — 1 for where a Pond's Duck runs (catchment/pool/dedicated)
   pond_flock                    — 1 for a Pond's effective Flock posture (mode + engine)
-  flock_dispatched_total        — Flock dispatches that ran on the engine (per Duck lifetime)
+  flock_dispatched_total        — Flock dispatches that ran on the engine (accumulated from Duck reports)
   flock_dispatch_failures_total — dispatches that failed and DEGRADED TO LOCAL (a broken Flock's tell)
   spout_delivery_lag_seconds    — now − delivered_f, per Spout
   spout_failed                  — 0/1 per Spout
