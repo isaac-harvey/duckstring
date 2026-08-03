@@ -55,6 +55,13 @@ def _csv(value: str | None) -> list[str]:
     return [v.strip() for v in value.split(",") if v.strip()] if value else []
 
 
+# Mirror the boot script's output to the serial console, so ``get-console-output`` shows it. This is the
+# ONLY window into a Duck that dies before it ever dials back — and that box has no inbound SSH (by
+# design) and no log agent, so without this the failure is literally unobservable. Learned the hard way:
+# a pool agent that never connected could not be diagnosed at all.
+_CONSOLE_TEE = "exec > >(tee -a /dev/console /var/log/duckstring-boot.log) 2>&1"
+
+
 def _userdata(*, pond: str, major: int, version: str, source_path: str, catchment_url: str,
               token: str, data_root: str | None, pip_spec: str | None) -> str:
     """The cloud-init shell that boots the Duck. It fetches its own source artifact over the duck
@@ -67,7 +74,7 @@ def _userdata(*, pond: str, major: int, version: str, source_path: str, catchmen
         "--root", _REMOTE_ROOT, "--source-path", source_path,
         f"--data-root={data_root or ''}",
     ]
-    lines = ["#!/bin/bash", "set -euo pipefail", f"mkdir -p {_REMOTE_ROOT}"]
+    lines = ["#!/bin/bash", "set -euxo pipefail", _CONSOLE_TEE, f"mkdir -p {_REMOTE_ROOT}"]
     if pip_spec:
         lines.append(f"pip3 install --quiet {shlex.quote(pip_spec)}")
     lines.append("exec " + " ".join(shlex.quote(c) for c in cmd))
@@ -250,7 +257,7 @@ class Ec2Launcher:
         instance_type = (spec.get("instance_type") or dc.get("instance_type")
                          or os.environ.get("DUCKSTRING_EC2_INSTANCE_TYPE") or "m6i.large")
         pip_spec = dc.get("pip_spec") if dc.get("pip_spec") is not None else self.pip_spec
-        lines = ["#!/bin/bash", "set -euo pipefail", f"mkdir -p {_REMOTE_ROOT}"]
+        lines = ["#!/bin/bash", "set -euxo pipefail", _CONSOLE_TEE, f"mkdir -p {_REMOTE_ROOT}"]
         if pip_spec:
             lines.append(f"pip3 install --quiet {shlex.quote(pip_spec)}")
         lines.append(f"exec python3 -m {module_cmd}")
@@ -286,21 +293,44 @@ class Ec2Launcher:
     def diagnose(self, pond_key: str) -> str | None:
         """Ask EC2 what happened to this Duck's instance — the liveness sweep's silent branch, so a box
         that terminated/never booted surfaces its state ("terminated: Server.SpotInstanceTermination")
-        instead of only "lost contact". Best-effort: any DescribeInstances problem → None."""
+        instead of only "lost contact". Best-effort: any DescribeInstances problem → None.
+
+        Includes the tail of the **serial console**, which the boot script tees to. A Duck that dies
+        before dialling back leaves no other trace: the box has no inbound SSH and no log agent, so the
+        console is the difference between "lost contact" and the actual Python traceback."""
+        rec = self._instances.get(pond_key)
+        if rec is None:
+            return None
+        parts = []
+        try:
+            resp = self._ec2().describe_instances(InstanceIds=[rec["instance_id"]])
+            inst = resp["Reservations"][0]["Instances"][0]
+            parts.append(f"instance {inst.get('State', {}).get('Name', 'unknown')}")
+            reason = inst.get("StateReason", {}).get("Message")
+            if reason:
+                parts.append(str(reason))
+        except Exception:
+            log.debug("ec2: describe_instances failed for %s", pond_key, exc_info=True)
+        console = self.console_tail(pond_key)
+        if console:
+            parts.append(f"console: {console}")
+        return "ec2: " + "; ".join(parts) if parts else None
+
+    def console_tail(self, pond_key: str, lines: int = 12) -> str | None:
+        """The last ``lines`` of the instance's serial console (where the boot script tees its output),
+        with the boot banner filtered out. ``None`` if unavailable — the console can lag a minute or two
+        after boot, and is empty on some instance types."""
         rec = self._instances.get(pond_key)
         if rec is None:
             return None
         try:
-            resp = self._ec2().describe_instances(InstanceIds=[rec["instance_id"]])
-            inst = resp["Reservations"][0]["Instances"][0]
-            parts = [f"instance {inst.get('State', {}).get('Name', 'unknown')}"]
-            reason = inst.get("StateReason", {}).get("Message")
-            if reason:
-                parts.append(str(reason))
-            return "ec2: " + "; ".join(parts)
+            out = self._ec2().get_console_output(InstanceId=rec["instance_id"], Latest=True).get("Output") or ""
         except Exception:
-            log.debug("ec2: describe_instances failed for %s", pond_key, exc_info=True)
+            log.debug("ec2: get_console_output failed for %s", pond_key, exc_info=True)
             return None
+        keep = [ln for ln in out.splitlines()
+                if ln.strip() and not ln.startswith(("ci-info:", "[", "<"))]
+        return " | ".join(keep[-lines:]) or None
 
     def terminate(self, pond_key: str, wait: bool = False) -> None:
         self._pending.pop(pond_key, None)

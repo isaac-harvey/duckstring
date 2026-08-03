@@ -60,6 +60,14 @@ from ..keys import pond_key
 # above the Duck's long-poll timeout so a healthy hold is never mistaken for death.
 _DUCK_DEAD_AFTER = timedelta(seconds=60)
 
+# The window allowed for a Duck's FIRST contact after a spawn, which is a different quantity: a local
+# subprocess is talking in a second, a Fargate task pulls an image, and an EC2 instance boots an OS and
+# may pip-install before it can dial. 60 s is structurally too short for EC2 — a cold pool's first run
+# always failed even when perfectly configured. Applies only until the Duck first speaks; after that the
+# steady-state window above governs.
+_STARTUP_GRACE = {"catchment": timedelta(seconds=60), "fargate": timedelta(minutes=3),
+                  "ec2": timedelta(minutes=8)}
+
 # Keep an idle Duck warm for this long before reaping it. Reaping the instant a Pond goes idle, then
 # respawning on the next run, races: a Pond re-armed in the window between the shutdown being sent and
 # the Duck exiting ends up in-flight with a dying Duck → a spurious "Duck not running" failure. The
@@ -242,6 +250,9 @@ class Driver:
         self.meta: dict[str, dict] = {}  # key -> {name, major, version_id, version, source_path, ...}
         self.jobs: dict[str, list[dict]] = {}  # key -> queued Duck commands
         self.last_seen: dict[str, datetime] = {}  # key -> last Duck contact (jobs poll / event)
+        # Ponds whose Duck was spawned but has never spoken — they get the provider's (longer) startup
+        # grace rather than the steady-state silence window. Cleared on first contact.
+        self._awaiting_first_contact: set[str] = set()
         # key -> cumulative Flock dispatch counters ({dispatched, failed, last_error}), accumulated from
         # the per-Ripple-Run deltas Ducks report (see _record_flock). Observability only (in-memory; a
         # restart just waits for the next report).
@@ -2264,6 +2275,7 @@ class Driver:
         with self.lock:
             now = _now()
             self.last_seen[pond] = now  # any event proves the Duck is alive
+            self._awaiting_first_contact.discard(pond)  # it spoke — steady-state liveness from here
             kind = payload.get("kind")
             f = payload.get("f")
             status = payload.get("status", "success")
@@ -2378,6 +2390,7 @@ class Driver:
     def take_jobs(self, pond: str) -> list[dict]:
         with self.lock:
             self.last_seen[pond] = _now()  # the Duck is alive — it just polled
+            self._awaiting_first_contact.discard(pond)
             jobs = self.jobs.get(pond, [])
             self.jobs[pond] = []
             return jobs
@@ -2848,6 +2861,21 @@ class Driver:
                   f"({size / 1e6:.0f} MB; {'registry+publish' if mirrored else 'registry'}) — "
                   f"rehydrates on next demand", flush=True)
 
+    def _silence_window(self, pond: str) -> timedelta:
+        """How long this Pond's Duck may be silent before it counts as dead. Once it has spoken, the
+        steady-state window; before that, the provider's startup grace — booting an EC2 instance is
+        minutes, and judging it by the steady-state 60 s failed every cold EC2 pool's first run."""
+        if pond not in self._awaiting_first_contact:
+            return _DUCK_DEAD_AFTER
+        provider = "catchment"
+        try:
+            duck = self.duck_config(pond)
+            if duck.get("remote"):
+                provider = (duck.get("pool") or {}).get("provider") or "fargate"
+        except Exception:
+            pass
+        return max(_STARTUP_GRACE.get(provider, _DUCK_DEAD_AFTER), _DUCK_DEAD_AFTER)
+
     def _check_liveness(self, now: datetime) -> None:
         """Fail any Pond whose Duck has died (process gone) or fallen silent (no contact) while a Run
         is in flight, attributing it to that Run (``start_f``). Only for launchers that own real Duck
@@ -2867,7 +2895,7 @@ class Driver:
                 continue
             last = self.last_seen.get(pond)
             dead = not self.launcher.is_running(pond)
-            silent = last is not None and (now - last) > _DUCK_DEAD_AFTER
+            silent = last is not None and (now - last) > self._silence_window(pond)
             if dead:
                 # Prefer the launcher's specific spawn-failure reason (e.g. a remote pool missing its
                 # image/AMI/IAM) over the generic crash message, so the operator sees the real cause.
@@ -2943,6 +2971,7 @@ class Driver:
             return
         self.launcher.ensure(pond, meta["version"], meta["source_path"], duck=self.duck_config(pond))
         self.last_seen[pond] = now  # grace clock: a freshly (re)spawned Duck isn't immediately stale
+        self._awaiting_first_contact.add(pond)  # until it speaks, judge it by the spawn grace (see below)
         self._idle_since.pop(pond, None)  # it's running again — reset its reap grace clock
         # Cancel any not-yet-collected shutdown: this Pond is running again, so the Duck must not exit.
         self.jobs[pond] = [j for j in self.jobs.get(pond, []) if j.get("kind") != "shutdown"]

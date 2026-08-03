@@ -229,9 +229,33 @@ class FargateLauncher:
                     parts.append(f"container exit {c['exitCode']}")
                 if c.get("reason"):
                     parts.append(str(c["reason"]))
+            logs = self.log_tail(pond_key)
+            if logs:
+                parts.append(f"logs: {logs}")
             return "fargate: " + "; ".join(parts) if parts else None
         except Exception:
             log.debug("fargate: describe_tasks failed for %s", pond_key, exc_info=True)
+            return None
+
+    def log_tail(self, pond_key: str, lines: int = 12) -> str | None:
+        """The tail of this Duck's CloudWatch stream. The task definition already routes container output
+        there (awslogs), but nothing ever read it back — so an operator saw "container exit 1" and had to
+        go to the console to learn why. The Duck logs to stderr, so this is its traceback."""
+        task_arn = self._tasks.get(pond_key)
+        if task_arn is None or not self.region:
+            return None
+        try:
+            import boto3
+
+            task_id = task_arn.rsplit("/", 1)[-1]
+            logs = boto3.client("logs", region_name=self.region)
+            events = logs.get_log_events(
+                logGroupName="/duckstring/duck", logStreamName=f"duck/{_CONTAINER}/{task_id}",
+                limit=lines, startFromHead=False,
+            ).get("events") or []
+            return " | ".join(e["message"] for e in events) or None
+        except Exception:
+            log.debug("fargate: log fetch failed for %s", pond_key, exc_info=True)
             return None
 
     def terminate(self, pond_key: str, wait: bool = False) -> None:

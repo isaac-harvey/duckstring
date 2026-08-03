@@ -199,8 +199,6 @@ def test_silent_duck_clears_launcher_record_and_carries_diagnosis(tmp_path):
     no-op — and (b) carry the provider's diagnosis (e.g. ECS stoppedReason) in the failure message."""
     from datetime import timedelta
 
-    from duckstring.catchment.driver import _now
-
     terminated = []
 
     class _SilentLauncher(NoopLauncher):
@@ -215,14 +213,41 @@ def test_silent_duck_clears_launcher_record_and_carries_diagnosis(tmp_path):
         def terminate(self, pond_name: str, wait: bool = False) -> None:
             terminated.append(pond_name)
 
+    from duckstring.catchment.driver import _now
+
     d = _inlet_driver(tmp_path, "silent.db", _SilentLauncher())
     d.pulse("src@1")  # a Run in flight
+    d.take_jobs("src@1")  # it spoke once, so the steady-state silence window applies (not spawn grace)
     d.last_seen["src@1"] = _now() - timedelta(seconds=120)  # contact aged past the heartbeat
     d._check_liveness(_now())
     assert d.state.pond_states["src@1"].is_failed
     assert "src@1" in terminated, "the silent Duck's record must be cleared so a retry re-spawns"
     (error,) = d.db.execute("SELECT error FROM pond_run WHERE status = 'failed'").fetchone()
     assert "Lost contact" in error and "TaskFailedToStart" in error  # the provider's reason travels
+
+
+def test_a_remote_duck_gets_its_providers_startup_grace(tmp_path):
+    """First contact is a different quantity from steady-state silence: a local subprocess talks in a
+    second, an EC2 instance boots an OS first. Judging a cold EC2 spawn by the 60 s silence window failed
+    every first run on a fresh pool, however well configured. The grace applies only until it speaks."""
+    from datetime import timedelta
+
+    d = _inlet_driver(tmp_path, "grace.db", _DeadLauncher())
+    key = "src@1"
+    d._awaiting_first_contact.add(key)
+
+    d.duck_config = lambda _k: {"remote": False, "pool": None}
+    assert d._silence_window(key) == timedelta(seconds=60)
+    d.duck_config = lambda _k: {"remote": True, "pool": {"provider": "fargate"}}
+    assert d._silence_window(key) == timedelta(minutes=3)
+    d.duck_config = lambda _k: {"remote": True, "pool": {"provider": "ec2"}}
+    assert d._silence_window(key) == timedelta(minutes=8)
+
+    # Once the Duck speaks — here by collecting its jobs, the very first thing it does — the
+    # steady-state window governs: a warm EC2 Duck that goes quiet is still caught in 60 s.
+    d.take_jobs(key)
+    assert key not in d._awaiting_first_contact
+    assert d._silence_window(key) == timedelta(seconds=60)
 
 
 def test_dead_duck_clears_launcher_record(tmp_path):

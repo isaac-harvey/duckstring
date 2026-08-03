@@ -181,6 +181,42 @@ def test_no_placement_config_still_launches_and_warns(tmp_path, caplog):
     assert warned == 1, "warn once, not once per spawn"
 
 
+def test_boot_scripts_tee_to_the_serial_console(tmp_path):
+    """A Duck that dies before dialling back has no inbound SSH and no log agent, so the serial console
+    is the only trace it leaves. Both boot paths must mirror their output there, or a failed boot is
+    literally unobservable — which is exactly where the pool-agent investigation stalled."""
+    import base64
+
+    from duckstring.catchment.pool_launcher import Ec2PoolMachine
+
+    ec2 = FakeEc2()
+    lch = _launcher(tmp_path, ec2, instance_profile="ds-worker")
+    lch.ensure("a@1", "1", "ponds/a/1", duck=_duck("heavy"))
+    Ec2PoolMachine("devpool", {"instance_type": "m6i.large"}, lch).start()
+    assert len(ec2.launched) == 2
+    for _iid, kw in ec2.launched:
+        script = base64.b64decode(kw["UserData"]).decode()
+        assert "/dev/console" in script, f"boot output is unobservable:\n{script}"
+        assert "set -euxo pipefail" in script  # -x so the console shows WHICH step failed
+
+
+def test_diagnose_includes_the_console_tail(tmp_path):
+    ec2 = FakeEc2()
+    ec2.describe_instances = lambda **kw: {
+        "Reservations": [{"Instances": [{"State": {"Name": "running"}}]}]}
+    ec2.get_console_output = lambda **kw: {"Output": "\n".join([
+        "ci-info: noise", "[   1.23] kernel noise",
+        "+ pip3 install --quiet duckstring",
+        "ModuleNotFoundError: No module named 'duckstring'",
+    ])}
+    lch = _launcher(tmp_path, ec2, instance_profile="ds-worker")
+    lch.ensure("a@1", "1", "ponds/a/1", duck=_duck("heavy"))
+    diag = lch.diagnose("a@1")
+    assert "instance running" in diag
+    assert "ModuleNotFoundError" in diag       # the actual cause reaches the Pond's failure message
+    assert "ci-info" not in diag and "kernel noise" not in diag  # boot banner filtered out
+
+
 def test_pool_agent_boots_against_the_directory_the_userdata_creates(tmp_path):
     """The agent's --root must be the dir the userdata mkdirs. It was hardcoded to /var/duckstring while
     the userdata created /var/lib/duckstring, so on real EC2 the agent died on boot and every Pond on the
