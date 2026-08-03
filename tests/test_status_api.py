@@ -404,3 +404,82 @@ def test_runs_route_params_and_unknown_pond(tmp_path):
     assert client.get("/api/runs", params={"limit": 100000}).status_code == 200
     snk = _pond(client.get("/api/status").json(), "snk")
     assert snk["ripple_edges"] == [["r1", "r2"]]
+
+
+def _run_rows(d):
+    return [r[0] for r in d.db.execute("SELECT status FROM pond_run ORDER BY f").fetchall()]
+
+
+def test_clear_closes_the_run_it_abandons(tmp_path):
+    """`clear` rolls start_f back to end_f so the halted Run is not re-failed by liveness — which also
+    means liveness can never CLOSE it. Without this the Run sits at 'running' in the history forever,
+    looking like work still in progress."""
+    from duckstring.catchment.driver import _now
+
+    d = _inlet_driver(tmp_path, "clearrun.db", _DeadLauncher())
+    d.pulse("src@1")
+    assert _run_rows(d) == ["running"]
+
+    d.clear("src@1")                # abandons the in-flight Run by design
+    d._check_liveness(_now())       # that Run is not in flight any more → liveness never touches it
+    assert "running" not in _run_rows(d), "clear left an orphaned 'running' row"
+
+
+def test_abandoning_a_run_records_why_and_spares_finished_ones(tmp_path):
+    """The closure carries its reason, and never rewrites a Run the Duck already reported."""
+    from duckstring.catchment.driver import _now
+
+    d = _inlet_driver(tmp_path, "abandon.db", _DeadLauncher())
+    d.pulse("src@1")
+    f = d.state.pond_states["src@1"].start_f.isoformat()
+
+    d._abandon_pond_run("src@1", f, _now())
+    status, err = d.db.execute("SELECT status, error FROM pond_run WHERE f = ?", (f,)).fetchone()
+    assert status == "failed" and "abandoned by an operator clear" in err
+
+    # Re-running it must not touch the now-finished row (nor invent one for an unknown f).
+    d._abandon_pond_run("src@1", f, _now())
+    d._abandon_pond_run("src@1", "2099-01-01T00:00:00+00:00", _now())
+    assert d.db.execute("SELECT count(*) FROM pond_run").fetchone()[0] == 1
+    (err2,) = d.db.execute("SELECT error FROM pond_run WHERE f = ?", (f,)).fetchone()
+    assert err2 == err
+
+
+def test_a_pond_that_moves_on_closes_runs_left_behind(tmp_path):
+    """The general invariant: a Pond not in flight has no 'running' rows. A Run is normally closed only by
+    the Duck reporting IT, so any path where the Pond advances without that report — a vanished Duck, a
+    replaced spawn — strands one. Reconciliation covers the paths not yet enumerated, which matters
+    because the live sighting resisted reproduction."""
+    d = _inlet_driver(tmp_path, "moved.db", _DeadLauncher())
+    d.pulse("src@1")
+    stale_f = d.state.pond_states["src@1"].start_f.isoformat()
+    assert _run_rows(d) == ["running"]
+
+    # A later Run completes without the earlier one ever being reported.
+    later = d.state.pond_states["src@1"].start_f + timedelta(seconds=30)
+    d._dispatch_begin_run("src@1", later, later)
+    d.on_event("src@1", {"kind": "ripple", "ripple": "r1", "f": later.isoformat(), "status": "success"})
+    d.on_event("src@1", {"kind": "run_completed", "f": later.isoformat()})
+
+    rows = dict(d.db.execute("SELECT f, status FROM pond_run").fetchall())
+    assert rows[later.isoformat()] == "success"
+    assert rows[stale_f] == "failed", f"the abandoned earlier Run was left behind: {rows}"
+
+
+def test_closing_abandoned_runs_never_rewrites_a_reported_outcome(tmp_path):
+    """A Run the Duck already reported keeps its own outcome — reconciliation only touches rows still
+    sitting at 'running'."""
+    d = _inlet_driver(tmp_path, "keep.db", _DeadLauncher())
+    d.pulse("src@1")
+    first = d.state.pond_states["src@1"].start_f
+    d.on_event("src@1", {"kind": "failed", "ripple": "r1", "f": first.isoformat(),
+                         "status": "failed", "error": "boom"})
+    later = first + timedelta(seconds=30)
+    d._dispatch_begin_run("src@1", later, later)
+    d.on_event("src@1", {"kind": "ripple", "ripple": "r1", "f": later.isoformat(), "status": "success"})
+    d.on_event("src@1", {"kind": "run_completed", "f": later.isoformat()})
+
+    rows = dict(d.db.execute("SELECT f, status FROM pond_run").fetchall())
+    assert rows[first.isoformat()] == "failed"
+    (err,) = d.db.execute("SELECT error FROM pond_run WHERE f = ?", (first.isoformat(),)).fetchone()
+    assert err == "boom", "the Duck's own failure message was overwritten"

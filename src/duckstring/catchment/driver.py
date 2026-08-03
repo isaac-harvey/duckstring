@@ -1303,8 +1303,28 @@ class Driver:
         """Operator acknowledgement: clear a Pond's failure/block (no run). Downstream Ponds blocked
         only by this failure re-derive and unblock on their own."""
         with self.lock:
-            self.state = clear_pond(self.state, pond, _now())
-            self._process(_now())
+            now = _now()
+            # Clearing rolls start_f back to end_f so liveness won't re-fail the halted Run — which also
+            # means liveness can never CLOSE it either. Close it here, or it sits at 'running' for good.
+            ps = self.state.pond_states.get(pond)
+            in_flight = ps.start_f if ps is not None and ps.start_f > ps.end_f else None
+            self.state = clear_pond(self.state, pond, now)
+            if in_flight is not None:
+                self._abandon_pond_run(pond, _iso(in_flight), now)
+            self._process(now)
+
+    def _abandon_pond_run(self, pond: str, f: str, now: datetime) -> None:
+        """Close a specific still-``running`` row an operator action abandoned. Never creates a row and
+        never overwrites a finished one — a Run the Duck already reported keeps its own outcome."""
+        meta = self.meta[pond]
+        cur = self.db.execute(
+            "UPDATE pond_run SET finished_at = ?, status = 'failed', "
+            "error = COALESCE(error, 'abandoned by an operator clear before the Run completed') "
+            "WHERE pond_version_id = ? AND f = ? AND status = 'running'",
+            (_iso(now), meta["version_id"], f),
+        )
+        if cur.rowcount:
+            self.db.commit()
 
     def clear_on_redeploy(self, name: str, major: int) -> None:
         """Called after a (re)deploy: if the Pond was failed, clear it — a fresh artifact presumably
@@ -3052,6 +3072,29 @@ class Driver:
             (_iso(now), int(changed), meta["version_id"], f),
         )
         self.db.commit()
+        self._close_abandoned_runs(pond, f, now)
+
+    def _close_abandoned_runs(self, pond: str, through_f: str, now: datetime) -> None:
+        """Close any OLDER ``running`` row for this version — the Pond has demonstrably moved past them.
+
+        The invariant: a Pond that is not in flight has no running rows. A row is only closed by the Duck
+        reporting *that* Run, so any path where the Pond advances without a report (an operator clear over
+        an in-flight Run, a Duck that vanished before its report landed, a replaced spawn) strands one at
+        ``running`` forever — liveness will not touch it, because the Pond is no longer in flight. It then
+        sits in the history looking like work still in progress, which is what made a live box look like
+        it had a stuck Run three separate times.
+
+        Deliberately reconciliation rather than a fix at each call site: it holds for paths not yet
+        enumerated, which is the useful property when the exact sequence has resisted reproduction."""
+        meta = self.meta[pond]
+        cur = self.db.execute(
+            "UPDATE pond_run SET finished_at = ?, status = 'failed', "
+            "error = COALESCE(error, 'abandoned — the Pond advanced past this Run without completing it') "
+            "WHERE pond_version_id = ? AND status = 'running' AND f < ?",
+            (_iso(now), meta["version_id"], through_f),
+        )
+        if cur.rowcount:
+            self.db.commit()
 
     def _record_persist(self, pond: str, f: str | None, status: str, error: str | None, now: datetime,
                         started_at: str | None = None, finished_at: str | None = None) -> None:
