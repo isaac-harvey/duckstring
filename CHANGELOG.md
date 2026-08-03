@@ -2,7 +2,7 @@
 
 Notable changes per release. Versions before 0.5.0 are recorded in the git history and the `v*` tags.
 
-## 0.5.0 — unreleased
+## 0.5.0 — 2026-08-03
 
 The cloud release: a Catchment can now run its Ducks on AWS, keep its data on S3, and serve that data
 over standard wire protocols. Everything below is opt-in — a Catchment with no cloud configuration
