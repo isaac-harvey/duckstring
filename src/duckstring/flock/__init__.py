@@ -94,6 +94,111 @@ def _record_dispatch(engine, result, error: str | None = None) -> None:
         _stats["last_error"] = None
 
 
+def _qi(name: str) -> str:
+    return '"' + str(name).replace('"', '""') + '"'
+
+
+# The expression forms whose meaning is PROVEN identical between DuckDB and a dispatch engine, by
+# conformance test rather than by assumption. Deliberately small: column references, literals,
+# comparisons and boolean connectives. It grows only as conformance coverage grows.
+#
+# What is excluded, and why (each is a known cross-engine divergence, not caution for its own sake):
+#   arithmetic  — decimal result-type and overflow rules differ; float summation order is not even
+#                 stable within DuckDB across thread counts, so "what DuckDB would have done" is not a
+#                 single value. Those columns must be computed locally or declared DECIMAL.
+#   CAST        — string→number and narrowing casts differ in whether they round, truncate, or raise.
+#   functions   — round/trunc half-way rules, string collation and trimming, temporal precision and
+#                 timezone handling all vary by engine.
+_SAFE_SQL_NODES = (
+    "Column", "Identifier", "Star", "Alias", "Literal", "Boolean", "Null", "Paren",
+    "EQ", "NEQ", "GT", "GTE", "LT", "LTE", "And", "Or", "Not", "Is", "In", "Between",
+)
+
+
+def semantic_reason(builder) -> str | None:
+    """``None`` when every expression in this terminal is on the proven-equivalent whitelist, else the
+    reason it must run locally.
+
+    The engine-agnostic half of eligibility: an engine's own ``eligible`` says what its compiler can
+    *express*, this says what we have *proven equivalent*. Shape alone is not enough — a left-deep join
+    of two tables is expressible everywhere, but `round(qty * price, 2)` in its projection is where the
+    engines actually disagree.
+
+    Needs a SQL parser to judge an expression (the ``duckstring[lineage]`` extra, which ships sqlglot).
+    Without one we cannot read the projection, so only bare column lists are dispatched — unparsed SQL
+    is never assumed safe."""
+    exprs: list[str] = []
+    for kind, payload in builder._ops:
+        if kind in ("filter", "select"):
+            exprs.append(str(payload))
+        elif kind == "mutate":
+            exprs.extend(str(v) for v in (payload or {}).values())
+    if not exprs:
+        return None
+    try:
+        import sqlglot
+    except ImportError:
+        bare = all(all(_is_bare_column(part) for part in e.split(",")) for e in exprs)
+        return None if bare else "no SQL parser available to prove the expressions equivalent (pip install duckstring[lineage])"  # noqa: E501
+    for expr in exprs:
+        try:
+            trees = sqlglot.parse(f"SELECT {expr}", read="duckdb")
+        except Exception:  # noqa: BLE001 — unparseable means unprovable
+            return f"could not parse {expr!r} to prove it engine-equivalent"
+        for tree in trees:
+            for node in tree.walk():
+                name = type(node).__name__
+                if name in ("Select", "Expression"):
+                    continue
+                if name not in _SAFE_SQL_NODES:
+                    return (f"{name} is not on the engine-equivalence whitelist — DuckDB and the engine "
+                            f"may not agree on it (in {expr!r})")
+    return None
+
+
+def _is_bare_column(text: str) -> bool:
+    """A plain column reference, optionally qualified/aliased — the only thing we dare dispatch when no
+    parser is available to judge anything richer."""
+    import re
+
+    return bool(re.fullmatch(r"\s*[\w.\"]+(\s+AS\s+[\w\"]+)?\s*", text, re.IGNORECASE))
+
+
+def conform(builder, result):
+    """Force an engine's result to be **exactly what DuckDB would have produced**, or reject it.
+
+    DuckDB is the authority: dispatching decides *where* the work runs, never *what* gets published. An
+    engine that returns the same rows with a different column order, or ``DECIMAL(36,2)`` where DuckDB
+    says ``DECIMAL(35,2)``, has changed the output — and since the published schema is the version
+    contract, that difference can fail a Pond and (before the widening rule) wedge it permanently.
+
+    The oracle is free: ``builder.schema()`` is DuckDB's own answer for this terminal, obtained by
+    binding the local plan without executing it. So:
+
+    - a column set that doesn't match the oracle → **reject** (return None → local compute). Not
+      something to paper over: it means the engine computed a different query.
+    - otherwise project in the oracle's column ORDER with an explicit CAST per column, so the types are
+      DuckDB's by construction rather than by coincidence.
+
+    Returns the conformed relation, or ``None`` to fall back."""
+    if result is None:
+        return None
+    try:
+        oracle = builder.schema()
+        got = set(result.columns)
+        if got != set(oracle):
+            missing, extra = sorted(set(oracle) - got), sorted(got - set(oracle))
+            log.warning("flock: engine result does not match the DuckDB oracle (missing=%s extra=%s) "
+                        "— running local", missing, extra)
+            return None
+        projection = ", ".join(f"CAST({_qi(c)} AS {t}) AS {_qi(c)}" for c, t in oracle.items())
+        return result.project(projection)
+    except Exception as exc:  # noqa: BLE001 — conformance must never fail a Run; local compute is correct
+        log.warning("flock: could not conform the engine result (%s: %s) — running local",
+                    type(exc).__name__, str(exc)[:200])
+        return None
+
+
 def _dispatch(engine, builder, out_pk):
     """Dispatch + record. The engine protocol says ``dispatch`` returns ``None`` on an engine-side
     failure, but the fallback contract (the Flock is NEVER load-bearing) must not depend on every engine
@@ -105,6 +210,14 @@ def _dispatch(engine, builder, out_pk):
     except Exception as exc:  # noqa: BLE001 — the fallback contract: degrade to local, never fail the run
         log.warning("flock: engine raised (%s: %s) — running local", type(exc).__name__, str(exc)[:300])
         result, error = None, f"{type(exc).__name__}: {str(exc)[:300]}"
+    if result is not None:
+        # Fail CLOSED: a result that isn't what DuckDB would have produced is discarded, turning a wrong
+        # answer into a slower one. The counters record it as a failed dispatch, so a Flock that is
+        # quietly non-conformant shows up on /metrics instead of in your published data.
+        conformed = conform(builder, result)
+        if conformed is None:
+            error = "engine result did not conform to the DuckDB schema"
+        result = conformed
     _record_dispatch(engine, result, error)
     return result
 
@@ -220,7 +333,9 @@ def comprehensive(builder, out_pk, *, pond_mode: str | None, comprehensive_bound
     mode = resolve_mode(pond_mode)
     if mode == "off":
         return None
-    reason = engine.eligible(builder)
+    # Two gates, in order: what we have PROVEN equivalent (engine-agnostic), then what this engine's
+    # compiler can express. The first is the one that keeps DuckDB the authority.
+    reason = semantic_reason(builder) or engine.eligible(builder)
     if reason is not None:
         log.info("flock: not dispatching (%s)", reason)
         return None

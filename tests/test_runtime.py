@@ -150,6 +150,31 @@ def test_pulse_runs_chain_end_to_end(runtime):
     assert reports["end_f"] is not None and sales["end_f"] is not None
 
 
+def _write_eligible_pond(root: Path) -> Path:
+    """A Pond whose builder terminal is on the Flock's engine-equivalence whitelist: a join projecting
+    BARE COLUMNS only. The demo's `priced` deliberately is not — its `CAST(round(qty * price, 2))` is
+    exactly the arithmetic whose decimal result type engines disagree about, so the semantic gate
+    (correctly) keeps it local. Dispatch needs something provably equivalent to exercise."""
+    d = root / "flockable"
+    (d / "src").mkdir(parents=True, exist_ok=True)
+    (d / "pond.toml").write_text(
+        '[pond]\nname = "flockable"\nversion = "1.0.0"\n\n'
+        '[sources]\norders = "1.0.0"\ncatalog = "1.0.0"\n'
+    )
+    (d / "src" / "pond.py").write_text(
+        "from duckstring import ripple\n\n\n"
+        "@ripple\n"
+        "def flat(pond):\n"
+        "    (\n"
+        '        pond.trickle("orders.order_line")\n'
+        '        .join(pond.trickle("catalog.product"), on="product_id")\n'
+        '        .select("s0.order_id, s0.product_id, s0.quantity, s1.unit_price")\n'
+        '        .merge("flat_line", pk="order_id")\n'
+        "    )\n"
+    )
+    return d
+
+
 def _use_fake_flock(monkeypatch, **extra):
     """Point Ducks at the fake Flock engine (tests/flock_fake_engine.py). Ducks are spawned per run and
     inherit the current environment, so setting this before the run is enough; PYTHONPATH carries tests/
@@ -181,19 +206,23 @@ def test_flock_dispatch_is_reported_not_silent(runtime, monkeypatch, failing):
     modes = {"returns-none": {"FAKE_FLOCK_FAIL": "1"}, "raises": {"FAKE_FLOCK_RAISE": "1"}}
     _use_fake_flock(monkeypatch, **modes.get(failing, {}))
 
-    _deploy(url, _TRICKLE_PONDS)
-    # `always` dispatches every eligible terminal; priced is the builder Pond.
-    assert httpx.post(f"{url}/api/ponds/priced/duck", json={"flock_mode": "always"},
+    _deploy(url, ("orders", "catalog"))
+    pond_dir = _write_eligible_pond(Path(_root) / "src")
+    r = httpx.post(f"{url}/api/deploy",
+                   files={"pond": ("pond.zip", _zip_dir(pond_dir), "application/zip")},
+                   data={"name": "flockable", "version": "1.0.0", "type": "outlet"}, timeout=15.0)
+    assert r.status_code == 200, r.text
+    assert httpx.post(f"{url}/api/ponds/flockable/duck", json={"flock_mode": "always"},
                       timeout=10.0).status_code == 200
 
-    httpx.post(f"{url}/api/ponds/revenue/pulse", timeout=5.0)
-    assert _wait(lambda: (_pond_status(url, "priced") or {}).get("end_f") is not None, timeout=90.0), \
-        "priced never became fresh — a Flock dispatch (even a failing one) must still complete the run"
+    httpx.post(f"{url}/api/ponds/flockable/pulse", timeout=5.0)
+    assert _wait(lambda: (_pond_status(url, "flockable") or {}).get("end_f") is not None, timeout=90.0), \
+        "the Pond never became fresh — a Flock dispatch (even a failing one) must still complete the run"
 
-    priced = _pond_status(url, "priced")
+    priced = _pond_status(url, "flockable")
     metrics = httpx.get(f"{url}/metrics", timeout=5.0).text
-    ok = _metric(metrics, 'duckstring_flock_dispatched_total{pond="priced",major="1"}')
-    bad = _metric(metrics, 'duckstring_flock_dispatch_failures_total{pond="priced",major="1"}')
+    ok = _metric(metrics, 'duckstring_flock_dispatched_total{pond="flockable",major="1"}')
+    bad = _metric(metrics, 'duckstring_flock_dispatch_failures_total{pond="flockable",major="1"}')
     if failing == "none":
         assert ok and ok >= 1, f"a successful dispatch must be counted; got:\n{metrics}"
         assert priced["flock_error"] is None

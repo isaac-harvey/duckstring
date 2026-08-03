@@ -81,6 +81,24 @@ def _reset_flock_stats():
     yield
 
 
+class _StubRel:
+    """The minimum a conformable result needs: its columns, and a projection that returns itself."""
+
+    columns = ["a"]
+
+    def project(self, _projection):
+        return self
+
+
+class _StubBuilder:
+    def schema(self):
+        return {"a": "INTEGER"}
+
+
+def _ok_result(_builder):
+    return _StubRel()
+
+
 def test_stats_start_empty_and_omitted():
     assert flock.stats() is None  # no field ships on the ripple event until Flock actually ran
     assert flock.take_stats() is None
@@ -90,11 +108,11 @@ def test_take_stats_is_a_delta_that_resets():
     """The Duck reports per Ripple Run and the Catchment accumulates — so each report must cover only
     what happened since the last one. A snapshot here would double-count across a Pond's Ripples and be
     lost entirely when a Duck is replaced mid-run."""
-    good = FakeEngine(result_fn=lambda b: object())
-    flock._dispatch(good, None, None)
+    good = FakeEngine(result_fn=_ok_result)
+    flock._dispatch(good, _StubBuilder(), None)
     assert flock.take_stats() == {"dispatched": 1, "failed": 0, "last_error": None}
     assert flock.take_stats() is None  # drained
-    flock._dispatch(good, None, None)
+    flock._dispatch(good, _StubBuilder(), None)
     assert flock.take_stats()["dispatched"] == 1  # the next window counts from zero
 
 
@@ -128,15 +146,15 @@ def test_unloadable_engine_spec_degrades_rather_than_raises():
 
 
 def test_stats_count_dispatches_and_failures():
-    good = FakeEngine(result_fn=lambda b: object())
+    good = FakeEngine(result_fn=_ok_result)
     bad = FakeEngine()  # dispatch → None = the engine failed (the fallback contract)
     bad.last_error = "InvalidRequestException: Unable to verify/create output bucket"
-    flock._dispatch(good, None, None)
+    flock._dispatch(good, _StubBuilder(), None)
     assert flock.stats() == {"dispatched": 1, "failed": 0, "last_error": None}
-    flock._dispatch(bad, None, None)
+    flock._dispatch(bad, _StubBuilder(), None)
     s = flock.stats()
     assert s["failed"] == 1 and "output bucket" in s["last_error"]
-    flock._dispatch(good, None, None)  # a clean dispatch clears the sticky error
+    flock._dispatch(good, _StubBuilder(), None)  # a clean dispatch clears the sticky error
     assert flock.stats()["last_error"] is None
 
 
@@ -161,10 +179,12 @@ def test_always_mode_dispatches_via_injected_engine(tmp_path, monkeypatch):
         monkeypatch.setenv(k, v)
     pond = _pond(tmp_path, flock_mode="always")
     _mark_source(pond)
-    engine = FakeEngine(result_fn=lambda b: b.ctx.read_table("src").project("id, v * 10 AS v10"))
+    engine = FakeEngine(result_fn=lambda b: b.ctx.read_table("src").project("id, v"))
     monkeypatch.setattr(flock, "get_engine", lambda env=None: engine)
 
-    pond.trickle("src").select("s0.id, s0.v * 10 AS v10").merge("out", pk="id")
+    # Bare columns: on the engine-equivalence whitelist, so `always` actually dispatches. An arithmetic
+    # projection would (correctly) stay local — see test_flock_conformance.
+    pond.trickle("src").select("s0.id, s0.v").merge("out", pk="id")
     assert engine.dispatched
     net = pond.con.execute(
         "SELECT count(*) FROM out__changelog WHERE _duckstring_d = 1"
