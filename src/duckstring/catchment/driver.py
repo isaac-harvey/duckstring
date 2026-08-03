@@ -314,6 +314,11 @@ class Driver:
         if self._egress_cb is not None:
             self._egress_cb()
 
+    def _enqueue_job(self, pond: str, job: dict) -> None:
+        """Queue a job for a Duck. It collects on its next poll (routes/duck.py explains why delivery is
+        a poll rather than a push)."""
+        self.jobs.setdefault(pond, []).append(job)
+
     def set_alert_notify(self, cb) -> None:
         self._alert_cb = cb
 
@@ -2995,7 +3000,7 @@ class Driver:
         self._idle_since.pop(pond, None)  # it's running again — reset its reap grace clock
         # Cancel any not-yet-collected shutdown: this Pond is running again, so the Duck must not exit.
         self.jobs[pond] = [j for j in self.jobs.get(pond, []) if j.get("kind") != "shutdown"]
-        self.jobs[pond].append({
+        self._enqueue_job(pond, {
             "kind": "begin_run", "f": _iso(f), "force": force, "refresh": refresh,
             "sources_changed": sources_changed,  # backs pond.sources_changed() (for always_run gating)
             "immediate_retries": self.state.ponds[pond].retry_immediately,  # live budget, per Run
@@ -3042,7 +3047,7 @@ class Driver:
             # that re-runs on any sub-grace cadence keeps its Duck and never hits the reap/respawn race.
             since = self._idle_since.setdefault(name, now)
             if now - since >= _REAP_GRACE:
-                self.jobs.setdefault(name, []).append({"kind": "shutdown"})
+                self._enqueue_job(name, {"kind": "shutdown"})
                 self._idle_since.pop(name, None)
 
     # ─── History + persistence ────────────────────────────────────────────────

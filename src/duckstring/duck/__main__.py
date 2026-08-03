@@ -35,6 +35,22 @@ _STUCK_GRACE_S = 30.0
 log = logging.getLogger("duckstring.duck")
 
 
+# Idle poll backoff. Job delivery is a poll (routes/duck.py explains why it is not a long poll), so the
+# interval IS the dispatch latency — keep it short while there is any reason to expect work, and back off
+# when there is not. A flat 0.1 s meant ten requests a second forever: unnoticeable beside a local
+# Catchment, but continuous network round-trips for a remote Duck, and enough log noise to actively
+# hinder debugging one.
+_POLL_MIN_S = 0.1
+_POLL_MAX_S = 2.0
+
+
+def _poll_delay(idle_rounds: int) -> float:
+    """Back off geometrically from _POLL_MIN_S to _POLL_MAX_S over consecutive empty polls. A Duck that
+    has just been told to do something, or is mid-run, resets to the floor — so responsiveness is
+    unchanged exactly when it matters."""
+    return min(_POLL_MIN_S * (2 ** idle_rounds), _POLL_MAX_S)
+
+
 def serve(core: DuckCore, executor: RippleExecutor, client: CatchmentClient) -> None:
     """Single-threaded event loop fed by a poll thread (jobs) and executor callbacks (completions)."""
     q: queue.Queue = queue.Queue()
@@ -68,12 +84,18 @@ def serve(core: DuckCore, executor: RippleExecutor, client: CatchmentClient) -> 
         threading.Thread(target=_run, daemon=True).start()
 
     def _poll_loop():
+        idle_rounds = 0
         while not stop.is_set():
             jobs = client.poll_jobs()
             for job in jobs:
                 q.put(("job", job))
-            if not jobs:
-                stop.wait(0.1)  # short poll interval; avoids busy-spinning the Catchment
+            if jobs or inflight:
+                idle_rounds = 0        # work arrived or is running — stay responsive
+                if not jobs:
+                    stop.wait(_POLL_MIN_S)
+            else:
+                stop.wait(_poll_delay(idle_rounds))
+                idle_rounds += 1
 
     def _launch(names):
         nonlocal inflight, last_progress

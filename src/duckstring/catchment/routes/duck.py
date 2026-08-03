@@ -8,7 +8,15 @@ authority — no object-store coupling here.
 
 A Duck serves one major line of a Pond, so all routes address the pond key ``name@major``. All are
 Duck-initiated, so the same shape works for a local subprocess or a remote Duck. Job delivery is a
-short poll (the Duck re-polls on a short interval); events are idempotent on freshness.
+short poll (the Duck re-polls on a backing-off interval); events are idempotent on freshness.
+
+**Why this is not a long poll.** ``take_jobs`` DRAINS the queue, so holding the connection opens a window
+where a Duck that was killed mid-poll wakes on the next job and swallows work meant for its replacement,
+which then waits forever for a job that no longer exists. Verified: holding the connection broke reset
+and missing-source recovery, and ASGI gives no reliable disconnect signal for an idle GET to close the
+window with. Doing this properly needs a spawn token so the server can tell WHICH Duck owns the queue —
+worth doing, but it is a protocol change, not a tweak. Until then the Duck backs off when idle, which
+removes most of the traffic with none of the delivery risk.
 """
 
 from __future__ import annotations
