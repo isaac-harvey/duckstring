@@ -200,6 +200,27 @@ def test_boot_scripts_tee_to_the_serial_console(tmp_path):
         assert "set -euxo pipefail" in script  # -x so the console shows WHICH step failed
 
 
+def test_remote_workers_get_the_aws_region_in_their_environment(tmp_path, monkeypatch):
+    """A remote worker starts with an EMPTY environment, and without a region the data plane's S3 access
+    goes out UNSIGNED — the bucket answers "No AWSAccessKey was presented", which reads as a permissions
+    problem even though the instance role is healthy. Cost an hour on the gate box. The Catchment's own
+    Ducks inherit this from the service environment; these must be told. Credentials are never exported —
+    the box uses its instance profile."""
+    import base64
+
+    from duckstring.catchment.pool_launcher import Ec2PoolMachine
+
+    ec2 = FakeEc2()
+    lch = _launcher(tmp_path, ec2, instance_profile="ds-worker", region="ap-southeast-2")
+    lch.ensure("a@1", "1", "ponds/a/1", duck=_duck("heavy"))
+    Ec2PoolMachine("devpool", {"instance_type": "m6i.large"}, lch).start()
+    assert len(ec2.launched) == 2
+    for _iid, kw in ec2.launched:
+        script = base64.b64decode(kw["UserData"]).decode()
+        assert "export AWS_REGION=ap-southeast-2" in script, f"unsigned S3 awaits:\n{script}"
+        assert "AWS_SECRET_ACCESS_KEY" not in script  # never ship credentials to a worker
+
+
 def test_diagnose_includes_the_console_tail(tmp_path):
     ec2 = FakeEc2()
     ec2.describe_instances = lambda **kw: {

@@ -62,8 +62,22 @@ def _csv(value: str | None) -> list[str]:
 _CONSOLE_TEE = "exec > >(tee -a /dev/console /var/log/duckstring-boot.log) 2>&1"
 
 
+def _aws_env(region: str | None) -> list[str]:
+    """Export the AWS region into a worker's environment. Not cosmetic: without a region the data
+    plane's S3 access falls back to an UNSIGNED request, which the bucket rejects with
+    "No AWSAccessKey was presented" — the instance role is present and healthy, so the failure reads as
+    a permissions problem rather than a missing setting. The Catchment's own Ducks inherit this from the
+    service environment; a remote worker starts with an empty one and must be told.
+
+    Credentials themselves are NEVER exported — the box uses its instance profile."""
+    if not region:
+        return []
+    return [f"export AWS_REGION={shlex.quote(region)} AWS_DEFAULT_REGION={shlex.quote(region)}"]
+
+
 def _userdata(*, pond: str, major: int, version: str, source_path: str, catchment_url: str,
-              token: str, data_root: str | None, pip_spec: str | None) -> str:
+              token: str, data_root: str | None, pip_spec: str | None,
+              region: str | None = None) -> str:
     """The cloud-init shell that boots the Duck. It fetches its own source artifact over the duck
     channel (the dir won't exist on the box), so nothing but the reachable Catchment URL + token is
     needed. ``pip_spec`` installs duckstring when the AMI doesn't already carry it."""
@@ -74,7 +88,8 @@ def _userdata(*, pond: str, major: int, version: str, source_path: str, catchmen
         "--root", _REMOTE_ROOT, "--source-path", source_path,
         f"--data-root={data_root or ''}",
     ]
-    lines = ["#!/bin/bash", "set -euxo pipefail", _CONSOLE_TEE, f"mkdir -p {_REMOTE_ROOT}"]
+    lines = ["#!/bin/bash", "set -euxo pipefail", _CONSOLE_TEE, *_aws_env(region),
+             f"mkdir -p {_REMOTE_ROOT}"]
     if pip_spec:
         lines.append(f"pip3 install --quiet {shlex.quote(pip_spec)}")
     lines.append("exec " + " ".join(shlex.quote(c) for c in cmd))
@@ -177,7 +192,7 @@ class Ec2Launcher:
         userdata = _userdata(
             pond=name, major=major, version=version, source_path=source_path,
             catchment_url=self.remote_base_url, token=self.token, data_root=self.data_root,
-            pip_spec=pip_spec,
+            pip_spec=pip_spec, region=region,
         )
         kwargs = {
             "ImageId": ami,
@@ -257,7 +272,9 @@ class Ec2Launcher:
         instance_type = (spec.get("instance_type") or dc.get("instance_type")
                          or os.environ.get("DUCKSTRING_EC2_INSTANCE_TYPE") or "m6i.large")
         pip_spec = dc.get("pip_spec") if dc.get("pip_spec") is not None else self.pip_spec
-        lines = ["#!/bin/bash", "set -euxo pipefail", _CONSOLE_TEE, f"mkdir -p {_REMOTE_ROOT}"]
+        region = spec.get("region") or dc.get("region") or self.region
+        lines = ["#!/bin/bash", "set -euxo pipefail", _CONSOLE_TEE, *_aws_env(region),
+                 f"mkdir -p {_REMOTE_ROOT}"]
         if pip_spec:
             lines.append(f"pip3 install --quiet {shlex.quote(pip_spec)}")
         lines.append(f"exec python3 -m {module_cmd}")
@@ -275,7 +292,6 @@ class Ec2Launcher:
         if instance_profile:
             kwargs["IamInstanceProfile"] = {"Name": instance_profile}
         kwargs.update(self._placement(dc))  # a Pool agent dials back too — same placement rules
-        region = spec.get("region") or dc.get("region")
         if region and self.region is None:
             self.region = region
         resp = self._ec2().run_instances(**kwargs)
