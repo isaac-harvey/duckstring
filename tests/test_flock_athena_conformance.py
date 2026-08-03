@@ -56,14 +56,22 @@ _CASES = [
 ]
 
 
-def _athena_values(exprs: list[str]) -> list[str]:
-    """Evaluate each expression on Athena, as strings (string comparison keeps the test about semantics
-    rather than about client-side type mapping)."""
+def _athena_values(exprs: list[str], cast_to: list[str] | None = None) -> list[str]:
+    """Evaluate each expression on Athena, as strings.
+
+    ``cast_to`` mirrors what ``flock.conform`` does in production: cast the engine's result to the type
+    DuckDB produced. Comparing raw output would flag differences that never reach your data — Athena's
+    ``round(x, 2)`` keeps scale 3 (``2.350``) where DuckDB rescales to 2 (``2.35``), and conform casts
+    that back. What matters is whether the values agree AFTER that, so that is what we compare."""
     import boto3
 
     region = os.environ.get("DUCKSTRING_FLOCK_ATHENA_REGION")
     athena = boto3.client("athena", **({"region_name": region} if region else {}))
-    select = ", ".join(f"CAST(({e}) AS VARCHAR) AS c{i}" for i, e in enumerate(exprs))
+    if cast_to:
+        select = ", ".join(f"CAST(CAST(({e}) AS {t}) AS VARCHAR) AS c{i}"
+                           for i, (e, t) in enumerate(zip(exprs, cast_to, strict=True)))
+    else:
+        select = ", ".join(f"CAST(({e}) AS VARCHAR) AS c{i}" for i, e in enumerate(exprs))
     qid = athena.start_query_execution(
         QueryString=f"SELECT {select}",
         WorkGroup=os.environ["DUCKSTRING_FLOCK_ATHENA_WORKGROUP"],
@@ -81,10 +89,13 @@ def _athena_values(exprs: list[str]) -> list[str]:
     return [c.get("VarCharValue") for c in rows[1]["Data"]]  # row 0 is the header
 
 
-def _duckdb_values(exprs: list[str]) -> list[str]:
+def _duckdb_values(exprs: list[str]) -> tuple[list[str], list[str]]:
+    """The oracle: each expression's value AND its DuckDB type (the type conform casts the engine to)."""
     con = duckdb.connect()
+    types = [str(con.sql(f"SELECT ({e}) AS v").types[0]) for e in exprs]
     select = ", ".join(f"CAST(({e}) AS VARCHAR) AS c{i}" for i, e in enumerate(exprs))
-    return [None if v is None else str(v) for v in con.sql(f"SELECT {select}").fetchone()]
+    values = [None if v is None else str(v) for v in con.sql(f"SELECT {select}").fetchone()]
+    return values, types
 
 
 def test_athena_matches_duckdb_on_the_allow_list():
@@ -92,7 +103,8 @@ def test_athena_matches_duckdb_on_the_allow_list():
     matrix, including the expressions we already exclude — so an exclusion that turns out to be
     unnecessary is visible and can be lifted, and one that turns out to be necessary is documented."""
     exprs = [e for _l, e, _a in _CASES]
-    duck, athena = _duckdb_values(exprs), _athena_values(exprs)
+    duck, duck_types = _duckdb_values(exprs)
+    athena = _athena_values(exprs, cast_to=duck_types)  # post-conform, i.e. what would actually ship
 
     report, wrong_allow, unnecessary_exclusion = [], [], []
     for (label, expr, allowed), d, a in zip(_CASES, duck, athena, strict=True):

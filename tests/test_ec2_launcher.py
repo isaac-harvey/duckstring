@@ -200,6 +200,17 @@ def test_boot_scripts_tee_to_the_serial_console(tmp_path):
         assert "set -euxo pipefail" in script  # -x so the console shows WHICH step failed
 
 
+def test_region_defaults_from_the_environment_like_fargate(tmp_path, monkeypatch):
+    """cloud_backends builds both remote backends with identical kwargs and passes no region, so the
+    environment is the only source. Fargate always read it; EC2 did not — so its workers were launched
+    with no region at all and their S3 writes went out unsigned."""
+    monkeypatch.setenv("AWS_REGION", "ap-southeast-2")
+    assert Ec2Launcher(tmp_path, "http://cat:7474").region == "ap-southeast-2"
+    monkeypatch.delenv("AWS_REGION")
+    monkeypatch.setenv("AWS_DEFAULT_REGION", "eu-west-1")
+    assert Ec2Launcher(tmp_path, "http://cat:7474").region == "eu-west-1"
+
+
 def test_remote_workers_get_the_aws_region_in_their_environment(tmp_path, monkeypatch):
     """A remote worker starts with an EMPTY environment, and without a region the data plane's S3 access
     goes out UNSIGNED — the bucket answers "No AWSAccessKey was presented", which reads as a permissions

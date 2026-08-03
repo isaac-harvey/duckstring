@@ -73,8 +73,19 @@ _TYPES = {
 #                       in the last bits. Not a correctness cliff (DuckDB is not bit-stable across
 #                       thread counts either) but unverified, so it waits for a measurement.
 #
-# The list grows from evidence: tests/test_flock_athena_conformance.py runs each candidate on BOTH
-# engines and compares. Nothing joins it on reasoning alone.
+# MEASURED against real Athena on 2026-08-03 (tests/test_flock_athena_conformance.py), comparing
+# POST-conform values — i.e. what would actually ship:
+#   agreed  : decimal * and +, round() incl. the half-way and 2-dp cases, abs, floor/ceil, coalesce,
+#             null comparison — so the allowances above are evidence, not inference.
+#   diverged: 7 / 2 → DuckDB 3.5, Athena 3 (post-conform 3.0: the right type carrying the WRONG value);
+#             CAST(2.5 AS INTEGER) → DuckDB 2, Athena 3.
+#   agreed but still excluded, pending more than one sample each: CAST(2.9 AS INTEGER), upper(trim(…)),
+#             string || NULL. One passing case is not a proof about a whole function family.
+# Note round(x, 2) returns DECIMAL(10,3) on Athena vs (10,2) on DuckDB — a TYPE difference that conform
+# already erases, which is why the probe compares post-conform rather than raw engine output.
+#
+# The list grows from evidence: that test runs each candidate on BOTH engines and compares. Nothing
+# joins it on reasoning alone.
 _ALLOWED_NODES = equivalence.BASE_NODES | frozenset({"Add", "Sub", "Mul", "Neg", "Coalesce", "If", "Case"})
 _ALLOWED_FUNCS = frozenset({"round", "abs", "floor", "ceil", "ceiling", "coalesce", "nullif",
                             "least", "greatest"})

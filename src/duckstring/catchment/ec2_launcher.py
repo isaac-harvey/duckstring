@@ -125,7 +125,12 @@ class Ec2Launcher:
         self.security_groups = _csv(security_groups or os.environ.get("DUCKSTRING_EC2_SECURITY_GROUPS"))
         self.assign_public_ip = assign_public_ip or os.environ.get("DUCKSTRING_EC2_ASSIGN_PUBLIC_IP")
         self._warned_no_sg = False
-        self.region = region
+        # Default from the environment exactly as the Fargate backend does. Without this the launcher has
+        # no region, so nothing is exported into a worker's environment and its S3 access goes out
+        # UNSIGNED — the bucket answers "No AWSAccessKey was presented", which reads as an IAM fault even
+        # though the instance role is fine. (cloud_backends builds both backends with the same kwargs and
+        # passes no region, so the env is the only source.)
+        self.region = region or os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
         self._client = ec2_client
         self._instances: dict[str, dict] = {}   # pond_key → {"instance_id", "pool"}
         self._pending: dict[str, tuple] = {}     # spawns deferred until a reachable URL is known
