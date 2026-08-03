@@ -150,6 +150,87 @@ def test_pulse_runs_chain_end_to_end(runtime):
     assert reports["end_f"] is not None and sales["end_f"] is not None
 
 
+def _write_eligible_pond(root: Path) -> Path:
+    """A Pond whose builder terminal is on the Flock's engine-equivalence whitelist: a join projecting
+    BARE COLUMNS only. The demo's `priced` deliberately is not — its `CAST(round(qty * price, 2))` is
+    exactly the arithmetic whose decimal result type engines disagree about, so the semantic gate
+    (correctly) keeps it local. Dispatch needs something provably equivalent to exercise."""
+    d = root / "flockable"
+    (d / "src").mkdir(parents=True, exist_ok=True)
+    (d / "pond.toml").write_text(
+        '[pond]\nname = "flockable"\nversion = "1.0.0"\n\n'
+        '[sources]\norders = "1.0.0"\ncatalog = "1.0.0"\n'
+    )
+    (d / "src" / "pond.py").write_text(
+        "from duckstring import ripple\n\n\n"
+        "@ripple\n"
+        "def flat(pond):\n"
+        "    (\n"
+        '        pond.trickle("orders.order_line")\n'
+        '        .join(pond.trickle("catalog.product"), on="product_id")\n'
+        '        .select("s0.order_id, s0.product_id, s0.quantity, s1.unit_price")\n'
+        '        .merge("flat_line", pk="order_id")\n'
+        "    )\n"
+    )
+    return d
+
+
+def _use_fake_flock(monkeypatch, **extra):
+    """Point Ducks at the fake Flock engine (tests/flock_fake_engine.py). Ducks are spawned per run and
+    inherit the current environment, so setting this before the run is enough; PYTHONPATH carries tests/
+    into the subprocess so the module is importable there."""
+    monkeypatch.setenv("DUCKSTRING_FLOCK_ENGINE", "flock_fake_engine:FakeFlockEngine")
+    monkeypatch.setenv("PYTHONPATH", str(Path(__file__).parent))
+    for k, v in extra.items():
+        monkeypatch.setenv(k, v)
+
+
+def _metric(metrics: str, prefix: str) -> float | None:
+    for line in metrics.splitlines():
+        if line.startswith(prefix):
+            return float(line.rsplit(" ", 1)[1])
+    return None
+
+
+@pytest.mark.parametrize("failing", ["none", "returns-none", "raises"])
+def test_flock_dispatch_is_reported_not_silent(runtime, monkeypatch, failing):
+    """The Flock's reporting surface, through real Duck subprocesses — the path that only a live cloud
+    box could exercise before the engine seam opened.
+
+    All three outcomes are indistinguishable without a report: a dispatch that SUCCEEDS should show as
+    work that ran remotely; one that FAILS — whether the engine returns None per the protocol or breaks
+    its contract and raises — still completes the run on local compute while quietly paying full local
+    cost. The Duck ships the delta on each ripple event; the Catchment accumulates it onto /metrics and
+    (for a failure) the pond's flock_error."""
+    url, _root = runtime
+    modes = {"returns-none": {"FAKE_FLOCK_FAIL": "1"}, "raises": {"FAKE_FLOCK_RAISE": "1"}}
+    _use_fake_flock(monkeypatch, **modes.get(failing, {}))
+
+    _deploy(url, ("orders", "catalog"))
+    pond_dir = _write_eligible_pond(Path(_root) / "src")
+    r = httpx.post(f"{url}/api/deploy",
+                   files={"pond": ("pond.zip", _zip_dir(pond_dir), "application/zip")},
+                   data={"name": "flockable", "version": "1.0.0", "type": "outlet"}, timeout=15.0)
+    assert r.status_code == 200, r.text
+    assert httpx.post(f"{url}/api/ponds/flockable/duck", json={"flock_mode": "always"},
+                      timeout=10.0).status_code == 200
+
+    httpx.post(f"{url}/api/ponds/flockable/pulse", timeout=5.0)
+    assert _wait(lambda: (_pond_status(url, "flockable") or {}).get("end_f") is not None, timeout=90.0), \
+        "the Pond never became fresh — a Flock dispatch (even a failing one) must still complete the run"
+
+    priced = _pond_status(url, "flockable")
+    metrics = httpx.get(f"{url}/metrics", timeout=5.0).text
+    ok = _metric(metrics, 'duckstring_flock_dispatched_total{pond="flockable",major="1"}')
+    bad = _metric(metrics, 'duckstring_flock_dispatch_failures_total{pond="flockable",major="1"}')
+    if failing == "none":
+        assert ok and ok >= 1, f"a successful dispatch must be counted; got:\n{metrics}"
+        assert priced["flock_error"] is None
+    else:
+        assert bad and bad >= 1, f"the degrade must be counted; got:\n{metrics}"
+        assert priced["flock_error"], "a failed dispatch must surface as flock_error, not silence"
+
+
 def test_trickle_chain_runs_end_to_end(runtime):
     """The incremental-Trickle demo on real Duck subprocesses: a pulse on the revenue Outlet cascades
     up through the builder Pond to the append + merge inlets, every Pond runs, and the published layout
@@ -182,6 +263,120 @@ def test_trickle_chain_runs_end_to_end(runtime):
         # The reconstructed main is readable (non-empty current state) even without a checkpointed base.
         n = rcon.sql(f"SELECT count(*) FROM ({ParquetDataPlane().read_select(data_dir, table)})").fetchone()[0]
         assert n > 0, f"{name}: empty reconstructed main"
+
+
+@pytest.mark.timeout(120)
+def test_local_first_publish_persists_to_data_root(runtime, tmp_path_factory):
+    """Local-first publish + async Persist (plans/persist.md phase 2), on real Duck subprocesses: with a
+    data root attached, a chain still PUBLISHES to the local layout (the fast handoff — co-located Sinks
+    and the viewer never wait on the durable mirror), and the Persist then mirrors every line's output to
+    the data root and reports ``persisted_f``. This is the 'attached a bucket and everything got slow'
+    fix: the durable copy is off the run's critical path."""
+    import json
+
+    url, root = runtime
+    durable = tmp_path_factory.mktemp("durable_root")
+    # Attach the data root BEFORE anything publishes (fresh catchment → no confirm needed).
+    r = httpx.put(f"{url}/api/catchment/settings",
+                  json={"data_root": str(durable), "mode": "empty"}, timeout=10.0)
+    assert r.status_code == 200, r.text
+
+    _deploy(url, _TRICKLE_PONDS)
+    httpx.post(f"{url}/api/ponds/revenue/pulse", timeout=5.0)
+    assert _wait(lambda: (_pond_status(url, "revenue") or {}).get("end_f") is not None), \
+        "revenue never became fresh"
+
+    # 1. The publish is LOCAL — the catchment-root layout, exactly as with no cloud attached.
+    for name in _TRICKLE_PONDS:
+        assert (root / "ponds" / name / "m1" / "data" / "_trickle.json").exists(), \
+            f"{name}: no local publish (local-first violated)"
+
+    # 2. The async Persist mirrors each line to the data root and advances its persisted_f watermark.
+    def _persisted(name):
+        st = _pond_status(url, name) or {}
+        return st.get("persisted_f") is not None
+    for name in _TRICKLE_PONDS:
+        assert _wait(lambda n=name: _persisted(n)), f"{name}: persisted_f never advanced"
+        mirrored = durable / name / "m1" / "data" / "_trickle.json"
+        assert mirrored.exists(), f"{name}: no durable mirror at the data root"
+    # The mirrored layout is a readable flat publish (parts travel by name).
+    sidecar = json.loads((durable / "orders" / "m1" / "data" / "_trickle.json").read_text())
+    assert sidecar["order_line"]["mode"] == "append"
+    assert list((durable / "orders" / "m1" / "data" / "order_line").glob("*.parquet")), \
+        "orders: no mirrored history parts"
+
+    # 3. The persist log exists per line (a separate item from the pond_run — plans/persist.md).
+    import sqlite3
+    db = sqlite3.connect(root / "duck.db")
+    try:
+        n = db.execute("SELECT count(*) FROM pond_persist WHERE status = 'success'").fetchone()[0]
+        assert n >= len(_TRICKLE_PONDS), f"expected a persist row per line, got {n}"
+    finally:
+        db.close()
+
+    # 4. The data viewer reads (local-first) still work with the root attached.
+    r = httpx.post(f"{url}/api/query/count", json={"pond": "orders", "table": "order_line"}, timeout=10.0)
+    assert r.status_code == 200, r.text
+    assert r.json()["count"] > 0
+
+    # 5. The Persist surfaces in RUN HISTORY as its own log item on the run it covered — status +
+    #    wall-clock timings (the run itself closed at local publish; the mirror landed after).
+    runs = httpx.get(f"{url}/api/runs?pond=orders", timeout=10.0).json()["runs"]
+    persisted = [x for x in runs if x.get("persist")]
+    assert persisted, "no run carries its persist outcome in /api/runs"
+    p = persisted[0]["persist"]
+    assert p["status"] == "success" and p["started_at"] and p["finished_at"], p
+
+
+@pytest.mark.timeout(120)
+def test_named_pool_runs_co_resident_ducks(runtime, tmp_path_factory):
+    """Phase 5 offline e2e (plans/pool-agent.md): a named Pool with provider 'local' is ONE shared
+    machine — a real Pool-agent subprocess with its OWN root — hosting every targeted Pond's Duck as a
+    co-resident child. The whole chain runs on the Pool (publishes land under the AGENT'S root, not the
+    Catchment's — the shared-filesystem handoff), the engine models the shared Pool identity, and each
+    line async-persists to the durable plane, which is where the Catchment (a different Pool) reads it.
+    This exercises every seam of the agent protocol except the ~30 lines that start a Fargate/EC2
+    machine — the real-AWS gate run's job."""
+    url, root = runtime
+    durable = tmp_path_factory.mktemp("pool_durable")
+    r = httpx.put(f"{url}/api/catchment/settings",
+                  json={"data_root": str(durable), "mode": "empty"}, timeout=10.0)
+    assert r.status_code == 200, r.text
+    r = httpx.post(f"{url}/api/catchment/duck-pools",
+                   json={"name": "devpool", "provider": "local"}, timeout=10.0)
+    assert r.status_code == 200, r.text
+
+    _deploy_demo(url)
+    for name in _PONDS:
+        r = httpx.post(f"{url}/api/ponds/{name}/duck", json={"duck_target": "devpool"}, timeout=10.0)
+        assert r.status_code == 200, r.text
+
+    # The engine models every Pond on the SHARED Pool identity (same-Pool end_f gating between them).
+    for p in httpx.get(f"{url}/api/status", timeout=5.0).json()["ponds"]:
+        assert p["pool"] == "pool:devpool", f"{p['name']} not on the shared Pool: {p['pool']}"
+
+    httpx.post(f"{url}/api/ponds/reports/pulse", timeout=5.0)
+    assert _wait(lambda: (_pond_status(url, "reports") or {}).get("end_f") is not None, timeout=90.0), \
+        "the chain never completed on the Pool"
+
+    agent_root = root / "pools" / "devpool"
+    for name in _PONDS:
+        # Published on the POOL's filesystem (the co-resident handoff), not the Catchment's.
+        assert (agent_root / "ponds" / name / "m1" / "data" / "_trickle.json").exists(), \
+            f"{name}: no publish under the Pool agent's root"
+        assert not (root / "ponds" / name / "m1" / "data" / "_trickle.json").exists(), \
+            f"{name}: published under the Catchment root — it did not run on the Pool"
+    # Each line persists to the durable plane (a Pool Duck is async_persist, like a Catchment-Pool one).
+    for name in _PONDS:
+        assert _wait(lambda n=name: (_pond_status(url, n) or {}).get("persisted_f") is not None,
+                     timeout=45.0), f"{name}: persisted_f never advanced"
+        assert (durable / name / "m1" / "data" / "_trickle.json").exists(), \
+            f"{name}: no durable mirror"
+    # The Catchment (a different Pool) reads the output from the durable plane.
+    r = httpx.post(f"{url}/api/query/count", json={"pond": "reports", "table": "daily_summary"}, timeout=10.0)
+    if r.status_code != 200:  # table name differs per demo — fall back to the table list
+        tables = httpx.get(f"{url}/api/ponds/reports/tables", timeout=10.0).json()["tables"]
+        assert tables, "reports published no readable tables to the durable plane"
 
 
 _TPCDS_PONDS = ("tpcds_sales", "tpcds_items", "tpcds_stores", "tpcds_priced",

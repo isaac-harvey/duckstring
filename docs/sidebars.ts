@@ -32,6 +32,7 @@ const sidebars: SidebarsConfig = {
       label: 'Guides',
       items: [
         'guides/running-a-catchment',
+        'guides/cloud',
         'guides/creating-a-pond',
         'guides/local-testing',
         'guides/deploying',
@@ -45,6 +46,7 @@ const sidebars: SidebarsConfig = {
         'guides/dbt',
         'guides/connecting-catchments',
         'guides/querying-data',
+        'guides/lineage',
         'guides/web-ui',
       ],
     },

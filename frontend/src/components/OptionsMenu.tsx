@@ -6,6 +6,7 @@ import { useIsMobile } from '@/lib/useIsMobile';
 import type { AccessLevel } from '@/lib/api';
 import { SecretsMenu } from './SecretsMenu';
 import { AlertsMenu } from './AlertsMenu';
+import { CloudMenu } from './CloudMenu';
 
 // The caller's API access level as three capabilities — Manage | Demand | Read — each prefixed with a
 // green ✓ when the key grants it, a grey – when not. (Moved off the always-on badge into the menu.)
@@ -77,14 +78,18 @@ export function TopBar() {
   const collapsedPonds = useLiveStore((s) => s.collapsedPonds);
   const setAllCollapsed = useLiveStore((s) => s.setAllCollapsed);
   const enterSelector = useLiveStore((s) => s.enterSelector);
+  const setCatalogOpen = useLiveStore((s) => s.setCatalogOpen);
   // Stable key over the collapsible Pond ids — avoids re-rendering on every poll.
   const collapsibleKey = useLiveStore((s) =>
     [...new Set(Object.values(s.ripples).map((r) => r.pondId))].sort().join(',')
   );
 
   const [open, setOpen] = useState(false);
-  const [panel, setPanel] = useState<'secrets' | 'alerts' | null>(null);
+  const [panel, setPanel] = useState<'secrets' | 'alerts' | 'cloud' | null>(null);
   const isMobile = useIsMobile();
+  // Cloud is enabled but its credentials are being rejected — remote compute is silently broken, so we
+  // flag it persistently (on the closed bar, and beside the Cloud menu item) not just inside the menu.
+  const credsInvalid = useLiveStore((s) => !!(s.cloud?.cloud_enabled && s.cloud?.creds_valid === false));
 
   const label = catchment?.name || (catchment?.id ? catchment.id.slice(0, 8) : 'Catchment');
   const isFull = accessLevel === 'full';
@@ -133,15 +138,23 @@ export function TopBar() {
           <AccessChips />
         </div>
         <button
-          aria-label="Options"
+          aria-label={credsInvalid ? 'Options — cloud credentials invalid' : 'Options'}
+          title={credsInvalid ? 'Cloud credentials are not authenticating — see Options → Cloud' : undefined}
           onClick={() => (open ? close() : setOpen(true))}
           style={{
-            marginLeft: 'auto', alignSelf: 'stretch', background: open ? '#27272a' : 'transparent',
-            border: '1px solid #27272a', borderRadius: 6, padding: '0 9px', color: open ? '#e4e4e7' : '#a1a1aa',
-            cursor: 'pointer', fontFamily: 'inherit', fontSize: 14, lineHeight: 1,
+            position: 'relative', marginLeft: 'auto', alignSelf: 'stretch',
+            background: open ? '#27272a' : 'transparent',
+            border: `1px solid ${credsInvalid ? '#f59e0b' : '#27272a'}`, borderRadius: 6, padding: '0 9px',
+            color: open ? '#e4e4e7' : '#a1a1aa', cursor: 'pointer', fontFamily: 'inherit', fontSize: 14, lineHeight: 1,
           }}
         >
           ☰
+          {credsInvalid && (
+            <span style={{
+              position: 'absolute', top: -4, right: -4, width: 9, height: 9, borderRadius: '50%',
+              background: '#f59e0b', border: '1px solid #15151a',
+            }} />
+          )}
         </button>
       </div>
 
@@ -160,6 +173,10 @@ export function TopBar() {
               <span style={{ color: '#71717a', fontSize: 11 }}>{allCollapsed ? '▸' : '▾'}</span>
             </button>
           )}
+          <button style={menuItem} onClick={() => { setCatalogOpen(true); close(); }}>
+            <span>Catalog</span>
+            <span style={{ color: '#71717a', fontSize: 11 }}>⊟</span>
+          </button>
           {isFull && (
             <button
               style={{ ...menuItem, color: panel === 'secrets' ? '#e4e4e7' : '#d4d4d8' }}
@@ -179,6 +196,15 @@ export function TopBar() {
             </button>
           )}
           {isFull && (
+            <button
+              style={{ ...menuItem, color: panel === 'cloud' ? '#e4e4e7' : '#d4d4d8' }}
+              onClick={() => setPanel(panel === 'cloud' ? null : 'cloud')}
+            >
+              <span>Cloud {credsInvalid && <span style={{ color: '#f59e0b' }} title="Credentials invalid">⚠</span>}</span>
+              <span style={{ color: '#71717a', fontSize: 11 }}>›</span>
+            </button>
+          )}
+          {isFull && (
             <button style={{ ...menuItem, color: '#d4d4d8' }} onClick={() => { enterSelector(); close(); }}>
               <span>Pond Actions…</span>
             </button>
@@ -186,6 +212,7 @@ export function TopBar() {
 
           {panel === 'secrets' && <Popout onClose={() => setPanel(null)}><SecretsMenu onClose={() => setPanel(null)} /></Popout>}
           {panel === 'alerts' && <Popout onClose={() => setPanel(null)}><AlertsMenu onClose={() => setPanel(null)} /></Popout>}
+          {panel === 'cloud' && <CloudMenu onClose={() => setPanel(null)} />}
         </div>
       )}
     </div>

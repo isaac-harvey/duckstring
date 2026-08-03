@@ -38,3 +38,48 @@ def pond_data_dir(root: Path, pond_name: str, major: int, data_root: str | None 
 
 def pond_connect(root: Path, pond_name: str, major: int) -> duckdb.DuckDBPyConnection:
     return connect(pond_registry_path(root, pond_name, major))
+
+
+def local_publish_f(local: Storage) -> str | None:
+    """The freshness the LOCAL publish backs, from its ``_trickle.json`` sidecar (the max stamp across
+    its tables) — ``None`` if there is no readable sidecar. Same content anchor the Pool-loss
+    reconciliation uses."""
+    from ..trickle_io import load_sidecar
+    from .driver import _plane_freshness
+
+    try:
+        return _plane_freshness(load_sidecar(local))
+    except Exception:
+        return None
+
+
+def resolve_data_dir(root: Path, pond_name: str, major: int, data_root: str | None = None,
+                     expected_f: str | None = None) -> Storage:
+    """The data-plane location to **read** one major line from, resolved local-first (plans/persist.md):
+    a Pond co-located on this Pool (its Duck publishes to the local layout) is read from the local root —
+    the fast handoff — and only a Pond with no local publish (a remote-Pool Duck writing straight to the
+    data root) is read from ``data_root``. The local ``_trickle.json`` sidecar is the publish marker:
+    every export writes one, so its presence = this line publishes here.
+
+    Writers never use this — a publish location is explicit (:func:`pond_data_dir`), not probed.
+
+    ``expected_f`` is the freshness the *Catchment* knows this line has published (its ``changed_f`` —
+    the content anchor, since a pass publishes nothing). Given it, a local publish that is BEHIND that
+    is treated as the stale leftover it is and the read falls through to the data root. That closes the
+    move-to-a-remote-Pool hole: the local sidecar survives the move and would otherwise silently shadow
+    fresher remote data — a wrong answer, not just a slow one. Without ``expected_f`` (a puddle run, or
+    any caller with no engine state) the probe is the old presence check, which is never wrong for a
+    line that has not moved.
+
+    Reading the local sidecar is one small local file read; the data root is only touched when the local
+    copy actually looks stale, so the fast handoff keeps costing nothing."""
+    if data_root is None:
+        return pond_data_dir(root, pond_name, major, None)
+    local = pond_data_dir(root, pond_name, major, None)
+    if not local.exists("_trickle.json"):
+        return pond_data_dir(root, pond_name, major, data_root)
+    if expected_f is not None:
+        local_f = local_publish_f(local)
+        if local_f is None or local_f < expected_f:
+            return pond_data_dir(root, pond_name, major, data_root)
+    return local

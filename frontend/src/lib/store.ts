@@ -12,6 +12,7 @@ import type {
   WindowRow,
 } from './types';
 import {
+  fetchCloudSettings,
   fetchStatus,
   fetchView,
   fetchRuns,
@@ -23,6 +24,7 @@ import {
   type BatchOp,
   clearFailure,
   setBudget,
+  setDuck,
   addWindow,
   removeWindow,
   controlSpout,
@@ -31,6 +33,8 @@ import {
   setApiKey,
   UnauthorizedError,
   type AccessLevel,
+  type CloudGate,
+  type DuckOverrideBody,
   type StatusPayload,
   type RawPond,
   type RawRipple,
@@ -67,7 +71,7 @@ function nodeView(n: RawPond | RawRipple, dMs: number): NodeView {
   };
 }
 
-function mapRun(r: RawPondRun): PondRun {
+export function mapRun(r: RawPondRun): PondRun {
   return {
     pond: r.pond,
     id: r.id,
@@ -79,6 +83,10 @@ function mapRun(r: RawPondRun): PondRun {
     status: r.status,
     error: r.error,
     traceback: r.traceback,
+    persist: r.persist
+      ? { status: r.persist.status, error: r.persist.error,
+          startedAt: r.persist.started_at, finishedAt: r.persist.finished_at }
+      : r.persist,
     ripples: r.ripples?.map((rr) => ({
       ripple: rr.ripple,
       startedAt: rr.started_at,
@@ -113,6 +121,7 @@ export function atLeast(level: AccessLevel, required: AccessLevel): boolean {
 interface StatusSlice {
   catchment: { id: string | null; name: string | null } | null;
   accessLevel: AccessLevel;
+  cloud: CloudGate | null; // the cloud-enable gate (remote data root + AWS creds); null until first /status
   ponds: Record<PondId, Pond>;
   ripples: Record<RippleId, Ripple>;
   pondViews: Record<PondId, NodeView>;
@@ -121,7 +130,7 @@ interface StatusSlice {
   triggers: Record<PondId, TriggerView>;
 }
 
-function transformStatus(payload: StatusPayload): StatusSlice {
+function transformStatus(payload: StatusPayload): Omit<StatusSlice, 'cloud'> {
   const ponds: Record<PondId, Pond> = {};
   const ripples: Record<RippleId, Ripple> = {};
   const pondViews: Record<PondId, NodeView> = {};
@@ -137,7 +146,7 @@ function transformStatus(payload: StatusPayload): StatusSlice {
     if (p.is_draw && !consumed.has(p.id)) continue;
     ponds[p.id] = {
       id: p.id, name: p.name, kind: p.kind,
-      isDraw: p.is_draw ?? false, isSpout: p.is_spout ?? false, sources: [],
+      isDraw: p.is_draw ?? false, isSpout: p.is_spout ?? false, dbt: p.dbt ?? false, sources: [],
     };
     pondInfo[p.id] = {
       version: p.version,
@@ -156,8 +165,11 @@ function transformStatus(payload: StatusPayload): StatusSlice {
       missingSources: p.missing_sources ?? [],
       blockedBy: p.blocked_by ?? [],
       error: p.error,
+      failureKind: p.failure_kind ?? null,
       immediateRetries: p.immediate_retries,
       sourceRetries: p.source_retries,
+      duck: p.duck ?? null,
+      flockError: p.flock_error ?? null,
       spout: p.spout ?? null,
     };
     pondViews[p.id] = nodeView(p, p.d_ms);
@@ -187,6 +199,8 @@ function transformStatus(payload: StatusPayload): StatusSlice {
     // Default to 'full' when absent — keeps an open/unauthed Catchment (and any transitional backend)
     // showing every control, matching pre-ladder behaviour.
     accessLevel: payload.access_level ?? 'full',
+    // NOTE: `cloud` is NOT in the ~1 s status payload anymore — it's polled slowly via refreshCloud(). We
+    // intentionally omit it here so the existing value is preserved across a status refresh.
     ponds, ripples, pondViews, rippleViews, pondInfo, triggers,
   };
 }
@@ -218,6 +232,8 @@ export interface LiveState extends StatusSlice {
 
   // The Pond whose exported tables are open in the full-screen data viewer (null = closed). The modal
   // owns its own table-selection / SQL / windowing state; the store just tracks the target.
+  catalogOpen: boolean;
+  setCatalogOpen(open: boolean): void;
   dataViewerPondId: PondId | null;
   openDataViewer(id: PondId): void;
   closeDataViewer(): void;
@@ -232,6 +248,7 @@ export interface LiveState extends StatusSlice {
   windowsByPond: Record<PondId, WindowRow[]>;
 
   refresh(): Promise<void>;
+  refreshCloud(): Promise<void>;  // the cloud gate on its own slow poll (off the ~1 s status loop)
   submitApiKey(key: string): Promise<void>;
   refreshWindows(pond: PondId): Promise<void>;
   refreshRunDetail(): Promise<void>;
@@ -278,6 +295,7 @@ export interface LiveState extends StatusSlice {
 
   clearFailure(pond: PondId): Promise<void>;
   setBudget(pond: PondId, immediateRetries: number, sourceRetries: number): Promise<void>;
+  setDuck(pond: PondId, body: DuckOverrideBody): Promise<void>;
 
   addWindow(pond: PondId, body: AddWindowBody): Promise<void>;
   removeWindow(pond: PondId, name: string): Promise<void>;
@@ -334,6 +352,7 @@ function closure(seeds: PondId[], adj: Record<string, string[]>): Set<string> {
 export const useLiveStore = create<LiveState>((set, get) => ({
   catchment: null,
   accessLevel: 'full', // until the first /api/status; open Catchments stay 'full'
+  cloud: null,
   ponds: {},
   ripples: {},
   pondViews: {},
@@ -349,6 +368,8 @@ export const useLiveStore = create<LiveState>((set, get) => ({
   selectedRippleId: null,
   selectedTriggerId: null,
   collapsedPonds: {},
+  catalogOpen: false,
+  setCatalogOpen: (open) => set({ catalogOpen: open }),
   dataViewerPondId: null,
 
   runs: [],
@@ -361,6 +382,17 @@ export const useLiveStore = create<LiveState>((set, get) => ({
   windowsByPond: {},
   lineage: null,
   statusVersion: null,
+
+  async refreshCloud() {
+    // The cloud gate changes rarely and its backend checks (secret store, env, the TTL-throttled STS
+    // refresh) don't belong on the engine-state hot path — so it rides its own slow poll. Failures leave
+    // the last good value (and never disturb the status loop).
+    try {
+      set({ cloud: await fetchCloudSettings() });
+    } catch {
+      /* keep the last cloud gate */
+    }
+  },
 
   async refresh() {
     let payload;
@@ -582,6 +614,7 @@ export const useLiveStore = create<LiveState>((set, get) => ({
   clearFailure: (pond) => act(get, set, () => clearFailure(pond)),
   setBudget: (pond, immediateRetries, sourceRetries) =>
     act(get, set, () => setBudget(pond, immediateRetries, sourceRetries)),
+  setDuck: (pond, body) => act(get, set, () => setDuck(pond, body)),
 
   // Spout control (the standing Wake) — wake/force/sleep/kill/clear/resync on a Spout node id.
   spoutControl: (spoutId, action) => act(get, set, () => controlSpout(spoutId, action)),

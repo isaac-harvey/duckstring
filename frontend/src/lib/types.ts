@@ -18,6 +18,7 @@ export interface Pond {
   kind: string; // inlet | pond | outlet
   isDraw: boolean; // a Pond Draw — fed by a duct from an upstream Catchment
   isSpout: boolean; // a Spout — egresses its source's output to an external system (terminal)
+  dbt: boolean; // a dbt-mode Pond — its Ripples are dbt models (no @ripple code)
   sources: PondId[];
 }
 
@@ -66,8 +67,14 @@ export interface PondInfo {
   missingSources: string[]; // declared Sources absent from the Catchment (pond keys "name@major")
   blockedBy: string[]; // required Sources that are down — the reason for an upstream block
   error: string | null; // failure message of the freshest failed Run, when failed
+  failureKind: 'contract' | 'error' | null; // the failed sub-reason (contract = the additive-schema gate refused the publish)
   immediateRetries: number; // live budget: Ripple retries within a Run
   sourceRetries: number; // live budget: Runs retried on a Source change
+  // Effective compute config (Duck target/size + Flock posture) + declared/override; null for Draws/Spouts.
+  duck: import('./api').DuckConfig | null;
+  // The most recent Flock dispatch failure — a failed dispatch still completes the run on local
+  // compute, so this warning is the only visible tell that the Flock is degrading. Null when clean.
+  flockError: string | null;
   // Spout nodes only: its egress config + standing-Wake armed state.
   spout?: { destination: string; table: string | null; mode: string; armed: boolean } | null;
 }
@@ -95,6 +102,8 @@ export interface PondRun {
   status: string;
   error: string | null; // Pond-level failure message (dead/silent Duck, ledger error), if any
   traceback: string | null; // full traceback for a Pond-level failure, if any
+  // The async mirror to the durable plane (plans/persist.md) — its own log item, landing after the run.
+  persist?: { status: string; error: string | null; startedAt: string | null; finishedAt: string | null } | null;
   ripples?: RippleRun[];
 }
 

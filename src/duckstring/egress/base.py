@@ -29,11 +29,16 @@ class Capabilities:
     - ``supports_delete`` — can remove rows (a merge Trickle's retractions).
     - ``transactional`` — applies atomically and owns its watermark in-destination (exactly-once);
       otherwise the Catchment owns the watermark and delivery is idempotent at-least-once.
+    - ``mirrors_layout`` — can mirror a Trickle table's **published collection** (per-run parts +
+      changelog/band/base tiers + sidecar) to the destination, syncing only the new/changed artifacts —
+      the incremental object-store path a Spout opts into with ``mode=append``. Parts are immutable and
+      idempotent by name, so the file-set diff *is* the watermark.
     """
 
     supports_delta: bool
     supports_delete: bool
     transactional: bool
+    mirrors_layout: bool = False
 
 
 @runtime_checkable

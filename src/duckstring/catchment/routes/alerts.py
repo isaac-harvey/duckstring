@@ -27,6 +27,7 @@ class _ChannelBody(BaseModel):
     scope: Optional[str] = None          # "name@major" (one line), "name" (any major), or None (catchment-wide)
     events: str = "all"                  # CSV of kinds, or "all"
     stale_ms: Optional[int] = None       # freshness-SLA bound; None = no freshness monitoring
+    renotify_ms: Optional[int] = None    # re-notify interval while an episode persists; None = once per episode
 
 
 @router.get("/alerts", dependencies=[auth.full])
@@ -37,7 +38,8 @@ def list_alerts(request: Request):
 @router.post("/alerts", dependencies=[auth.full])
 def add_alert(request: Request, body: _ChannelBody):
     try:
-        _driver(request).add_channel(body.name, body.destination, body.scope, body.events, body.stale_ms)
+        _driver(request).add_channel(body.name, body.destination, body.scope, body.events, body.stale_ms,
+                                     body.renotify_ms)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     return {"ok": True, "name": body.name}

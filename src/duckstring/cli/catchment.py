@@ -232,8 +232,13 @@ def init(
     ),
     header: Optional[list[str]] = typer.Option(None, "--header", help=_HEADER_HELP),
     yes: bool = typer.Option(False, "--yes", "-y", help="Automatically set as default catchment."),
+    no_start: bool = typer.Option(
+        False, "--no-start",
+        help="Register (and mint keys) without starting the server — for scripted provisioning where a "
+             "supervisor (systemd, a container runtime) owns the process via `catchment start`.",
+    ),
 ) -> None:
-    """Create and register a new local Catchment, then start the server."""
+    """Create and register a new local Catchment, then start the server (or stop short with --no-start)."""
     from .config import CONFIG_DIR, list_catchments
 
     if generate_key and key:
@@ -283,6 +288,9 @@ def init(
         _register_or_abort(name, url=url, kind="local", root=str(root_dir), key=key, headers=headers, **store_kw)
         _offer_default(name, yes)
 
+    if no_start:
+        typer.echo(f"Registered '{name}' (not started). Start it with:  duckstring catchment start {name}")
+        return
     _launch(name, url, root_dir, key, **store_kw)
 
 
@@ -339,6 +347,32 @@ def rotate_keys(
     if "full" in keys:
         update_catchment_key(cname, keys["full"])
     _print_keys_panel(cname, keys)
+
+
+@app.command()
+def settings(
+    catchment: Optional[str] = typer.Option(None, "--catchment", "-c", help="Catchment (uses default if omitted)."),
+    data_root: Optional[str] = typer.Option(
+        None, "--data-root", help="Attach the data-plane target (s3://…, gs://…, or a shared path)."),
+) -> None:
+    """Show the Catchment's cloud config, or with --data-root attach the object-store data plane.
+    Attaching is set-once in practice — refused once the Catchment has published data (it would strand
+    it). Remote compute (Duck Pools / Flock) unlocks when the data root is remote AND AWS creds are set."""
+    from . import _http
+    from .config import resolve_catchment
+
+    _, cfg = resolve_catchment(catchment)
+    if data_root is not None:
+        _http.put(f"{cfg['url']}/api/catchment/settings", auth=cfg, json={"data_root": data_root})
+        typer.echo(f"Data root set to {data_root}.")
+    got = _http.get(f"{cfg['url']}/api/catchment/settings", auth=cfg).json()
+    typer.echo(f"data root:  {got.get('data_root') or '(local)'}")
+    typer.echo(f"AWS creds:  {'yes' if got.get('aws_configured') else 'no'}")
+    typer.echo(f"cloud:      {'enabled' if got.get('cloud_enabled') else 'disabled'}"
+               + ("" if got.get("cloud_enabled")
+                  else "  (needs a remote data root + AWS credentials)"))
+    if got.get("has_data"):
+        typer.echo("note:       the data root is now set-once (the Catchment has published data).")
 
 
 @app.command()

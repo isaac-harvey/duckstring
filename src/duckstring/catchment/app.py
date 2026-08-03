@@ -12,7 +12,7 @@ from fastapi.staticfiles import StaticFiles
 from . import auth
 from .db import connect, ensure_identity, migrate
 from .driver import Driver
-from .launcher import NoopLauncher, SubprocessLauncher
+from .launcher import NoopLauncher, SubprocessLauncher, load_launcher_class
 from .routes import router
 
 _STATIC_DIR = Path(__file__).parent / "static"
@@ -41,15 +41,70 @@ async def _lifespan(app: FastAPI):
         # keys, so rotating those never disrupts running Ducks).
         # base_url None = unknown (the platform picked the bind address): the launcher defers spawns
         # until the dial-back middleware learns the address from the first request.
-        launcher = SubprocessLauncher(
-            app.state.root, base_url, token=app.state.duck_token, data_root=app.state.data_root
-        )
+        # DUCKSTRING_DUCK_LAUNCHER=module:Class (prereqs D6) swaps the implementation — same
+        # constructor contract, same interface; the Duck still dials back over the duck channel.
+        if os.environ.get("DUCKSTRING_DUCK_LAUNCHER"):
+            # A fully-custom launcher (D6) takes over entirely — same constructor contract as before.
+            launcher_cls = load_launcher_class(os.environ["DUCKSTRING_DUCK_LAUNCHER"])
+            launcher = launcher_cls(
+                app.state.root, base_url, token=app.state.duck_token, data_root=app.state.data_root
+            )
+        else:
+            # The dispatching launcher: `catchment`-targeted Ponds on this box (subprocess), pool/
+            # dedicated ones on EC2 — the same code whether the Catchment is local or hosted. The EC2
+            # backend is only built when cloud is enabled (remote data root + AWS creds); otherwise
+            # remote targets degrade to local (plans/cloud-config.md).
+            from .cloud_backends import build_remote_backends
+            from .launcher import DispatchingLauncher
+
+            local = SubprocessLauncher(
+                app.state.root, base_url, token=app.state.duck_token, data_root=app.state.data_root
+            )
+            # The remote backends (Fargate/EC2 + the shared dial-back) exist only when cloud is enabled
+            # (remote data root + AWS creds); otherwise remote targets degrade to local. The same builder
+            # re-attaches them live when creds / the data root change at runtime (see cloud_backends).
+            remotes, dialback = build_remote_backends(
+                app.state.root, base_url, app.state.duck_token, app.state.data_root, app.state.secret_store)
+            launcher = DispatchingLauncher(local, remotes, dialback=dialback, default_provider="fargate")
     driver = Driver(app.state.db, app.state.root, base_url, launcher, data_root=app.state.data_root)
     app.state.driver = driver
     app.state.launcher = launcher
 
+    # Boot credential check: the cloud gate is presence-based (deterministic, network-free), so a
+    # present-but-rejected key would show "enabled" while every remote launch fails. Validate the creds
+    # actually authenticate in the background — the result caches on app.state.cloud_creds (surfaced on
+    # /api/status so the UI can persistently warn) and logs a warning. Non-blocking, never fails boot.
+    # Validity is surfaced, not folded into the gate (a transient STS blip must not strand a running setup).
+    from .cloud_backends import refresh_credential_status
+    app.state.cloud_creds = None
+    refresh_credential_status(app.state, force=True)
+
     # Restore: resume any Pond Runs that were in flight when the Catchment last stopped.
     driver.resume_incomplete()
+
+    # Data-serving wire adapters (plans/data-serving.md): the Postgres wire (default) + Arrow Flight SQL,
+    # each on its own port when configured, sharing the sandboxed serving core. Put TLS + a network ACL
+    # in front for a hosted Catchment (the password is an API key).
+    app.state.serve_wires = []
+    pg_port = os.environ.get("DUCKSTRING_SERVE_PG_PORT")
+    if pg_port:
+        from .pg_wire import PgWireServer
+
+        pg = PgWireServer(driver, api_key=app.state.api_key,
+                          host=os.environ.get("DUCKSTRING_SERVE_HOST", "127.0.0.1"), port=int(pg_port))
+        pg.start()
+        app.state.serve_wires.append(pg)
+    flight_port = os.environ.get("DUCKSTRING_SERVE_FLIGHT_PORT")
+    if flight_port:
+        try:
+            from .flight_sql import FlightSqlServer
+
+            fl = FlightSqlServer(driver, api_key=app.state.api_key,
+                                 host=os.environ.get("DUCKSTRING_SERVE_HOST", "127.0.0.1"), port=int(flight_port))
+            fl.start()
+            app.state.serve_wires.append(fl)
+        except ImportError:
+            pass  # Flight needs pyarrow.flight; skip if unavailable
 
     from .alert_worker import run_alert_worker
     from .egress_worker import run_egress_worker
@@ -97,6 +152,8 @@ async def _lifespan(app: FastAPI):
             except asyncio.CancelledError:
                 pass
         launcher.shutdown_all()
+        for wire in getattr(app.state, "serve_wires", []):
+            wire.stop()
         if app.state.data_lease is not None:
             from .data_lease import release_lease
 
@@ -134,6 +191,12 @@ def create_app(
     migrate(con)
     ensure_identity(con, name or os.environ.get("DUCKSTRING_CATCHMENT_NAME"))
 
+    # The data root can be a persisted Catchment setting (attached via the API after the Catchment is
+    # made — plans/cloud-config.md), behind an explicit argument and the env for platform hosting.
+    if not data_root:
+        from .cloud import DATA_ROOT_KEY, get_setting
+        data_root = get_setting(con, DATA_ROOT_KEY)
+
     # Writer lease on an external data root — refuse to start if a *different* live Catchment owns it (two
     # Catchments racing one lake's Iceberg catalog would dangle its pointer). A same-id restart reclaims
     # instantly; only engaged for an external DUCKSTRING_DATA_ROOT, so the local default is untouched.
@@ -167,6 +230,10 @@ def create_app(
     from .secrets import SecretStore
     app.state.secret_store = SecretStore(root)
     credentials.set_secret_provider(app.state.secret_store.get)
+    # Give the AWS_* secrets teeth: load them into the environment so botocore's chain uses them (the
+    # enable-by-secret cloud flow). Real env wins.
+    from . import cloud as _cloud
+    _cloud.load_aws_env(app.state.secret_store)
     # The address Ducks dial back to: explicit argument (the CLI passes its bind address), or the
     # environment, or None — unknown, because the host platform picks the bind address (e.g. Posit
     # Connect). When None it is learned from the first request's ASGI scope below.

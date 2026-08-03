@@ -12,6 +12,11 @@ Metric families (all `duckstring_*`):
   pond_failed/blocked/killed    — 0/1 state flags per Pond
   pond_runs_completed_total     — completed Pond Runs (rebuilt from the DB → monotonic across restarts)
   pond_failures_total           — cumulative failed Pond Runs per (pond, major)
+  pond_run_seconds_total        — cumulative Duck execution seconds (summed Ripple-Run spans) — cost signal
+  pond_duck_target              — 1 for where a Pond's Duck runs (catchment/pool/dedicated)
+  pond_flock                    — 1 for a Pond's effective Flock posture (mode + engine)
+  flock_dispatched_total        — Flock dispatches that ran on the engine (accumulated from Duck reports)
+  flock_dispatch_failures_total — dispatches that failed and DEGRADED TO LOCAL (a broken Flock's tell)
   spout_delivery_lag_seconds    — now − delivered_f, per Spout
   spout_failed                  — 0/1 per Spout
   alert_deliveries_total        — queued notifications by status (sent/pending/failed)
@@ -73,6 +78,37 @@ def render_metrics(snap: dict) -> str:
     family("pond_failures_total", "counter", "Cumulative failed Pond Runs.")
     for n in ponds:
         line("pond_failures_total", snap["failures"].get((n["name"], n["major"]), 0), pond=n["name"], major=n["major"])
+
+    # Compute-cost signals (plans/cloud-config.md): the Duck's cumulative execution time + where it runs
+    # + its Flock posture, so a scrape can attribute spend across the fleet.
+    family("pond_run_seconds_total", "counter", "Cumulative Duck execution seconds (summed Ripple-Run spans).")
+    for n in ponds:
+        line("pond_run_seconds_total", snap["runtimes"].get((n["name"], n["major"]), 0),
+             pond=n["name"], major=n["major"])
+
+    family("pond_duck_target", "gauge", "1 for the Duck target a Pond runs on (catchment/pool/dedicated).")
+    for n in ponds:
+        if "duck_target" in n:
+            line("pond_duck_target", 1, pond=n["name"], major=n["major"], target=n["duck_target"])
+
+    family("pond_flock", "gauge", "1 for a Pond's effective Flock posture (mode + engine).")
+    for n in ponds:
+        if "flock_mode" in n:
+            line("pond_flock", 1, pond=n["name"], major=n["major"],
+                 mode=n["flock_mode"], engine=n["flock_engine"])
+
+    # A failed dispatch still runs local (the fallback contract), so a broken Flock is otherwise
+    # invisible while quietly paying full local compute — these counters are the tell.
+    family("flock_dispatched_total", "counter", "Flock dispatches that ran on the engine.")
+    for n in ponds:
+        if "flock_dispatched" in n:
+            line("flock_dispatched_total", n["flock_dispatched"], pond=n["name"], major=n["major"])
+
+    family("flock_dispatch_failures_total", "counter",
+           "Flock dispatches that failed and degraded to local compute.")
+    for n in ponds:
+        if "flock_dispatch_failures" in n:
+            line("flock_dispatch_failures_total", n["flock_dispatch_failures"], pond=n["name"], major=n["major"])
 
     family("spout_delivery_lag_seconds", "gauge", "Seconds since a Spout last delivered (now − delivered_f).")
     for n in spouts:

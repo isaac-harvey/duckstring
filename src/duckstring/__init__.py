@@ -5,7 +5,6 @@ from .core import (
     Catchment,
     Pond,
     Puddle,
-    Ripple,
     puddle,
     ripple,
 )
@@ -19,7 +18,6 @@ __all__ = [
     "Catchment",
     "Pond",
     "Puddle",
-    "Ripple",
     "puddle",
     "ripple",
     "__version__",

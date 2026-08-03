@@ -68,6 +68,7 @@ export function AlertChannelForm({ fixedScope, onAdded }: { fixedScope?: string;
   const [scope, setScope] = useState('');
   const [events, setEvents] = useState<EventKind[]>(DEFAULT_EVENTS);
   const [stale, setStale] = useState('');
+  const [renotify, setRenotify] = useState('');
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
@@ -77,8 +78,10 @@ export function AlertChannelForm({ fixedScope, onAdded }: { fixedScope?: string;
   const submit = async () => {
     setErr(null);
     let staleMs: number | null;
+    let renotifyMs: number | null;
     try {
       staleMs = parseStale(stale);
+      renotifyMs = parseStale(renotify);
     } catch (e) {
       setErr(e instanceof Error ? e.message : 'bad duration');
       return;
@@ -94,11 +97,12 @@ export function AlertChannelForm({ fixedScope, onAdded }: { fixedScope?: string;
     const eventsStr = EVENT_KINDS.every((k) => events.includes(k)) ? 'all' : events.join(',');
     setBusy(true);
     try {
-      await addAlert({ name: finalName, destination: destination.trim(), scope: scopeName, events: eventsStr, stale_ms: staleMs });
+      await addAlert({ name: finalName, destination: destination.trim(), scope: scopeName, events: eventsStr, stale_ms: staleMs, renotify_ms: renotifyMs });
       setName('');
       setDestination('');
       setScope('');
       setStale('');
+      setRenotify('');
       setEvents(DEFAULT_EVENTS);
       onAdded();
     } catch (e) {
@@ -127,6 +131,8 @@ export function AlertChannelForm({ fixedScope, onAdded }: { fixedScope?: string;
         <input value={stale} onChange={(e) => setStale(e.target.value)}
           placeholder="freshness SLA (e.g. 1h) — alert when stale longer" style={input} />
       )}
+      <input value={renotify} onChange={(e) => setRenotify(e.target.value)}
+        placeholder="re-notify every (e.g. 6h) — while still failing/stale; blank = once" style={input} />
       <div style={{ fontSize: 10, color: '#52525b', lineHeight: 1.5 }}>
         Use <span style={{ color: '#71717a' }}>{'${secret:NAME}'}</span> / <span style={{ color: '#71717a' }}>{'${env:NAME}'}</span> for tokens; resolved only at send time.
       </div>
@@ -172,7 +178,7 @@ export function ChannelRow({ channel, onChanged }: { channel: RawAlertChannel; o
         </span>
       </div>
       <div style={{ fontSize: 10, color: '#71717a', marginTop: 2 }}>
-        {channel.scope ?? 'all ponds'} · {channel.events}{channel.stale_ms ? ` · SLA ${fmtStale(channel.stale_ms)}` : ''}
+        {channel.scope ?? 'all ponds'} · {channel.events}{channel.stale_ms ? ` · SLA ${fmtStale(channel.stale_ms)}` : ''}{channel.renotify_ms ? ` · re-notify ${fmtStale(channel.renotify_ms)}` : ''}
       </div>
       <div style={{ fontSize: 10, color: '#52525b', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
         {channel.destination}

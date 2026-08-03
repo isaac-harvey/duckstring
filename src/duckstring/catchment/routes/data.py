@@ -11,13 +11,33 @@ import zipfile
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import Response
 from pydantic import BaseModel
 
 from .. import auth
 
 router = APIRouter()
+
+
+def _require_serviceable(request: Request, pond: str, major: int, table: Optional[str], full: bool) -> None:
+    """Governance for the per-pond browse: a non-full caller may only touch **serviceable** tables (their
+    base exposed). A Trickle companion (``X__changelog``/``__band``/``__droplog``/``__base``) resolves to
+    its base table. Full callers see everything. Raises 403 otherwise."""
+    if full or not table:
+        return
+    from ...keys import pond_key
+    from ...trickle_io import base_table_name
+
+    driver = getattr(request.app.state, "driver", None)
+    if driver is None:
+        return  # no engine (exported data outlives a deployment) — nothing to gate against
+    try:
+        serviceable = driver.serviceable(pond_key(pond, major))
+    except Exception:
+        serviceable = set()
+    if base_table_name(table) not in serviceable:
+        raise HTTPException(status_code=403, detail=f"table {table!r} is not serviceable")
 
 
 def _resolve_major(request: Request, pond_name: str, major: Optional[int], version: Optional[str]) -> int:
@@ -46,10 +66,30 @@ def _resolve_major(request: Request, pond_name: str, major: Optional[int], versi
 
 
 def _data_dir(request: Request, pond_name: str, major: int):
-    from ..registry import pond_data_dir
+    # Local-first read (plans/persist.md): a line publishing on this Pool is read from the local layout
+    # (fast, and fresher than the async persist); only a remote-published line reads the data root.
+    from ..registry import resolve_data_dir
 
     data_root = getattr(request.app.state, "data_root", None)
-    return pond_data_dir(Path(request.app.state.root), pond_name, major, data_root)
+    # expected_f = what the engine says this line published, so a stale local publish (a line that MOVED
+    # to a remote Pool) can't answer a query with old data.
+    driver = getattr(request.app.state, "driver", None)
+    expected_f = driver.published_f(pond_name, major) if driver is not None else None
+    return resolve_data_dir(Path(request.app.state.root), pond_name, major, data_root, expected_f=expected_f)
+
+
+def _tune_read_con(con) -> None:
+    """Configure an in-memory read connection so a large reconstruction (a big merge main over S3) **spills
+    to disk instead of OOM-crashing** the worker into an opaque 500, and so repeated S3 reads don't re-fetch
+    Parquet metadata. In-memory DuckDB has no ``temp_directory`` by default, so it *cannot* spill — one
+    unbounded window/aggregate over a multi-GB changelog would abort the process; pointing it at a temp dir
+    (with a bounded memory limit) turns that into a slow-but-correct query. ``enable_object_cache`` keeps
+    Parquet footers warm across the many small scans a reconstruction issues."""
+    try:
+        con.execute(f"SET temp_directory='{tempfile.gettempdir()}'")
+        con.execute("SET enable_object_cache=true")
+    except Exception:
+        pass  # tuning is best-effort — never fail a read because a PRAGMA was rejected
 
 
 def _open_pond(request: Request, pond_name: str, major: int):
@@ -64,6 +104,7 @@ def _open_pond(request: Request, pond_name: str, major: int):
     data_dir = _data_dir(request, pond_name, major)
     con = duckdb.connect()  # in-memory: no file, no lock, no contention
     con.execute("SET TimeZone='UTC'")  # Trickle freshness is UTC; read/compare/render consistently
+    _tune_read_con(con)  # spill instead of OOM (a big merge reconstruction) + cache Parquet footers over S3
     dp.prepare(con)  # ready the connection to read the published format (e.g. load the iceberg ext)
     data_dir.duckdb_setup(con)  # object store → httpfs + credentials (no-op for local)
     con.execute(f'CREATE SCHEMA IF NOT EXISTS "{pond_name}"')
@@ -236,11 +277,15 @@ def _trickle_base_sql(
 @router.get("/ponds/{name}/tables", dependencies=[auth.read])
 def list_pond_tables(
     name: str, request: Request, major: Optional[int] = None, version: Optional[str] = None,
+    principal: auth.Principal = Depends(auth.get_principal),
 ):
     """The tables this Pond's selected major line has published — the data viewer's table picker. Each
     carries its Trickle ``mode`` (``append``/``merge``, else ``None``) and ``pk`` from the sidecar, so the
     viewer can offer the freshness window + consolidated view. A merge changelog (``X__changelog``) is a
-    plain table here (not in the sidecar) — it stays raw-navigable, unchanged."""
+    plain table here (not in the sidecar) — it stays raw-navigable, unchanged.
+
+    Governance: a non-full caller sees only the **serviceable** (exposed) tables — the same surface the
+    Catalog and the sandboxed query core allow (companions of hidden tables are excluded)."""
     from ...dataplane import get_data_plane
 
     m = _resolve_major(request, name, major, version)
@@ -258,7 +303,63 @@ def list_pond_tables(
             "trickle": mode if mode in ("append", "merge") else None,
             "pk": list(meta.get("pk") or []),
         })
+    if principal.level < auth.Level.FULL:
+        from ...keys import pond_key
+
+        driver = getattr(request.app.state, "driver", None)
+        serviceable = driver.serviceable(pond_key(name, m)) if driver is not None else set()
+        out = [o for o in out if o["name"] in serviceable]
     return {"tables": out}
+
+
+@router.get("/ponds/{name}/trace", dependencies=[auth.read])
+def trace_row(
+    name: str, table: str, request: Request, where: Optional[str] = None,
+    major: Optional[int] = None, version: Optional[str] = None,
+):
+    """**Temporal row provenance** (plans/lineage.md Phase 4): which run produced the selected row(s),
+    from which input window. Resolves the newest ``_duckstring_f`` among the rows matching ``where``
+    (every Trickle row carries its producing run's freshness; a plain overwrite table resolves to its
+    last publish), then answers with that run — its version, timings, and the window ``(previous_f, f]``
+    each Source was read over. ``where`` is a SQL predicate over the published table (the same trust
+    level as ``/api/query`` — read-gated, over the exported snapshot, never the live registry)."""
+    import duckdb
+
+    from ...dataplane import get_data_plane
+
+    m = _resolve_major(request, name, major, version)
+    data_dir = _data_dir(request, name, m)
+    dp = get_data_plane()
+    con = duckdb.connect()
+    try:
+        con.execute("SET TimeZone='UTC'")
+        dp.prepare(con)
+        data_dir.duckdb_setup(con)
+        try:
+            sel = dp.read_select(data_dir, table)
+        except FileNotFoundError:
+            raise HTTPException(status_code=404, detail=f"table {table!r} is not published") from None
+        pred = where or "1=1"
+        try:
+            cols = con.sql(f"SELECT * FROM ({sel}) LIMIT 0").columns
+            if "_duckstring_f" in cols:
+                row = con.execute(
+                    f'SELECT max("_duckstring_f"), count(*) FROM ({sel}) WHERE {pred}'
+                ).fetchone()
+                row_f, matched = (row[0].isoformat() if row[0] else None), row[1]
+            else:  # a plain overwrite table — the whole publish is one run
+                matched = con.execute(f"SELECT count(*) FROM ({sel}) WHERE {pred}").fetchone()[0]
+                row_f = (_sidecar(request, name, m).get(table) or {}).get("f")
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=f"bad predicate: {exc}") from None
+    finally:
+        con.close()
+    if not matched or row_f is None:
+        return {"table": table, "matched": int(matched or 0), "row_f": None, "run": None}
+    trace = request.app.state.driver.trace_run(name, m, row_f)
+    return {"table": table, "matched": int(matched), "row_f": row_f, **trace}
 
 
 @router.get("/ponds/{name}/objects", dependencies=[auth.read])
@@ -345,6 +446,7 @@ def delete_pond_object(
 def pond_freshness(
     name: str, request: Request, table: str,
     major: Optional[int] = None, version: Optional[str] = None,
+    principal: auth.Principal = Depends(auth.get_principal),
 ):
     """The distinct run freshnesses (newest first, ≤100) of a Trickle table — the window selector's
     options. Read from the append history or, for a merge, its changelog. ``floor`` is the coverage
@@ -352,6 +454,7 @@ def pond_freshness(
     from ...trickle_io import changelog_name
 
     m = _resolve_major(request, name, major, version)
+    _require_serviceable(request, name, m, table, principal.level >= auth.Level.FULL)
     meta = _sidecar(request, name, m).get(table) or {}
     mode = meta.get("mode")
     if mode not in ("append", "merge"):
@@ -429,15 +532,30 @@ def _merge_deleted_count_sql(pond: str, table: str, pk: list, f_base) -> str:
 
 
 @router.post("/query/count", dependencies=[auth.read])
-def query_count(body: CountRequest, request: Request):
+def query_count(body: CountRequest, request: Request,
+                principal: auth.Principal = Depends(auth.get_principal)):
     """Total rows of the (default, custom, or Trickle) query — sizes the data viewer's virtual scroll. A
     bare ``COUNT(*)`` over a Parquet table is metadata-fast (no scan).
+
+    A custom ``sql`` runs through the **catchment-wide serving core** (cross-pond joins; sandboxed to the
+    serviceable surface unless the caller is full) — the same brain the ``/serve/query`` + wire front doors
+    use. A per-pond ``table``/``trickle`` browse stays on the Pond's own exported snapshot (and is
+    serviceable-gated for non-full callers).
 
     The **unwindowed current state of a merge** main is counted *without scanning the base*: the active count is
     ``count(cold base)`` (metadata) + the changelog's net Z-set weight (:meth:`DataPlane.consolidated_count_select`),
     plus the small deleted-tombstone count — so the scrollbar sizes near-instantly even at hundreds of millions of
     rows. A *windowed* merge count falls through to the (already small) windowed changelog query."""
+    full = principal.level >= auth.Level.FULL
+    if body.sql:
+        from ..serving import serving_count
+
+        try:
+            return {"count": serving_count(request.app.state.driver, body.sql, sandboxed=not full)}
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
     m = _resolve_major(request, body.pond, body.major, body.version)
+    _require_serviceable(request, body.pond, m, body.table, full)
     con = _open_pond(request, body.pond, m)
     try:
         if body.trickle == "merge" and body.pk and not (body.f_lo or body.f_hi):
@@ -482,34 +600,60 @@ def _json_safe(v):
 
 
 @router.post("/query/page", dependencies=[auth.read])
-def query_page(body: PageRequest, request: Request):
+def query_page(body: PageRequest, request: Request,
+               principal: auth.Principal = Depends(auth.get_principal)):
     """A paged read for the data viewer: runs the (default or custom) query as a subquery with
     ``LIMIT/OFFSET`` and returns ordered columns + row arrays + a ``has_more`` flag. Wrapping means a
     user's own ``LIMIT`` still caps the result while the grid pages within it. One row beyond the page
-    is fetched to detect ``has_more`` without a separate count."""
+    is fetched to detect ``has_more`` without a separate count.
+
+    A custom ``sql`` runs through the **catchment-wide serving core** (cross-pond joins — schemas are
+    ``{pond}`` for the served major, ``{pond}_v{major}`` for a pin; sandboxed to the serviceable surface
+    unless full). A per-pond ``table``/``trickle`` browse stays on the Pond's exported snapshot (freshness
+    windows, history), serviceable-gated for non-full callers."""
     _maybe_tap_on_get(request, body.pond, body.major, body.version)
-    m = _resolve_major(request, body.pond, body.major, body.version)
-    con = _open_pond(request, body.pond, m)
+    full = principal.level >= auth.Level.FULL
     limit = max(1, min(body.limit, 5000))
     offset = max(0, body.offset)
-    base = _base_sql(body, f_base=_merge_f_base(request, body, m))
-    # Order (if asked) + page at this single level. The default is the **cheap scan order**: with no ORDER BY
-    # the LIMIT/OFFSET pushes down to the Parquet scan (row groups skipped by count), so a page reads only its
-    # ~CHUNK rows and the changelog join touches only those — O(page), not O(table). An explicit column sort
-    # (the user clicking a header — quoted → injection-safe; unknown column → 400) pays the full-scan Top-N it
-    # genuinely needs. So a merge Trickle no longer force-sorts its (gigabyte-scale) base by PK on every page.
+    if body.sql:
+        from ..serving import serving_page
+
+        try:
+            return serving_page(request.app.state.driver, body.sql, sandboxed=not full,
+                                limit=limit, offset=offset, order_by=body.order_by, order_desc=body.order_desc)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    m = _resolve_major(request, body.pond, body.major, body.version)
+    _require_serviceable(request, body.pond, m, body.table, full)
     order = f" ORDER BY {_qi(body.order_by)} {'DESC' if body.order_desc else 'ASC'}" if body.order_by else ""
-    try:
-        rel = con.execute(f"SELECT * FROM ({base}) AS _ds_page{order} LIMIT {limit + 1} OFFSET {offset}")
+
+    def _page(rel):
         cols = [d[0] for d in rel.description] if rel.description else []
         fetched = rel.fetchall()
-        has_more = len(fetched) > limit
-        rows = [[_json_safe(c) for c in row] for row in fetched[:limit]]
-        return {"columns": cols, "rows": rows, "has_more": has_more}
+        return {"columns": cols, "rows": [[_json_safe(c) for c in row] for row in fetched[:limit]],
+                "has_more": len(fetched) > limit}
+
+    # The whole read is wrapped: opening the pond (Parquet/Iceberg views over the data plane), building the
+    # base query, and executing it can all fail — over S3 a listing/credentials/scan error must surface its
+    # MESSAGE to the caller (a 400), never a bare, opaque 500. The connection spills to disk (`_tune_read_con`)
+    # so a large merge reconstruction is slow, not fatal.
+    #
+    # A merge main's default view reconstructs latest-per-PK over base ⊎ changelog — an aggregate a LIMIT can't
+    # push past — but the changelog is clamped to `> f_base` (the rest is already folded into the base), so a
+    # checkpointed table reads only its small hot tier + a LIMIT-pushed base scan. With no ORDER BY the
+    # LIMIT/OFFSET pushes to the Parquet scan (O(page)); an explicit column sort pays the Top-N it needs.
+    con = None
+    try:
+        con = _open_pond(request, body.pond, m)
+        base = _base_sql(body, f_base=_merge_f_base(request, body, m))
+        return _page(con.execute(f"SELECT * FROM ({base}) AS _ds_page{order} LIMIT {limit + 1} OFFSET {offset}"))
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     finally:
-        con.close()
+        if con is not None:
+            con.close()
 
 
 class HistoryRequest(BaseModel):
@@ -521,7 +665,8 @@ class HistoryRequest(BaseModel):
 
 
 @router.post("/query/history", dependencies=[auth.read])
-def query_history(body: HistoryRequest, request: Request):
+def query_history(body: HistoryRequest, request: Request,
+                  principal: auth.Principal = Depends(auth.get_principal)):
     """The changelog history of one record (merge Trickle), **newest freshness first**, one row per run
     it changed in, labelled with a ``_duckstring_event``: ``create`` (a ``+1`` only), ``update`` (a
     ``-1`` of the old image and a ``+1`` of the new in the same run), or ``delete`` (a ``-1`` only). The
@@ -534,6 +679,7 @@ def query_history(body: HistoryRequest, request: Request):
     from ...trickle_io import changelog_name
 
     m = _resolve_major(request, body.pond, body.major, body.version)
+    _require_serviceable(request, body.pond, m, body.table, principal.level >= auth.Level.FULL)
     con = _open_pond(request, body.pond, m)
     clog = f"{_qi(body.pond)}.{_qi(changelog_name(body.table))}"
     fcol, dcol = _qi(_F), _qi(_D)

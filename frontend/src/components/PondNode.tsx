@@ -4,6 +4,7 @@ import { memo } from 'react';
 import { Handle, Position, type NodeProps } from '@xyflow/react';
 import { useLiveStore, formatAge, stateColor, nodeFill, THEME_BRAND } from '@/lib/store';
 import { DemandIndicators } from './DemandIndicators';
+import { DbtIcon } from './DbtIcon';
 
 // A small grid/table glyph — the affordance to open this Pond's data viewer (shown when it has tables).
 function TableIcon() {
@@ -138,6 +139,7 @@ export const PondNode = memo(function PondNode({ data }: NodeProps) {
               {pond.isDraw ? '[DRAW]' : '[SPOUT]'}
             </span>
           )}
+          {pond.dbt && <DbtIcon size={15} />}
           <span style={{ fontSize: 13, fontWeight: 700, color: '#e4e4e7', letterSpacing: '0.04em', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
             {displayName}
           </span>

@@ -62,10 +62,12 @@ Everything lives under the Catchment root, in three layers with distinct owners:
 | `duck.db` | Catchment | The system of record: deployed versions and topology, the live graph, freshness/demand/fault state, triggers, windows, budgets, and the canonical run history (one row per Ripple attempt, with errors and tracebacks). SQLite. |
 | `ponds/{name}/{version}/` | Catchment | Each deployed version's source, exactly as uploaded — the immutable artifact. |
 | `ponds/{name}/m{major}/registry.duckdb` | Duck | The major line's live working database — every table its Ripples write. Private to the Pond. |
-| `ponds/{name}/m{major}/data/*.parquet` | Duck | The published snapshots, exported atomically (write-then-rename) after each successful run. The only thing Sinks and queries read. |
+| `ponds/{name}/m{major}/data/*.parquet` | Duck | The published snapshots, exported atomically (write-then-rename) after each successful run. The only thing Sinks and queries read. A [Trickle](../guides/trickle.md) table publishes as per-run part files plus its changelog/tier directories; `data/state/` holds small per-table accumulator snapshots (internal — never surfaced by reads); `_trickle.json` describes every table (mode, key, freshness, size hints). |
 | `ponds/{name}/m{major}/pond.db` | Duck | The Duck's run ledger — its operational record for crash recovery and event replay. The Catchment's history remains canonical. |
 
 Runtime storage is per **major line** (`m1/`, `m2/`, …) — concurrent majors execute and publish independently. Identity in `duck.db` follows the versioning model: the Pond *name*, each immutable deployed *version*, and a *selection* pointer per `(name, major)` are separate records — which is what makes [deploys atomic and majors concurrent](../concepts/versioning.md). Paths in the database are root-relative, so the whole directory is relocatable and a backup of the root is a backup of the Catchment.
+
+The published `data/` directory is deliberately **sufficient to rebuild the working registry**: if a major line's `registry.duckdb` is lost (a host loss or migration — as opposed to a deliberate [refresh](../guides/control.md), which empties it in place), the Duck rehydrates the registry from the published tables, tiers, and accumulator snapshots on startup, and the next run resumes *incrementally* rather than from scratch.
 
 ## Flow control
 

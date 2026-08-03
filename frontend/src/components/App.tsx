@@ -6,7 +6,7 @@ import { useLiveStore } from '@/lib/store';
 import { BATCH_OPS, type BatchOp } from '@/lib/api';
 import { useIsMobile } from '@/lib/useIsMobile';
 import { DagCanvas } from './DagCanvas';
-import { Sidebar } from './Sidebar';
+import { Sidebar, TracePanel } from './Sidebar';
 import { RunHistory } from './RunHistory';
 import { RunDetail } from './RunDetail';
 import { DataViewerModal } from './DataViewerModal';
@@ -299,6 +299,10 @@ export function App() {
     })();
     // A separate lightweight clock so freshness "age" keeps counting up between state changes.
     const clock = setInterval(() => useLiveStore.setState({ now: Date.now() }), POLL_MS);
+    // The cloud gate is EVENT-DRIVEN, not polled: fetched once on load, then only when a surface that
+    // uses it opens (the Cloud menu, a Pond's Options modal). It changes on user actions the Cloud menu
+    // sees live, or a rare external creds-expiry that a menu-open (or a Duck launch failure) catches.
+    void useLiveStore.getState().refreshCloud();
     return () => {
       alive = false;
       clearInterval(clock);
@@ -308,6 +312,7 @@ export function App() {
   return (
     <div className="ds-app" style={{ display: 'flex', flexDirection: 'column', width: '100%', overflow: 'hidden', fontFamily: 'ui-monospace, SFMono-Regular, monospace' }}>
       {needsKey && <KeyPrompt />}
+      {/* One modal serves both the Catalog (Options → Catalog) and the per-Pond Data Viewer (table icon). */}
       <DataViewerModal />
       {/* Mobile: the TopBar is a full-width page header pinned above everything (desktop floats it on the canvas). */}
       {isMobile && <TopBar />}
@@ -330,6 +335,10 @@ export function App() {
           </div>
           <div style={{ flex: 1, minWidth: 0 }}>
             <RunDetail />
+          </div>
+          {/* Bottom-right quadrant — aligned under the 320px sidebar: the selected node's run timing. */}
+          <div style={{ width: 320, minWidth: 320, borderLeft: '1px solid #27272a' }}>
+            <TracePanel />
           </div>
         </div>
       )}

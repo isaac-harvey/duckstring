@@ -267,6 +267,50 @@ def test_worker_routes_delta_vs_full(tmp_path, monkeypatch):
 # ─── A real containerised Postgres (CI only) ──────────────────────────────────
 
 
-@pytest.mark.skip(reason="needs a live Postgres + the DuckDB postgres extension write path — CI integration")
-def test_postgres_real_e2e():  # pragma: no cover
-    pass
+@pytest.mark.skipif("DUCKSTRING_TEST_PG" not in __import__("os").environ,
+                    reason="set DUCKSTRING_TEST_PG to a libpq URI (postgres://user:pass@host:port/db)")
+@pytest.mark.timeout(60)
+def test_postgres_real_e2e(tmp_path):
+    """The real thing (CI: a postgres service container): a merge Trickle delivered incrementally over
+    two epochs through the REAL DuckDB postgres extension — bootstrap full load, then a delta apply with
+    an update + a delete, exactly-once via the in-destination watermark, all through the worker path."""
+    import os
+
+    import duckstring.trickle_io as T
+    from duckstring.catchment.egress_worker import _egress_spout
+    from duckstring.catchment.registry import pond_data_dir
+    from duckstring.dataplane import ParquetDataPlane
+
+    dsn = os.environ["DUCKSTRING_TEST_PG"]
+    src = _con()
+    data_dir = pond_data_dir(tmp_path, "sales", 1).root
+    job = {"pond_name": "sales", "major": 1, "table": "fact", "destination": dsn, "f": F1.isoformat()}
+
+    # Epoch 1 (bootstrap → full load): 2 rows.
+    T.merge_table(src, "fact", src.sql("SELECT * FROM (VALUES (1,'a'),(2,'b')) t(id,v)"), F1, ("id",))
+    ParquetDataPlane().export(src, data_dir, f=F1)
+    _egress_spout(tmp_path, job)
+
+    # Epoch 2 (incremental delta): 2 updated, 1 deleted, 3 inserted.
+    T.merge_table(src, "fact", src.sql("SELECT * FROM (VALUES (2,'B'),(3,'c')) t(id,v)"), F2, ("id",))
+    ParquetDataPlane().export(src, data_dir, f=F2)
+    _egress_spout(tmp_path, dict(job, f=F2.isoformat()))
+
+    # Verify at the destination through a fresh ATTACH (the driver's own transport).
+    ver = _con()
+    ver.execute("INSTALL postgres; LOAD postgres")
+    pg_uri = dsn.split("?")[0]
+    ver.execute(f"ATTACH '{pg_uri}' AS verify (TYPE postgres)")
+    rows = ver.execute('SELECT id, v FROM verify.public."fact" ORDER BY id').fetchall()
+    assert rows == [(2, "B"), (3, "c")]  # 1 deleted, 2 updated, 3 inserted
+    wm = ver.execute(
+        "SELECT f FROM verify.public._duckstring_egress WHERE table_name = 'fact'"
+    ).fetchone()[0]
+    assert str(wm).startswith(F2.isoformat()[:19])  # exactly-once cursor advanced to the delivered epoch
+
+    # Re-delivery at the same epoch is a no-op (the watermark already covers it → empty delta).
+    _egress_spout(tmp_path, dict(job, f=F2.isoformat()))
+    rows2 = ver.execute('SELECT id, v FROM verify.public."fact" ORDER BY id').fetchall()
+    assert rows2 == rows
+    ver.close()
+    src.close()

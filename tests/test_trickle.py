@@ -171,6 +171,39 @@ def test_merge_main_checkpoint_folds_into_base(reg, tmp_path, monkeypatch):
     assert sc["f_base"] >= ts(1).isoformat() and sc["floor"] is not None
 
 
+def test_base_hydrates_as_a_view_not_a_copy(reg, tmp_path, monkeypatch):
+    """A checkpointed merge main's cold base is registered on a fresh Duck as a **view** over the published
+    chunks — never copied into the registry (plans/s3-resident-state.md). The base can be arbitrarily large;
+    a spawned Duck must not download it to run a small delta. Reconstruction stays correct over the view."""
+    from duckstring.dataplane import hydrate_registry
+
+    monkeypatch.setenv("DUCKSTRING_COMPACT_THRESHOLD", "1")  # tiny → the base is folded + chunk-published
+    snk_dir = tmp_path / "data"
+    T.merge_table(reg, "dim", _state(reg, [(1, "a"), (2, "b")]), ts(1), ("id",))
+    publish(reg, snk_dir, f=ts(1))
+    T.merge_table(reg, "dim", _state(reg, [(1, "A"), (3, "c")]), ts(2), ("id",))  # update + insert + delete 2
+    publish(reg, snk_dir, f=ts(2))
+    assert T.base_chunks(snk_dir, "dim")  # a cold base exists on disk
+
+    # A fresh Duck: empty registry, hydrate from the published state.
+    fresh = duckdb.connect(str(tmp_path / "fresh.duckdb"))
+    try:
+        hydrate_registry(fresh, snk_dir)
+        # The base "dim" is a VIEW, not a materialised table.
+        assert fresh.execute("SELECT count(*) FROM duckdb_views() WHERE view_name = 'dim'").fetchone()[0] == 1
+        assert fresh.execute("SELECT count(*) FROM duckdb_tables() WHERE table_name = 'dim'").fetchone()[0] == 0
+        # Reconstruction over the view is correct (current state after the update/insert/delete).
+        rel = T.reconstruct_current(fresh, "dim")
+        assert sorted(fresh.sql(f"SELECT id, v FROM ({rel.sql_query()})").fetchall()) == [(1, "A"), (3, "c")]
+        # And a further checkpoint on the hydrated Duck (base is a view) still works — it replaces the view
+        # with a fresh base and re-views it, never erroring on the view/table mismatch.
+        T.merge_table(fresh, "dim", _state(fresh, [(1, "A"), (3, "C"), (4, "d")]), ts(3), ("id",))
+        publish(fresh, snk_dir, f=ts(3))
+        assert rows(fresh, snk_dir, "dim", "id, v") == [(1, "A"), (3, "C"), (4, "d")]
+    finally:
+        fresh.close()
+
+
 def test_per_table_compact_threshold_overrides_catchment_default(reg, tmp_path, monkeypatch):
     """A per-table ``compact_threshold`` (recorded at the merge write) overrides the catchment env default
     for that main's checkpoint trigger: a huge env default would never checkpoint these tiny tables, but a
@@ -677,6 +710,100 @@ def test_agg_count_metric_is_incremental(tmp_path):
     run(ts(2), ts(1))
     assert rows(snk, snk_dir, "by_k", "k, n") == [("A", 1), ("B", 3)]
     snk.close()
+
+
+def test_agg_companion_published_and_resumable(tmp_path):
+    """State-format Extension 1: an incremental ``.aggregate()`` publishes its registry accumulator
+    companion (``_duckstring_agg_{table}``) as a snapshot under ``state/agg/{table}/{f}.parquet`` — the
+    published form a registry-less host (DuckFlock) or a Duck recovering from registry loss hydrates to
+    resume incremental compute. Round-trip: the snapshot is byte-faithful to the registry companion, the
+    sidecar records it, only the latest snapshot is kept, it stays hidden from the read surface, and
+    hydrating it into a fresh registry reproduces the exact accumulator state (identical resumption)."""
+    from duckstring import agg
+
+    f_con, f_dir = _producer(tmp_path, "fact")
+    snk = duckdb.connect(str(tmp_path / "snk.duckdb"))
+    snk_dir = tmp_path / "ponds" / "o" / "m1" / "data"
+
+    def run(f, pf):
+        p = Pond("o", "1.0.0", snk, root=tmp_path, source_majors={"fact": 1}, f=f, previous_f=pf)
+        p.trickle("fact.f").aggregate(by="k", mn=agg.min("v"), n=agg.count()).merge("by_k", pk="k")
+        publish(snk, snk_dir, f=f)
+
+    T.merge_table(f_con, "f", f_con.sql("SELECT * FROM (VALUES (1,10,'A'),(2,20,'A'),(3,5,'B')) v(id,v,k)"),
+                  ts(1), ("id",))
+    publish(f_con, f_dir, f=ts(1))
+    run(ts(1), NEVER)
+
+    # The companion snapshot exists at state/agg/by_k/{f1}.parquet and equals the registry companion verbatim.
+    snap1 = snk_dir / "state" / "agg" / "by_k" / T.part_name(ts(1))
+    assert snap1.exists()
+    reg_rows = snk.sql('SELECT * FROM "_duckstring_agg_by_k" ORDER BY k').fetchall()
+    snap_rows = snk.sql(f"SELECT * FROM read_parquet('{snap1}') ORDER BY k").fetchall()
+    assert snap_rows == reg_rows
+    assert T.load_sidecar(snk_dir)["state"] == {"agg/by_k": {"f": ts(1).isoformat()}}
+    # Hidden from the read surface: the companion isn't a listed/readable table.
+    assert "_duckstring_agg_by_k" not in ParquetDataPlane().list_tables(snk_dir)
+    assert "by_k" in ParquetDataPlane().list_tables(snk_dir)
+
+    # Epoch 2: the snapshot rolls forward and the previous one is pruned (snapshot, not log, semantics).
+    T.merge_table(f_con, "f", f_con.sql("SELECT * FROM (VALUES (1,10,'A'),(3,5,'B'),(4,1,'B')) v(id,v,k)"),
+                  ts(2), ("id",))
+    publish(f_con, f_dir, f=ts(2))
+    run(ts(2), ts(1))
+    kept = sorted(p.name for p in (snk_dir / "state" / "agg" / "by_k").glob("*.parquet"))
+    assert kept == [T.part_name(ts(2))]  # only the latest snapshot survives
+    assert T.load_sidecar(snk_dir)["state"] == {"agg/by_k": {"f": ts(2).isoformat()}}
+    persistent = rows(snk, snk_dir, "by_k", "k, mn, n")
+    assert persistent == [("A", 10, 1), ("B", 1, 2)]
+
+    # Hydrate the (surviving) epoch-2 companion snapshot into a *fresh* registry and confirm it reproduces
+    # the registry accumulator state bit-for-bit — the resumption-sufficiency property DuckFlock relies on.
+    snap2 = snk_dir / "state" / "agg" / "by_k" / T.part_name(ts(2))
+    reg2 = snk.sql('SELECT * FROM "_duckstring_agg_by_k" ORDER BY k').fetchall()
+    fresh = duckdb.connect()
+    fresh.execute("SET TimeZone='UTC'")
+    fresh.execute(f'CREATE TABLE "_duckstring_agg_by_k" AS SELECT * FROM read_parquet(\'{snap2}\')')
+    hydrated = fresh.sql('SELECT * FROM "_duckstring_agg_by_k" ORDER BY k').fetchall()
+    assert hydrated == reg2
+    fresh.close()
+    snk.close()
+
+
+def test_sidecar_extension2_stats(tmp_path):
+    """State-format Extension 2: every published sidecar entry carries planner hints — ``stats``
+    ({rows, bytes, delta_rows_last}), a user-column ``schema`` map (system columns excluded), and
+    ``format: 2``. Hints only (the conformance differ ignores them); what a routing consumer
+    (``duckflock quote``) sizes a plan by without opening Parquet footers."""
+    con = duckdb.connect()
+    con.execute("SET TimeZone='UTC'")
+    d = tmp_path / "data"
+
+    # merge (2 rows), append (3 rows over 2 runs), overwrite (1 row)
+    T.merge_table(con, "m", con.sql("SELECT * FROM (VALUES (1,'a'),(2,'b')) t(id,v)"), ts(1), ("id",))
+    T.append_table(con, "a", con.sql("SELECT * FROM (VALUES (1,5),(2,6)) t(id,x)"), ts(1), ("id",))
+    con.execute("CREATE TABLE o AS SELECT 1 AS id, 'x' AS lbl")
+    publish(con, d, f=ts(1))
+    T.append_table(con, "a", con.sql("SELECT 3 AS id, 7 AS x"), ts(2), ("id",))
+    T.merge_table(con, "m", con.sql("SELECT * FROM (VALUES (1,'a'),(2,'B'),(3,'c')) t(id,v)"), ts(2), ("id",))
+    publish(con, d, f=ts(2))
+
+    sc = T.load_sidecar(d)
+    m, a, o = sc["m"], sc["a"], sc["o"]
+    assert m["format"] == a["format"] == o["format"] == 2
+    # rows = current state; delta_rows_last = this run's stamped rows (merge: changelog, append: base,
+    # overwrite: the whole rewrite).
+    assert m["stats"]["rows"] == 3
+    assert m["stats"]["delta_rows_last"] == 3  # 2's -1/+1 update + 3's insert
+    assert a["stats"]["rows"] == 3 and a["stats"]["delta_rows_last"] == 1
+    assert o["stats"]["rows"] == 1 and o["stats"]["delta_rows_last"] == 1
+    for e in (m, a, o):
+        assert e["stats"]["bytes"] > 0
+    # schema: user columns only, no _duckstring_* leakage.
+    assert set(m["schema"]) == {"id", "v"}
+    assert set(a["schema"]) == {"id", "x"}
+    assert o["schema"]["lbl"] == "VARCHAR"
+    con.close()
 
 
 def test_builder_filter_applies_to_delta_and_crosses_boundary(tmp_path):
@@ -1333,6 +1460,35 @@ def test_builder_append_spine_pk_fast_path(tmp_path, monkeypatch):
     ol([(10, "p1", 2), (11, "p2", 1), (12, "p1", 3), (13, "p2", 1)], ts(4))
     run(ts(4), ts(3))
     assert rows(snk, snk_dir, "enriched", "order_id, price") == [(10, 5), (11, 9), (12, 70), (13, 9)]
+    snk.close()
+
+
+def test_builder_append_spine_pk_fast_path_same_f_replay(tmp_path):
+    """Regression: a same-``f`` replay of a spine-PK append run must be idempotent (an at-least-once host —
+    retries, DuckFlock's replay contract — re-executes an epoch). The bug: ``_new_spine_rows`` counted the
+    first attempt's own ``f``-stamped rows as history, so the replay ``DELETE(@f)`` dropped them and nothing
+    re-inserted them — silent loss of the epoch's rows. The prefilter now excludes rows stamped at ``f``."""
+    _cons, ol, pr = _star_sources(tmp_path)
+    snk = duckdb.connect(str(tmp_path / "snk.duckdb"))
+    snk_dir = tmp_path / "ponds" / "e" / "m1" / "data"
+
+    def run(f, pf):
+        _enriched(tmp_path, snk, snk_dir, f, pf, fail_on_conflict=False, log_drops=False)
+
+    ol([(10, "p1", 2), (11, "p2", 1)], ts(1))
+    pr([("p1", 5), ("p2", 9)], ts(1))
+    run(ts(1), NEVER)                                            # bootstrap
+    assert rows(snk, snk_dir, "enriched", "order_id, price") == [(10, 5), (11, 9)]
+
+    # A new spine row arrives at ts(2) — the first attempt appends order 12.
+    ol([(10, "p1", 2), (11, "p2", 1), (12, "p1", 3)], ts(2))
+    run(ts(2), ts(1))
+    single = rows(snk, snk_dir, "enriched", "order_id, price")
+    assert single == [(10, 5), (11, 9), (12, 5)]
+
+    # Replay the SAME epoch (same f/previous_f, same input) — must equal the single-run output, not drop it.
+    run(ts(2), ts(1))
+    assert rows(snk, snk_dir, "enriched", "order_id, price") == single
     snk.close()
 
 

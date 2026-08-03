@@ -1011,6 +1011,8 @@ Pond:
         startF          # freshness of the most recently started Pond Run
         endF            # freshness of the most recently completed Pond Run
         changedF        # freshness at which this Pond's OUTPUT last actually changed (<= endF)
+        persistedF      # freshness through which the published output is mirrored to the durable
+                        # plane (<= endF); equals endF when the publish is durable at completion
         sourceF         # freshness available from this Pond's Sources (derived, below)
         D               # window delay (see Staleness); 0 unless fed by a window
         hasReceivedPull # a Sink (or trigger) has asked for resupply
@@ -1030,9 +1032,18 @@ Pond:
             else:
                 sourceF = now ; D = 0               # live source
         else if any Source is Required:
-            sourceF = min(Source.endF over Required Sources)   # blocks on the stalest
+            sourceF = min(Source.visibleF over Required Sources)   # blocks on the stalest
         else:
-            sourceF = max(Source.endF over all Sources)        # any optional Source suffices
+            sourceF = max(Source.visibleF over all Sources)        # any optional Source suffices
+
+    # A Source's freshness AS VISIBLE to this Pond depends on where each runs (its Pool — one shared
+    # filesystem): a co-located Source's local publish is directly readable at endF; a cross-Pool
+    # Source can only be read from the durable plane, so its mirror watermark gates instead.
+    derive Source.visibleF:
+        if Source shares this Pond's Pool, or Source publishes durably at completion:
+            visibleF = Source.endF
+        else:
+            visibleF = Source.persistedF            # <= endF: only ever delays, never invents
 
     on hasReceivedPull becomes true:
         if startF == endF:                          # cold start: wake the whole Pond
@@ -1114,6 +1125,8 @@ Ripple:
     on completing a Ripple Run:
         endF = startF                               # notify children
         Pond.endF = min(Ripple.endF over all Ripples)   # if advanced, the Pond Run completed
+        # on the Pond Run completing: persistedF = endF unless the publish is mirrored
+        # asynchronously — then a later persist-completion event advances it (monotonically)
 ```
 
 Under *pull*, a Pond will continuously initiate new Pond Runs any time its `sourceF` advances, or until the pull demand is cleared without renewal from a Sink. This could mean multiple Pond Runs are in operation simultaneously, which is intentional.

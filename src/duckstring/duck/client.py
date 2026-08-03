@@ -33,6 +33,14 @@ class CatchmentClient:
         except Exception:
             return []
 
+    def fetch_artifact(self) -> bytes:
+        """Fetch the deployed version's source bundle (an uncompressed tar) — the remote-Duck boot
+        path (prereqs D6): a Duck that can't read the Catchment's disk pulls its code over the duck
+        channel. NOT best-effort — a Duck without its source cannot serve, so this raises."""
+        r = self._client.get(f"{self.base}/api/duck/{self.pond}/{self.major}/artifact", timeout=60.0)
+        r.raise_for_status()
+        return r.content
+
     def post_event(self, payload: dict) -> bool:
         """Deliver one buffered event. Returns True on success (so the Duck drops it from the buffer)."""
         try:

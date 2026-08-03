@@ -18,6 +18,7 @@ SQLite is the durable mirror, the per-Pond ``pond.db`` ledgers the fallback.
 from __future__ import annotations
 
 import json
+import os
 import threading
 from datetime import datetime, timedelta, timezone
 
@@ -43,6 +44,7 @@ from ..engine import (
     kill_pond,
     next_wake,
     pulse_pond,
+    record_persist,
     refresh_pond,
     repair_pond,
     sentinel,
@@ -58,6 +60,14 @@ from ..keys import pond_key
 # above the Duck's long-poll timeout so a healthy hold is never mistaken for death.
 _DUCK_DEAD_AFTER = timedelta(seconds=60)
 
+# The window allowed for a Duck's FIRST contact after a spawn, which is a different quantity: a local
+# subprocess is talking in a second, a Fargate task pulls an image, and an EC2 instance boots an OS and
+# may pip-install before it can dial. 60 s is structurally too short for EC2 — a cold pool's first run
+# always failed even when perfectly configured. Applies only until the Duck first speaks; after that the
+# steady-state window above governs.
+_STARTUP_GRACE = {"catchment": timedelta(seconds=60), "fargate": timedelta(minutes=3),
+                  "ec2": timedelta(minutes=8)}
+
 # Keep an idle Duck warm for this long before reaping it. Reaping the instant a Pond goes idle, then
 # respawning on the next run, races: a Pond re-armed in the window between the shutdown being sent and
 # the Duck exiting ends up in-flight with a dying Duck → a spurious "Duck not running" failure. The
@@ -72,6 +82,24 @@ def _now() -> datetime:
 
 def _iso(dt: datetime) -> str:
     return dt.isoformat()
+
+
+def _plane_freshness(sidecar: dict) -> str | None:
+    """A Pond's freshness as recorded in its data plane — the max ``f`` (ISO string) across the
+    ``_trickle.json`` sidecar's table entries and its ``objects`` section (all output of a run shares the
+    run's ``f``). ``None`` for an empty plane (no sidecar). The ``state`` section (agg/acc companion
+    snapshots) is skipped — it is bounded by its base table's ``f``. ISO-8601 sorts lexically, so ``max``
+    over the strings is correct. This is the last *published* freshness (== ``changed_f``), not the
+    pass-heartbeat ``end_f`` (a no-change pass writes nothing to the plane) — coherent with the bytes."""
+    fs: list[str] = []
+    for key, entry in sidecar.items():
+        if key == "objects" and isinstance(entry, dict):
+            fs += [o["f"] for o in entry.values() if isinstance(o, dict) and o.get("f")]
+        elif key == "state":
+            continue
+        elif isinstance(entry, dict) and entry.get("f"):
+            fs.append(entry["f"])
+    return max(fs) if fs else None
 
 
 def _split_scope(scope: str | None) -> tuple[str | None, int | None]:
@@ -152,6 +180,60 @@ def _topo_order(scope: set[str], parents: dict[str, set[str]]) -> list[str]:
 BATCH_OPS = ("kill", "sleep", "reset", "wipe", "remove", "clear", "repair", "refresh")
 IRREVERSIBLE_OPS = frozenset({"reset", "wipe", "remove"})
 
+# The Duck preset-size vocabulary (prereqs D5). Presets only — never raw instance shapes; what a
+# size means physically is the launcher's business (the local subprocess ignores it).
+FLOCK_MODES = ("off", "upgrade", "always")
+OOM_POLICIES = ("fail_up", "fail")
+POOL_PROVIDERS = ("fargate", "ec2", "local")  # local = a shared Pool machine on this box (dev/test)
+
+# Built-in preset Duck Pools (plans/cloud-config.md §4b): Fargate task sizes, always available so a
+# `pond.toml duck = "M"` works with zero pool setup — and DSC ships the SAME names backed by its own
+# serverless pools, so a project transfers seamlessly (only the backend differs). Names are reserved.
+PRESET_POOLS = {
+    "S": {"cpu": 512, "memory": 2048},
+    "M": {"cpu": 1024, "memory": 4096},
+    "L": {"cpu": 2048, "memory": 8192},
+    "XL": {"cpu": 4096, "memory": 16384},
+}
+
+
+def _preset_pool(name: str) -> dict:
+    p = PRESET_POOLS[name]
+    return {"name": name, "provider": "fargate", "instance_type": None, "cpu": p["cpu"],
+            "memory": p["memory"], "min_instances": 0, "max_instances": 1, "idle_timeout": None,
+            "keep_warm": 0, "region": None, "deploy_config": None, "managed": True}
+
+
+def _load_json(s):
+    """A stored JSON TEXT column → a dict/None (tolerant of NULL / bad JSON)."""
+    if not s:
+        return None
+    try:
+        return json.loads(s)
+    except (ValueError, TypeError):
+        return None
+
+
+def _duck_override_row(row) -> dict:
+    """A pond_duck row → the nullable override dict (plans/cloud-config.md). Sizing is concrete now
+    (a pool / dedicated instance type), so there is no abstract size field. ``deploy_config`` is a Pond's
+    dedicated-Duck deployment config (JSON; plans/compute-config-ui.md), carrying its provider + AWS
+    image/AMI/VPC/IAM settings."""
+    keys = ("duck_target", "dedicated_instance_type", "dedicated_auto_stop",
+            "flock_mode", "flock_engine", "oom_policy", "deploy_config")
+    if row is None:
+        return {k: None for k in keys}
+    o = dict(zip(keys, row, strict=True))
+    o["dedicated_auto_stop"] = None if o["dedicated_auto_stop"] is None else bool(o["dedicated_auto_stop"])
+    o["deploy_config"] = _load_json(o["deploy_config"])
+    return o
+
+
+# OpenLineage identifiers (plans/lineage.md Phase 4) — the standard event/schema URLs.
+_OL_PRODUCER = "https://github.com/duckstring/duckstring"
+_OL_SCHEMA_URL = "https://openlineage.io/spec/2-0-2/OpenLineage.json#/definitions/RunEvent"
+_OL_SCHEMA_FACET = "https://openlineage.io/spec/facets/1-1-1/SchemaDatasetFacet.json"
+
 
 class Driver:
     def __init__(self, db, root, base_url: str | None, launcher, data_root: str | None = None):
@@ -168,6 +250,17 @@ class Driver:
         self.meta: dict[str, dict] = {}  # key -> {name, major, version_id, version, source_path, ...}
         self.jobs: dict[str, list[dict]] = {}  # key -> queued Duck commands
         self.last_seen: dict[str, datetime] = {}  # key -> last Duck contact (jobs poll / event)
+        # Ponds whose Duck was spawned but has never spoken — they get the provider's (longer) startup
+        # grace rather than the steady-state silence window. Cleared on first contact.
+        self._awaiting_first_contact: set[str] = set()
+        # key -> cumulative Flock dispatch counters ({dispatched, failed, last_error}), accumulated from
+        # the per-Ripple-Run deltas Ducks report (see _record_flock). Observability only (in-memory; a
+        # restart just waits for the next report).
+        self.flock_status: dict[str, dict] = {}
+        self.persisted: dict[str, str] = {}  # key -> persisted_f ISO (the durable-mirror watermark)
+        # Status-poll caches for the published-surface flags, keyed on data_version — see _exported_tables.
+        self._tables_cache: dict[str, tuple[int, set]] = {}
+        self._objects_cache: dict[str, tuple[int, bool]] = {}
         self._idle_since: dict[str, datetime] = {}  # key -> when the Pond went idle (reap grace clock)
         # Pond Draw transfers awaiting the poller: (pond_key, F). A Draw run is not dispatched to a
         # Duck — the poller performs the parquet fetch out-of-lock, then reports completion.
@@ -190,11 +283,25 @@ class Driver:
         # a failure/contract/spout alert for → their recovery is emitted centrally in _process when they
         # clear; _stale_breached tracks (channel_id, pond_key) currently over their freshness SLA.
         self._alert_cb = None
-        self._alerted_failures: dict[str, tuple[str, str | None, str | None]] = {}
+        self._alerted_failures: dict[str, tuple] = {}  # key → (kind, scope_pond, scope_major, f, title, message)
+        self._renotify_channels = False  # any enabled channel with a re-notify interval (refreshed per sweep)
         self._stale_breached: set[tuple[int, str]] = set()
+        # Per-Pond compute config (plans/cloud-config.md). The effective value coalesces:
+        # override (pond_duck) ?? declared (pond_version, from pond.toml) ?? Catchment default (env).
+        # A NULL override field inherits; loaded from pond_duck / pond_version in reload().
+        self.duck_overrides: dict[str, dict] = {}   # key → nullable override columns
+        self.duck_declared: dict[str, dict] = {}    # key → declared columns off the selected pond_version
+        self.duck_pool_names: set[str] = set()      # defined Duck Pools (for the unknown-pool→catchment fallback)
         # Monotonic counter bumped on every state change — the UI long-polls /api/status against it, so
         # the display updates the instant the engine state moves rather than on a fixed timer.
         self.state_version = 0
+        # A counter that bumps ONLY when the published data / served catalog changes (a run publishes, a
+        # deploy/reset/remove, a data-root switch) — NOT on every engine tick like state_version. The
+        # serving connection cache keys on this so it stays warm across ticks instead of rebuilding (and,
+        # for read users, re-materialising the whole catalog from S3) on nearly every query.
+        self.data_version = 0
+        # In-flight/last data-plane migration progress (None until one runs); see migrate().
+        self.migration: dict | None = None
         self.reload()
 
     def set_notify(self, cb) -> None:
@@ -206,6 +313,11 @@ class Driver:
     def _signal_egress(self) -> None:
         if self._egress_cb is not None:
             self._egress_cb()
+
+    def _enqueue_job(self, pond: str, job: dict) -> None:
+        """Queue a job for a Duck. It collects on its next poll (routes/duck.py explains why delivery is
+        a poll rather than a push)."""
+        self.jobs.setdefault(pond, []).append(job)
 
     def set_alert_notify(self, cb) -> None:
         self._alert_cb = cb
@@ -225,6 +337,7 @@ class Driver:
     def reload(self) -> None:
         """(Re)build the engine + metadata from the database (selected Ponds only)."""
         with self.lock:
+            self.data_version = getattr(self, "data_version", 0) + 1  # topology/catalog changed → refresh serving
             db = self.db
             ponds: dict[str, Pond] = {}
             pond_states: dict[str, PondState] = {}
@@ -234,23 +347,26 @@ class Driver:
             self.meta = {}
             self._incomplete: list[tuple[str, datetime]] = []  # (pond, F) runs to resume
 
+            self.duck_pool_names = set(PRESET_POOLS) | {r[0] for r in db.execute("SELECT name FROM duck_pool")}
+            self._pool_cache = None  # user-pool list cache (invalidated on add/remove) — status()'s per-Pond
+            #                          duck_config resolves pools off this instead of a DB query per poll
             name_by_pnid = {r[0]: r[1] for r in db.execute("SELECT id, name FROM pond_name")}
             rows = db.execute("""
                 SELECT pn.name, p.major, p.id, p.pond_version_id, pv.version, pv.source_path, pn.kind,
-                       p.is_draw, p.is_spout
+                       p.is_draw, p.is_spout, pv.dbt
                 FROM pond p JOIN pond_name pn ON pn.id = p.pond_name_id
                 JOIN pond_version pv ON pv.id = p.pond_version_id
             """).fetchall()
             deployed = {pond_key(name, major) for name, major, *_ in rows}
             pondid_to_key = {pid: pond_key(nm, mj) for nm, mj, pid, *_ in rows}
-            for name, major, pond_id, pv_id, version, source_path, kind, is_draw, is_spout in rows:
+            for name, major, pond_id, pv_id, version, source_path, kind, is_draw, is_spout, dbt in rows:
                 self.meta[pond_key(name, major)] = {
                     "name": name, "major": major, "version_id": pv_id, "version": version,
                     "source_path": source_path, "pond_id": pond_id, "kind": kind,
-                    "is_draw": bool(is_draw), "is_spout": bool(is_spout), "ripple_ids": {},
+                    "is_draw": bool(is_draw), "is_spout": bool(is_spout), "dbt": bool(dbt), "ripple_ids": {},
                 }
 
-            for name, major, pond_id, pv_id, _version, _source_path, _kind, is_draw, is_spout in rows:
+            for name, major, pond_id, pv_id, _version, _source_path, _kind, is_draw, is_spout, _dbt in rows:
                 key = pond_key(name, major)
                 sources, optional, missing = [], set(), []
                 for snid, smajor, required in db.execute(
@@ -276,15 +392,39 @@ class Driver:
                     "SELECT immediate_retries, source_retries FROM pond_retry WHERE pond_id = ?", (pond_id,)
                 ).fetchone()
                 imm, onc = retry if retry else (0, 0)
+                duck_row = db.execute(
+                    "SELECT duck_target, dedicated_instance_type, dedicated_auto_stop, "
+                    "flock_mode, flock_engine, oom_policy, deploy_config FROM pond_duck WHERE pond_id = ?",
+                    (pond_id,)
+                ).fetchone()
+                self.duck_overrides[key] = _duck_override_row(duck_row)
+                declared = db.execute(
+                    "SELECT duck_pool, flock_mode, flock_engine, oom_policy FROM pond_version WHERE id = ?",
+                    (pv_id,),
+                ).fetchone()
+                self.duck_declared[key] = {
+                    "duck_target": declared[0], "flock_mode": declared[1],
+                    "flock_engine": declared[2], "oom_policy": declared[3],
+                } if declared else {}
                 # always_run is a Pond property ORed up from its Ripples: any always_run Ripple means
                 # the Pond runs every time (never engine-passed). See plans/no-change-skip.md.
                 always_run = bool(db.execute(
                     "SELECT MAX(always_run) FROM ripple WHERE pond_version_id = ?", (pv_id,)
                 ).fetchone()[0])
+                # Pool identity + persist mode (plans/persist.md): where this Pond's Duck actually runs
+                # decides whose Sinks see end_f (same Pool) vs persisted_f (cross-Pool), and whether its
+                # own publish is async-mirrored. Draws/Spouts run in the Catchment process → Catchment Pool.
+                pool = self._pool_of(key) if not (is_draw or is_spout) else "catchment"
                 ponds[key] = Pond(
                     id=key, name=key, sources=sources, optional_sources=optional, windows=windows,
                     retry_immediately=imm, retry_on_change=onc, is_draw=bool(is_draw),
                     is_spout=bool(is_spout), has_missing_source=has_missing_source, always_run=always_run,
+                    pool=pool,
+                    # Local-first publish + async Persist applies on every SHARED filesystem — the
+                    # Catchment Pool and named Pools (whose agent passes --persist-root). Only a
+                    # per-Pond remote Duck ("duck:*" — preset/dedicated) publishes the plane directly.
+                    async_persist=(self.data_root is not None and not (is_draw or is_spout)
+                                   and not pool.startswith("duck:")),
                 )
                 pond_states[key] = self._load_pond_state(pond_id)
                 if is_spout:
@@ -353,8 +493,105 @@ class Driver:
             # is_blocked may be stale. Re-derive for every Pond (propagates to Sinks).
             for pid in self.state.pond_states:
                 derive_blocked(self.state, pid)
+            # The persist watermark (plans/persist.md): the freshness through which each line's published
+            # output is mirrored to the durable plane. Restore-then-derive: an async_persist Pond gets its
+            # recorded watermark from the DB (NEVER if it has not mirrored yet — conservative: cross-Pool
+            # Sinks wait for the next mirror); every other Pond's publish is durable at completion, so its
+            # watermark IS end_f. Pool-aware gating (source_visible_f) rides these restored values.
+            self.persisted = {}
+            for pid, pf in db.execute("SELECT pond_id, persisted_f FROM pond_state WHERE persisted_f IS NOT NULL"):
+                key = pondid_to_key.get(pid)
+                if key:
+                    self.persisted[key] = pf
+            for key, st in self.state.pond_states.items():
+                if self.state.ponds[key].async_persist:
+                    pf = self.persisted.get(key)
+                    st.persisted_f = datetime.fromisoformat(pf) if pf else NEVER
+                else:
+                    st.persisted_f = st.end_f
+            self._reconcile_lost_publishes()
             self.jobs = {key: self.jobs.get(key, []) for key in ponds}
             self.state_version += 1  # topology/config (deploy, ducts, windows) changed
+
+    def _reconcile_lost_publishes(self) -> None:
+        """Pool-loss rollback (plans/persist.md phase 4): make each async_persist Pond's freshness claims
+        match the bytes that actually survived. The local publish is the handoff and can die with its box
+        in the publish→persist window; a Pond then claims content (``changed_f``) that neither the local
+        layout nor the durable plane holds — a Sink reading now would get older bytes stamped as newer
+        freshness. On every reload (which every boot runs):
+
+        - **healthy** (the overwhelmingly common case, checked with one local file read): the local
+          sidecar's freshness backs ``changed_f`` → untouched. A pass advances ``end_f`` but publishes
+          nothing, so the comparison is content-anchored on ``changed_f``, never ``end_f``.
+        - **suspicious** (local bytes behind the claim): read the durable plane's sidecar (one object-store
+          read, rare path). The plane is TRUTH: its freshness advances ``persisted_f`` if ahead (this is
+          what un-parks cross-Pool Sinks after an adopt/hand-copy — the recorded watermark is advisory,
+          the plane decides). Then the Pond (and its Ripples) REGRESSES to the floor = what local ∪ plane
+          actually holds, the failure episode above the floor clears (that world is gone), and normal
+          demand re-runs the gap.
+
+        Fate-sharing makes this coherent: a same-Pool Sink that consumed the lost window lost its own
+        publishes with the same box and regresses by the same rule; a cross-Pool Sink never saw past
+        ``persisted_f`` at all (the gating rule). Deterministic from (DB, disk) — safe to re-run on every
+        reload; once the gap re-runs, the claims are backed again and this is a no-op."""
+        from pathlib import Path as _Path
+
+        from ..trickle_io import load_sidecar
+        from .registry import pond_data_dir
+
+        root = _Path(self.root)
+        for key, pond in self.state.ponds.items():
+            if not pond.async_persist:
+                continue
+            ps = self.state.pond_states[key]
+            if ps.changed_f == NEVER:
+                continue  # nothing ever published — nothing to back
+            meta = self.meta[key]
+            local_dir = pond_data_dir(root, meta["name"], meta["major"], None)
+            try:
+                local_f = _plane_freshness(load_sidecar(local_dir))
+            except Exception:
+                local_f = None
+            claimed = _iso(ps.changed_f)
+            if local_f is not None and local_f >= claimed:
+                continue  # the local publish backs the claim — healthy
+            try:
+                plane_f = _plane_freshness(
+                    load_sidecar(pond_data_dir(root, meta["name"], meta["major"], self.data_root)))
+            except Exception:
+                plane_f = None
+            if plane_f is not None and plane_f > _iso(ps.persisted_f):
+                ps.persisted_f = datetime.fromisoformat(plane_f)  # the plane is truth (adopt/hand-copy)
+                self.persisted[key] = plane_f
+                self.db.execute("UPDATE pond_state SET persisted_f = ? WHERE pond_id = ?",
+                                (plane_f, meta["pond_id"]))
+            floor = max(ps.persisted_f,
+                        datetime.fromisoformat(local_f) if local_f else NEVER)
+            if ps.changed_f <= floor:
+                continue  # the plane (or what's left locally) covers the claim after all
+            print(f"[driver] {key}: published content through {claimed} was lost with its Pool "
+                  f"(backed only through {_iso(floor)}) — regressing; demand will re-run the gap",
+                  flush=True)
+            ps.end_f = ps.start_f = ps.changed_f = floor
+            if ps.failed_f > floor:  # a failure episode above the floor belongs to the lost world
+                ps.is_failed = False
+                ps.failed_f = NEVER
+                ps.failures = 0
+            ps.targets = [t for t in ps.targets if t > floor]
+            for rid in (r for r, rip in self.state.ripples.items() if rip.pond_id == key):
+                rs = self.state.ripple_states[rid]
+                rs.end_f = min(rs.end_f, floor)
+                rs.start_f = min(rs.start_f, floor)
+                rs.targets = [t for t in rs.targets if t > floor]
+            self.db.execute(
+                "UPDATE pond_state SET start_f=?, end_f=?, changed_f=?, is_failed=?, failed_f=?, "
+                "failures=? WHERE pond_id=?",
+                (_iso(floor), _iso(floor), _iso(floor), int(ps.is_failed), _iso(ps.failed_f),
+                 ps.failures, meta["pond_id"]),
+            )
+        self.db.commit()
+        for pid in self.state.pond_states:
+            derive_blocked(self.state, pid)
 
     def _load_pond_state(self, pond_id: int) -> PondState:
         row = self.db.execute(
@@ -500,7 +737,11 @@ class Driver:
                 drop_table(con, table)
             finally:
                 con.close()
-            unpublish_table(pond_data_dir(Path(self.root), name, major, self.data_root), table)
+            # Local-first publish (plans/persist.md): the table may exist BOTH locally and on the persist
+            # layer — unpublish from both, or the stale local copy would shadow the deletion on reads.
+            unpublish_table(pond_data_dir(Path(self.root), name, major, None), table)
+            if self.data_root is not None:
+                unpublish_table(pond_data_dir(Path(self.root), name, major, self.data_root), table)
             self.state_version += 1
 
     def reset_pond(self, pond: str, clear_history: bool = False) -> None:
@@ -526,19 +767,23 @@ class Driver:
             shutil.rmtree(pond_major_dir(Path(self.root), name, major), ignore_errors=True)
             if self.data_root is not None:  # published data lives outside the state root (bucket/Volume)
                 pond_data_dir(Path(self.root), name, major, self.data_root).rmtree()
-            # 2. Rewind freshness/fault in duck.db (keep demand + operational config).
+            # 2. Rewind freshness/fault in duck.db (keep demand + operational config). persisted_f rewinds
+            #    too — the durable mirror was just scrubbed, so a surviving watermark would let cross-Pool
+            #    Sinks read a gap (plans/persist.md).
             self.db.execute(
                 "UPDATE pond_state SET start_f=?, end_f=?, changed_f=?, d_ms=0, is_failed=0, is_blocked=0, "
-                "failed_f=?, failures=0, is_killed=0, refresh_pending=0 WHERE pond_id=?",
+                "failed_f=?, failures=0, is_killed=0, refresh_pending=0, persisted_f=NULL WHERE pond_id=?",
                 (_iso(NEVER), _iso(NEVER), _iso(NEVER), _iso(NEVER), meta["pond_id"]),
             )
             if clear_history:
                 self.db.execute("DELETE FROM ripple_run WHERE pond_version_id=?", (meta["version_id"],))
                 self.db.execute("DELETE FROM pond_run WHERE pond_version_id=?", (meta["version_id"],))
+                self.db.execute("DELETE FROM ripple_run_lineage WHERE pond_version_id=?", (meta["version_id"],))
             self.db.commit()
             # 3. Rewind the in-memory engine state (keep demand: has_pull/pull_m/targets/standing_wake).
             if ps is not None:
                 ps.start_f = ps.end_f = ps.changed_f = NEVER
+                ps.persisted_f = NEVER
                 ps.d = timedelta()
                 ps.is_failed = ps.is_blocked = ps.is_killed = False
                 ps.failed_f = NEVER
@@ -555,6 +800,8 @@ class Driver:
                         rs.started_at = None
                         rs.runs_completed = 0
                 derive_blocked(self.state, pond)  # re-derive this Pond + propagate to its Sinks
+            self.persisted.pop(pond, None)
+            self.data_version += 1  # the published surface changed → drop the has_tables/objects caches
             self.state_version += 1
             self._process(_now())
 
@@ -594,21 +841,202 @@ class Driver:
                     except Exception:
                         pass
             # 3. Rewind all runtime rows in duck.db (keep demand + topology + operational config + secrets).
+            #    persisted_f rewinds with the rest — the mirror was scrubbed with the data.
             self.db.execute(
                 "UPDATE pond_state SET start_f=?, end_f=?, changed_f=?, d_ms=0, is_failed=0, is_blocked=0, "
-                "failed_f=?, failures=0, is_killed=0, refresh_pending=0",
+                "failed_f=?, failures=0, is_killed=0, refresh_pending=0, persisted_f=NULL",
                 (_iso(NEVER), _iso(NEVER), _iso(NEVER), _iso(NEVER)),
             )
             self.db.execute("DELETE FROM alert_delivery")  # the notification outbox is runtime, not config
             if clear_history:
                 self.db.execute("DELETE FROM ripple_run")
                 self.db.execute("DELETE FROM pond_run")
+                self.db.execute("DELETE FROM ripple_run_lineage")
             self.db.commit()
             # 4. Rebuild the engine from the scrubbed DB — a fresh-deploy engine (spouts/triggers re-armed).
             self.reload()
             self.state_version += 1
             self._process(_now())
             return {"ponds": len(lines)}
+
+    def switch_data_root(self, new_root: str | None, *, mode: str = "empty") -> dict:
+        """Re-point the data plane to ``new_root`` (``None`` = local, under the state root). Stop-the-world
+        (quiesce every Duck) and **NON-destructive** — the OLD location is never scrubbed, so it stays a
+        readable backup / hand-migration source. Two modes (plans/data-root-switch.md):
+
+        - ``"empty"`` (default): leave every Pond **as if its data were deleted** and **dormant** — rewind
+          all freshness to ``NEVER`` (cold refresh pending) and clear ALL demand (pull, push, standing
+          Wave/Tide). Nothing auto-runs; the operator drives the rebuild (or hand-copies data in first).
+        - ``"adopt"``: **pick up whatever data already sits in the target plane** (a bucket you copied into,
+          or one you're returning to) and resume with **no rebuild** — read each Pond's freshness from its
+          ``_trickle.json`` sidecar in the target, set the ledger to match, drop the local hot state
+          (registry + ledger) so the next run re-hydrates from the target, and **keep** demand + triggers.
+
+        (The **copy+adopt** move is :meth:`migrate`, which reports progress and runs the copy off-lock.)
+        Returns ``{"ponds": n}``."""
+        if mode not in ("empty", "adopt"):
+            raise ValueError(f"unknown switch mode {mode!r} (expected 'empty' or 'adopt')")
+        with self.lock:
+            # 1. Quiesce: stop every Duck (wait, so the registry handles are free) and drop pending work.
+            for key in list(self.state.ponds):
+                self.launcher.terminate(key, wait=True)
+            self.jobs.clear()
+            self._pending_transfers.clear()
+            self._pending_egress.clear()
+            self._idle_since.clear()
+            lines = [(m["name"], m["major"], m["pond_id"]) for m in self.meta.values()
+                     if not m.get("is_draw") and not m.get("is_spout")]
+            # Local-first publish (plans/persist.md): while a data root is attached, the local layout is a
+            # PUBLISH CACHE of that plane (mirrored to it by the Persist) — and reads resolve local-first.
+            # On a switch away from a non-local plane, that cache belongs to the OLD plane: left in place it
+            # would shadow the new plane's (empty or adopted) truth. Scrub it — the old plane itself remains
+            # intact as the backup. When the old plane IS local (old_root None), the local layout is the old
+            # location and is kept untouched, exactly per the backup contract above.
+            if self.data_root is not None:
+                from pathlib import Path as _Path
+
+                from .registry import pond_data_dir as _pdd
+                for name, major, _pid in lines:
+                    try:
+                        _pdd(_Path(self.root), name, major, None).rmtree()
+                    except Exception:
+                        pass
+            # 2. Re-point future spawns (publish + read) at the new plane. NOTE: the OLD location is not
+            #    touched — no scrub — so it remains a hand-migration source / switch-back backup.
+            self.data_root = new_root
+            if hasattr(self.launcher, "set_data_root"):
+                self.launcher.set_data_root(new_root)
+            else:
+                self.launcher.data_root = new_root
+            if mode == "empty":
+                # "Delete the data": rewind freshness + flag a cold refresh, and clear every form of demand
+                # so the pipeline stays idle — pull tokens, push targets, and standing Wave/Tide triggers.
+                self.db.execute(
+                    "UPDATE pond_state SET start_f=?, end_f=?, changed_f=?, d_ms=0, is_failed=0, is_blocked=0, "
+                    "failed_f=?, failures=0, is_killed=0, refresh_pending=1, has_pull=0, has_received_pull=0, "
+                    "persisted_f=NULL",  # the watermark belonged to the OLD plane — the new one starts empty
+                    (_iso(NEVER), _iso(NEVER), _iso(NEVER), _iso(NEVER)),
+                )
+                self.db.execute("DELETE FROM pond_target")   # push demand
+                self.db.execute("DELETE FROM pond_trigger")  # standing Wave/Tide
+            else:
+                self._adopt_plane(lines, new_root)
+            self.db.commit()
+            # 4. Rebuild the engine from the DB. empty → dormant (no kick); adopt/migrate → resumes on
+            #    its own demand from the adopted freshness.
+            self.reload()
+            self.state_version += 1
+            return {"ponds": len(lines)}
+
+    _MIGRATE_SKIP = frozenset({"catalog.json", "pond.db", "pond"})  # Iceberg pointer + namespace warehouse
+
+    def migration_status(self) -> dict:
+        """The current/last data-plane migration's progress (``status`` ∈ copying/adopting/done/failed,
+        + file/byte counts + the pond in flight), or ``{"status": "idle"}`` if none has run."""
+        m = self.migration
+        return dict(m) if m else {"status": "idle"}
+
+    def migrate(self, new_root: str | None) -> dict:
+        """**Copy** the current plane's data to ``new_root``, then ``adopt`` it — a one-action move that
+        carries the data across with no rebuild. Blocking (run it in a thread for a live migration); the
+        long **copy runs off-lock** (so ``/api/status`` stays responsive), bracketed by two short locked
+        phases: quiesce+plan, then re-point+adopt. Progress is published on ``self.migration`` throughout.
+        The Iceberg catalog/namespace are skipped (regenerated at the target — reads fall back to the flat
+        sidecars); the old location is left intact. Raises (and marks the migration ``failed``) on error."""
+        from pathlib import Path
+
+        from ..storage import copy_tree, tree_size
+        from .registry import pond_data_dir, resolve_data_dir
+
+        root = Path(self.root)
+        # Phase 1 (locked): quiesce, plan the copy, seed progress totals.
+        with self.lock:
+            old_root = self.data_root
+            for key in list(self.state.ponds):
+                self.launcher.terminate(key, wait=True)
+            self.jobs.clear()
+            self._pending_transfers.clear()
+            self._pending_egress.clear()
+            self._idle_since.clear()
+            lines = [(m["name"], m["major"], m["pond_id"]) for m in self.meta.values()
+                     if not m.get("is_draw") and not m.get("is_spout")]
+            total_files = total_bytes = 0
+            plan = []
+            for name, major, _pid in lines:
+                # Copy from the LOCAL-FIRST source (plans/persist.md): a locally-publishing line's local
+                # layout is complete and at end_f — the old plane's mirror may lag behind it (persisted_f
+                # ≤ end_f), so copying from the plane could miss the un-persisted tail. resolve gives the
+                # local layout when it publishes here, the old plane otherwise (a remote-Duck line).
+                src = resolve_data_dir(root, name, major, old_root)
+                dst = pond_data_dir(root, name, major, new_root)
+                if src.uri() == dst.uri():  # same physical location — nothing to copy
+                    continue
+                f, b = tree_size(src, skip_top=self._MIGRATE_SKIP)
+                total_files += f
+                total_bytes += b
+                plan.append((name, src, dst))
+            self.migration = {"status": "copying", "target": new_root, "pond": None,
+                              "total_files": total_files, "total_bytes": total_bytes,
+                              "copied_files": 0, "copied_bytes": 0, "error": None}
+        try:
+            # Phase 2 (off-lock): the actual copy. The engine is paused (see _process) + Ducks quiesced, so
+            # nothing writes the old plane meanwhile. Single writer of self.migration → no lock for updates.
+            def _on(nbytes: int) -> None:
+                self.migration["copied_files"] += 1
+                self.migration["copied_bytes"] += nbytes
+            for name, src, dst in plan:
+                self.migration["pond"] = name
+                copy_tree(src, dst, skip_top=self._MIGRATE_SKIP, on_file=_on)
+            # Phase 3 (locked): re-point. The target now holds a VERBATIM copy of the current data, so the
+            # freshness ledger + registries already match it — just move the pointer. No adopt/re-read of
+            # the target sidecar (which could come back empty and wrongly reset freshness), no rewind: a
+            # migration is faithful, so the pipeline resumes exactly where it was, at the new location.
+            with self.lock:
+                self.migration["pond"] = None
+                self.data_root = new_root
+                if hasattr(self.launcher, "set_data_root"):
+                    self.launcher.set_data_root(new_root)
+                else:
+                    self.launcher.data_root = new_root
+                self.state_version += 1
+                self.migration["status"] = "done"
+            return {"ponds": len(lines)}
+        except Exception as exc:
+            with self.lock:
+                if self.migration is not None:
+                    self.migration["status"] = "failed"
+                    self.migration["error"] = str(exc)
+            raise
+
+    def _adopt_plane(self, lines, new_root: str | None) -> None:
+        """Set each line's freshness to what the *target* plane actually holds (read from its sidecar) and
+        drop its local hot state so the next run re-hydrates from that plane. Demand/triggers are kept, so
+        the pipeline resumes incrementally instead of rebuilding. Empty target → NEVER (a cold start)."""
+        from pathlib import Path
+
+        from ..trickle_io import load_sidecar
+        from .registry import pond_data_dir, pond_major_dir
+
+        root = Path(self.root)
+        for name, major, pond_id in lines:
+            try:
+                sidecar = load_sidecar(pond_data_dir(root, name, major, new_root))
+            except Exception:
+                sidecar = {}
+            f_iso = _plane_freshness(sidecar) or _iso(NEVER)
+            self.db.execute(
+                "UPDATE pond_state SET start_f=?, end_f=?, changed_f=?, d_ms=0, is_failed=0, is_blocked=0, "
+                "failed_f=?, failures=0, is_killed=0, refresh_pending=0 WHERE pond_id=?",
+                (f_iso, f_iso, f_iso, _iso(NEVER), pond_id),
+            )
+            # Drop the (old-plane) hot state → the executor re-hydrates the registry from the target plane
+            # on the next run (registry-loss recovery). Keep the OLD data dir (backup) untouched.
+            major_dir = pond_major_dir(root, name, major)
+            for fname in ("registry.duckdb", "pond.db"):
+                try:
+                    (major_dir / fname).unlink(missing_ok=True)
+                except Exception:
+                    pass
 
     def remove_pond(self, name: str, major: int, wipe: bool = False) -> dict:
         """Remove (retire) one deployed major line ``name@major`` — delete its live ``pond`` selection, its
@@ -664,7 +1092,7 @@ class Driver:
             # 3. Delete the pond(id)-keyed config + the pond selection row. Keep pond_version / ripple /
             #    ripple_run / pond_run / pond_version_schema / pond_name (the retained record).
             for tbl in ("pond_state", "pond_target", "pond_open", "pond_trigger", "pond_retry",
-                        "pond_window", "pond_spout", "pond_to_pond"):
+                        "pond_window", "pond_spout", "pond_duck", "pond_to_pond", "pond_serve_override"):
                 self.db.execute(f"DELETE FROM {tbl} WHERE pond_id = ?", (pond_id,))
             self.db.execute("DELETE FROM pond WHERE id = ?", (pond_id,))
             # 3b. --wipe: purge the deployment record + run history + {version}/ artifacts for this major,
@@ -679,12 +1107,21 @@ class Driver:
                     self.db.execute(f"DELETE FROM ripple_run WHERE pond_version_id IN ({ph})", vids)
                     self.db.execute(f"DELETE FROM pond_run WHERE pond_version_id IN ({ph})", vids)
                     self.db.execute(f"DELETE FROM pond_version_schema WHERE pond_version_id IN ({ph})", vids)
+                    self.db.execute(f"DELETE FROM pond_version_serve WHERE pond_version_id IN ({ph})", vids)
+                    self.db.execute(f"DELETE FROM ripple_run_lineage WHERE pond_version_id IN ({ph})", vids)
+                    self.db.execute(
+                        f"DELETE FROM pond_version_column_lineage WHERE pond_version_id IN ({ph})", vids)
                     self.db.execute(
                         f"DELETE FROM ripple_to_ripple WHERE sink_id IN "
                         f"(SELECT id FROM ripple WHERE pond_version_id IN ({ph}))", vids)
                     self.db.execute(f"DELETE FROM ripple WHERE pond_version_id IN ({ph})", vids)
                     self.db.execute(f"DELETE FROM pond_version WHERE id IN ({ph})", vids)
-                # Drop the pond_name once its last major is gone and no live sink still sources it.
+                # Drop the pond_name once its last major is gone and no live sink still sources it —
+                # its served-major pointer (pond_serve, an FK on pond_name) goes with it.
+                self.db.execute(
+                    "DELETE FROM pond_serve WHERE pond_name_id = ? "
+                    "AND NOT EXISTS (SELECT 1 FROM pond_version WHERE pond_name_id = ?)",
+                    (pn_id, pn_id))
                 self.db.execute(
                     "DELETE FROM pond_name WHERE id = ? "
                     "AND NOT EXISTS (SELECT 1 FROM pond_version WHERE pond_name_id = ?) "
@@ -782,6 +1219,7 @@ class Driver:
             version_id = self.meta[pond]["version_id"]
             self.db.execute("DELETE FROM ripple_run WHERE pond_version_id = ?", (version_id,))
             self.db.execute("DELETE FROM pond_run WHERE pond_version_id = ?", (version_id,))
+            self.db.execute("DELETE FROM ripple_run_lineage WHERE pond_version_id = ?", (version_id,))
             self.db.commit()
             self.state_version += 1
 
@@ -870,8 +1308,28 @@ class Driver:
         """Operator acknowledgement: clear a Pond's failure/block (no run). Downstream Ponds blocked
         only by this failure re-derive and unblock on their own."""
         with self.lock:
-            self.state = clear_pond(self.state, pond, _now())
-            self._process(_now())
+            now = _now()
+            # Clearing rolls start_f back to end_f so liveness won't re-fail the halted Run — which also
+            # means liveness can never CLOSE it either. Close it here, or it sits at 'running' for good.
+            ps = self.state.pond_states.get(pond)
+            in_flight = ps.start_f if ps is not None and ps.start_f > ps.end_f else None
+            self.state = clear_pond(self.state, pond, now)
+            if in_flight is not None:
+                self._abandon_pond_run(pond, _iso(in_flight), now)
+            self._process(now)
+
+    def _abandon_pond_run(self, pond: str, f: str, now: datetime) -> None:
+        """Close a specific still-``running`` row an operator action abandoned. Never creates a row and
+        never overwrites a finished one — a Run the Duck already reported keeps its own outcome."""
+        meta = self.meta[pond]
+        cur = self.db.execute(
+            "UPDATE pond_run SET finished_at = ?, status = 'failed', "
+            "error = COALESCE(error, 'abandoned by an operator clear before the Run completed') "
+            "WHERE pond_version_id = ? AND f = ? AND status = 'running'",
+            (_iso(now), meta["version_id"], f),
+        )
+        if cur.rowcount:
+            self.db.commit()
 
     def clear_on_redeploy(self, name: str, major: int) -> None:
         """Called after a (re)deploy: if the Pond was failed, clear it — a fresh artifact presumably
@@ -902,6 +1360,337 @@ class Driver:
     def retry_config(self, pond: str) -> dict:
         p = self.state.ponds[pond]
         return {"immediate_retries": p.retry_immediately, "source_retries": p.retry_on_change}
+
+    @staticmethod
+    def duck_defaults() -> dict:
+        """The Catchment-wide compute defaults, from env. Inert for the classic subprocess Duck (the
+        Flock is off with no engine configured); the Flock posture matters for remote launchers."""
+        mode = (os.environ.get("DUCKSTRING_FLOCK_MODE") or "off").lower()
+        return {
+            "duck_target": "catchment",
+            "flock_mode": mode if mode in FLOCK_MODES else "off",
+            "flock_engine": os.environ.get("DUCKSTRING_FLOCK_ENGINE") or None,
+            "oom_policy": (os.environ.get("DUCKSTRING_FLOCK_OOM_POLICY") or "fail_up").lower(),
+        }
+
+    _DUCK_OVERRIDE_FIELDS = ("duck_target", "dedicated_instance_type", "dedicated_auto_stop", "deploy_config",
+                             "flock_mode", "flock_engine", "oom_policy")
+
+    def set_duck(self, pond: str, clear: bool = False, **fields) -> None:
+        """Set (or with ``clear`` drop) a Pond's compute override (persisted to pond_duck; operator-owned,
+        like retry budgets). Only the fields passed are changed; the rest keep their current override.
+        ``clear`` reverts the Pond to its DECLARED config (pond.toml), else the Catchment default."""
+        fields = {k: v for k, v in fields.items() if k in self._DUCK_OVERRIDE_FIELDS}
+        if fields.get("flock_mode") is not None and fields["flock_mode"] not in FLOCK_MODES:
+            raise ValueError(f"flock_mode must be one of {', '.join(FLOCK_MODES)}")
+        if fields.get("oom_policy") is not None and fields["oom_policy"] not in OOM_POLICIES:
+            raise ValueError(f"oom_policy must be one of {', '.join(OOM_POLICIES)}")
+        with self.lock:
+            pond_id = self.meta[pond]["pond_id"]
+            if clear:
+                self.db.execute("DELETE FROM pond_duck WHERE pond_id = ?", (pond_id,))
+                self.duck_overrides[pond] = _duck_override_row(None)
+            else:
+                cur = self.duck_overrides.get(pond) or _duck_override_row(None)
+                new = dict(cur)
+                new.update(fields)
+                # A dedicated Duck is a remote Duck of one — when its deployment config (provider + AWS
+                # image/AMI/VPC/IAM) is being set via the UI, it must be adequate to launch (validated over
+                # the env defaults). A dedicated target with NO blob keeps relying on the env (the CLI /
+                # hosted-platform path), surfacing a clear launch error if the env is also unset.
+                if new["duck_target"] == "dedicated" and new.get("deploy_config"):
+                    dc = new["deploy_config"]
+                    provider = dc.get("provider") or "fargate"
+                    from . import cloud_deploy
+                    miss = cloud_deploy.missing_fields(provider, dc)
+                    if miss:
+                        raise ValueError(
+                            f"dedicated {provider} Duck is missing required deployment config: "
+                            f"{', '.join(miss)} — set them (or the DUCKSTRING_{provider.upper()}_* env)")
+                    new["deploy_config"] = {"provider": provider, **cloud_deploy.clean(provider, dc)}
+                self.db.execute(
+                    "INSERT INTO pond_duck (pond_id, duck_target, dedicated_instance_type, "
+                    "dedicated_auto_stop, flock_mode, flock_engine, oom_policy, deploy_config) "
+                    "VALUES (:id, :duck_target, :dedicated_instance_type, :dedicated_auto_stop, "
+                    ":flock_mode, :flock_engine, :oom_policy, :deploy_config) "
+                    "ON CONFLICT(pond_id) DO UPDATE SET duck_target = excluded.duck_target, "
+                    "dedicated_instance_type = excluded.dedicated_instance_type, "
+                    "dedicated_auto_stop = excluded.dedicated_auto_stop, flock_mode = excluded.flock_mode, "
+                    "flock_engine = excluded.flock_engine, oom_policy = excluded.oom_policy, "
+                    "deploy_config = excluded.deploy_config",
+                    {"id": pond_id, "duck_target": new["duck_target"],
+                     "dedicated_instance_type": new["dedicated_instance_type"],
+                     "dedicated_auto_stop": (None if new["dedicated_auto_stop"] is None
+                                             else int(new["dedicated_auto_stop"])),
+                     "flock_mode": new["flock_mode"], "flock_engine": new["flock_engine"],
+                     "oom_policy": new["oom_policy"],
+                     "deploy_config": (json.dumps(new["deploy_config"]) if new.get("deploy_config") else None)},
+                )
+                self.duck_overrides[pond] = new
+            self.db.commit()
+            self._refresh_pool_identities()  # the target moved → the engine's Pool/persist model follows
+            self.state_version += 1  # the config shows in /api/status
+
+    def _refresh_pool_identities(self) -> None:
+        """Recompute each Pond's Pool identity + persist mode in the live engine after a compute-config
+        change (a duck override, a pool created/removed) — cheaper than a full reload, and demand-safe
+        (freshness/demand state untouched; only the visibility/persist model updates)."""
+        for key, pond in self.state.ponds.items():
+            if pond.is_draw or pond.is_spout:
+                continue
+            pond.pool = self._pool_of(key)
+            pond.async_persist = (self.data_root is not None
+                                  and not pond.pool.startswith("duck:"))
+            ps = self.state.pond_states.get(key)
+            if ps is not None and not pond.async_persist:
+                ps.persisted_f = ps.end_f  # durable at completion — the watermark tracks end_f
+
+    def _pool_of(self, pond: str) -> str:
+        """The Pool (one shared filesystem — plans/persist.md) this Pond's Duck runs on, mirroring the
+        DispatchingLauncher's actual routing: the Catchment Pool unless the Pond both TARGETS remote
+        compute and a remote backend is attached to take it (with none, the dispatcher degrades the spawn
+        to local — the Pool identity must follow the real box, not the configured wish). A remote spawn
+        is one machine per Pond in v1 → a Pool-of-one keyed by the pond key (named-Pool sharing is
+        plans/persist.md phase 5). Misclassification is fail-safe: a wrongly-remote identity only makes
+        gating conservative (waits for persisted_f), never premature."""
+        try:
+            duck = self.duck_config(pond)
+        except Exception:
+            return "catchment"
+        if not duck.get("remote"):
+            return "catchment"
+        # A named, non-preset pool the dispatcher would route to a shared machine → the SHARED Pool
+        # identity: every Pond on it sees the others at end_f (plans/pool-agent.md).
+        pool_identity = getattr(self.launcher, "pool_identity", None)
+        if pool_identity is not None:
+            shared = pool_identity(duck)
+            if shared is not None:
+                return f"pool:{shared}"
+        remote_for = getattr(self.launcher, "_remote_for", None)
+        if remote_for is None or remote_for(duck) is None:
+            return "catchment"  # no backend to take it — the dispatcher runs it locally
+        return f"duck:{pond}"
+
+    def duck_config(self, pond: str) -> dict:
+        """The Pond's EFFECTIVE compute config = override ?? declared ?? Catchment default (coalesce;
+        plans/cloud-config.md). An effective ``duck_target`` naming a pool this Catchment doesn't have
+        falls back to ``catchment`` (pond.toml stays portable)."""
+        o = self.duck_overrides.get(pond) or _duck_override_row(None)
+        decl = self.duck_declared.get(pond, {})
+        d = self.duck_defaults()
+
+        def pick(field):
+            return o.get(field) if o.get(field) is not None else (
+                decl.get(field) if decl.get(field) is not None else d.get(field))
+
+        # duck_target: override wins; else the declared pool name; else the Catchment default.
+        target = o["duck_target"] or decl.get("duck_target") or d["duck_target"]
+        if target not in ("catchment", "dedicated") and target not in self.duck_pool_names:
+            target = "catchment"  # an undefined pool → run locally (portable pond.toml)
+        # Embed the resolved pool spec so the dispatching launcher can act without DB access; `remote`
+        # is the routing signal (anything but the Catchment's own box).
+        pool = self.get_pool(target) if target not in ("catchment", "dedicated") else None
+        return {
+            "duck_target": target,
+            "remote": target != "catchment",
+            "preset": target in PRESET_POOLS,  # presets are isolated task-per-Pond, never a shared Pool
+            "pool": pool,
+            "dedicated_instance_type": o["dedicated_instance_type"],
+            "dedicated_auto_stop": o["dedicated_auto_stop"],
+            "deploy_config": o["deploy_config"],  # dedicated Duck's provider deployment config (JSON dict)
+            "flock_mode": pick("flock_mode"),
+            "flock_engine": pick("flock_engine"),
+            "oom_policy": pick("oom_policy"),
+            "declared": decl,
+            "override": {k: o[k] for k in self._DUCK_OVERRIDE_FIELDS},
+            "defaults": d,
+        }
+
+    # ─── Duck Pools (Catchment-level named remote compute; plans/cloud-config.md) ──
+
+    _POOL_FIELDS = ("provider", "instance_type", "cpu", "memory", "min_instances", "max_instances",
+                    "idle_timeout", "keep_warm", "region")
+
+    def _user_pools(self) -> list[dict]:
+        # Cached: rebuilt only when a pool is added/removed (or on reload), so status()'s per-Pond
+        # duck_config resolution doesn't run a DB query per Pond per ~1 s poll.
+        if self._pool_cache is not None:
+            return self._pool_cache
+        rows = self.db.execute(
+            "SELECT name, provider, instance_type, cpu, memory, min_instances, max_instances, "
+            "idle_timeout, keep_warm, region, deploy_config FROM duck_pool ORDER BY name"
+        ).fetchall()
+        cols = ("name", *self._POOL_FIELDS, "deploy_config")
+        pools = [dict(zip(cols, r, strict=True)) for r in rows]
+        for p in pools:
+            p["provider"] = p["provider"] or "fargate"  # NULL → the default provider
+            p["deploy_config"] = _load_json(p["deploy_config"])
+            p["managed"] = False
+        self._pool_cache = pools
+        return pools
+
+    def list_pools(self) -> list[dict]:
+        """The presets (built-in Fargate S/M/L/XL, `managed`) followed by user-defined pools."""
+        return [_preset_pool(n) for n in PRESET_POOLS] + self._user_pools()
+
+    def add_pool(self, name: str, **fields) -> dict:
+        """Create or update a user Duck Pool. Provider defaults to fargate; a preset name is reserved."""
+        if not name or not name.strip():
+            raise ValueError("a pool name is required")
+        if name in PRESET_POOLS:
+            raise ValueError(f"'{name}' is a built-in preset pool — pick another name")
+        vals = {k: fields.get(k) for k in self._POOL_FIELDS}
+        vals["provider"] = vals["provider"] or "fargate"
+        if vals["provider"] not in POOL_PROVIDERS:
+            raise ValueError(f"provider must be one of {', '.join(POOL_PROVIDERS)}")
+        for k in ("min_instances", "max_instances", "keep_warm"):
+            if vals[k] is not None and int(vals[k]) < 0:
+                raise ValueError(f"{k} must be >= 0")
+        mn, mx = vals["min_instances"], vals["max_instances"]
+        if mn is not None and mx is not None and int(mn) > int(mx):
+            raise ValueError("min_instances must be <= max_instances")
+        # When deployment config is supplied via the UI, it must be adequate to launch (validated over the
+        # env defaults). A pool created with NO blob keeps relying on the env (the CLI / hosted-platform
+        # path) — a clear launch error surfaces if the env is also unset.
+        from . import cloud_deploy
+        provided = fields.get("deploy_config")
+        deploy_config = cloud_deploy.clean(vals["provider"], provided)
+        if provided:
+            miss = cloud_deploy.missing_fields(vals["provider"], deploy_config)
+            if miss:
+                raise ValueError(
+                    f"{vals['provider']} pool is missing required deployment config: {', '.join(miss)} — set "
+                    f"them (or the DUCKSTRING_{vals['provider'].upper()}_* env)")
+        with self.lock:
+            self.db.execute(
+                "INSERT INTO duck_pool (name, provider, instance_type, cpu, memory, min_instances, "
+                "max_instances, idle_timeout, keep_warm, region, deploy_config) VALUES (:name, :provider, "
+                ":instance_type, :cpu, :memory, COALESCE(:min_instances, 0), COALESCE(:max_instances, 1), "
+                ":idle_timeout, COALESCE(:keep_warm, 0), :region, :deploy_config) "
+                "ON CONFLICT(name) DO UPDATE SET provider = excluded.provider, "
+                "instance_type = excluded.instance_type, cpu = excluded.cpu, memory = excluded.memory, "
+                "min_instances = excluded.min_instances, max_instances = excluded.max_instances, "
+                "idle_timeout = excluded.idle_timeout, keep_warm = excluded.keep_warm, "
+                "region = excluded.region, deploy_config = excluded.deploy_config",
+                {"name": name, **vals, "deploy_config": (json.dumps(deploy_config) if deploy_config else None)},
+            )
+            self.db.commit()
+            self.duck_pool_names.add(name)
+            self._pool_cache = None
+            self._refresh_pool_identities()
+            self.state_version += 1
+        return self.get_pool(name)
+
+    def get_pool(self, name: str) -> dict | None:
+        if name in PRESET_POOLS:
+            return _preset_pool(name)
+        for p in self._user_pools():
+            if p["name"] == name:
+                return p
+        return None
+
+    def remove_pool(self, name: str) -> None:
+        """Drop a user pool. Ponds pinned to it fall back to the Catchment Duck (the same unknown-pool
+        rule as a portable pond.toml), so removal never strands a Pond. Presets can't be removed."""
+        if name in PRESET_POOLS:
+            raise ValueError(f"'{name}' is a built-in preset pool and can't be removed")
+        with self.lock:
+            self.db.execute("DELETE FROM duck_pool WHERE name = ?", (name,))
+            self.db.commit()
+            self.duck_pool_names.discard(name)
+            self._pool_cache = None
+            self._refresh_pool_identities()
+            self.state_version += 1
+
+    # ─── Data serving: the exposure model + the served-major pointer (plans/data-serving.md) ──
+
+    def _pond_ids(self, pond_key: str) -> tuple[int, int, int, str, int]:
+        """(pond_id, pond_version_id, pond_name_id, name, major) for a pond key."""
+        m = self.meta[pond_key]
+        row = self.db.execute(
+            "SELECT p.id, p.pond_version_id, p.pond_name_id, p.major FROM pond p WHERE p.id = ?",
+            (m["pond_id"],),
+        ).fetchone()
+        return (row[0], row[1], row[2], m["name"], row[3])
+
+    def _output_tables(self, pond_version_id: int) -> set[str]:
+        return {r[0] for r in self.db.execute(
+            'SELECT DISTINCT "table" FROM pond_version_schema WHERE pond_version_id = ?',
+            (pond_version_id,))}
+
+    def serve_detail(self, pond_key: str) -> list[dict]:
+        """Per output table: its effective exposure + source (declared/override/hidden) — the Catalog
+        table list. Effective = override ?? (table ∈ declared serviceable)."""
+        pond_id, pv_id, _, _, _ = self._pond_ids(pond_key)
+        declared = {r[0] for r in self.db.execute(
+            "SELECT table_name FROM pond_version_serve WHERE pond_version_id = ?", (pv_id,))}
+        overrides = {r[0]: bool(r[1]) for r in self.db.execute(
+            "SELECT table_name, exposed FROM pond_serve_override WHERE pond_id = ?", (pond_id,))}
+        tables = self._output_tables(pv_id) | set(overrides)
+        out = []
+        for t in sorted(tables):
+            if t in overrides:
+                exposed, source = overrides[t], "override"
+            else:
+                exposed, source = (t in declared), ("declared" if t in declared else "hidden")
+            out.append({"table": t, "exposed": exposed, "source": source})
+        return out
+
+    def serviceable(self, pond_key: str) -> set[str]:
+        """The effective exposed (serviceable) tables for a pond line — the serving core's allowlist."""
+        return {d["table"] for d in self.serve_detail(pond_key) if d["exposed"]}
+
+    def set_exposed(self, pond_key: str, table: str, exposed: bool | None) -> None:
+        """Toggle the operational eye override for a table: True/False sets an explicit override,
+        None clears it (reverts to the pond.toml-declared default). Persists on the pond line (survives
+        a minor redeploy; a new major line starts fresh)."""
+        pond_id = self.meta[pond_key]["pond_id"]
+        with self.lock:
+            if exposed is None:
+                self.db.execute("DELETE FROM pond_serve_override WHERE pond_id = ? AND table_name = ?",
+                                (pond_id, table))
+            else:
+                self.db.execute(
+                    "INSERT INTO pond_serve_override (pond_id, table_name, exposed) VALUES (?, ?, ?) "
+                    "ON CONFLICT(pond_id, table_name) DO UPDATE SET exposed = excluded.exposed",
+                    (pond_id, table, int(exposed)))
+            self.db.commit()
+            self.state_version += 1
+
+    def served_major(self, name: str) -> int | None:
+        row = self.db.execute(
+            "SELECT ps.served_major FROM pond_serve ps JOIN pond_name pn ON pn.id = ps.pond_name_id "
+            "WHERE pn.name = ?", (name,)).fetchone()
+        return row[0] if row else None
+
+    def deployed_majors(self, name: str) -> list[int]:
+        return [r[0] for r in self.db.execute(
+            "SELECT p.major FROM pond p JOIN pond_name pn ON pn.id = p.pond_name_id "
+            "WHERE pn.name = ? ORDER BY p.major", (name,))]
+
+    def promote(self, name: str, major: int) -> None:
+        """Flip the served-major pointer (blue-green). Validated: the target major must publish every
+        table currently exposed on the served major, so a promotion never 404s a live query."""
+        from ..keys import pond_key
+        majors = self.deployed_majors(name)
+        if major not in majors:
+            raise ValueError(f"'{name}@{major}' is not deployed")
+        current = self.served_major(name)
+        if current is not None and current in majors:
+            exposed_now = self.serviceable(pond_key(name, current))
+            target_out = self._output_tables(self._pond_ids(pond_key(name, major))[1])
+            missing = exposed_now - target_out
+            if missing:
+                raise ValueError(
+                    f"'{name}@{major}' doesn't publish currently-served table(s): {', '.join(sorted(missing))}")
+        with self.lock:
+            (pn_id,) = self.db.execute("SELECT id FROM pond_name WHERE name = ?", (name,)).fetchone()
+            self.db.execute(
+                "INSERT INTO pond_serve (pond_name_id, served_major) VALUES (?, ?) "
+                "ON CONFLICT(pond_name_id) DO UPDATE SET served_major = excluded.served_major",
+                (pn_id, major))
+            self.db.commit()
+            self.state_version += 1
 
     def sleep(self, pond: str, upstream: bool = False) -> None:
         with self.lock:
@@ -1068,9 +1857,10 @@ class Driver:
         from pathlib import Path
 
         from ..trickle_io import load_sidecar
-        from .registry import pond_data_dir
+        from .registry import resolve_data_dir
 
-        sidecar = load_sidecar(pond_data_dir(Path(self.root), name, major, self.data_root))
+        sidecar = load_sidecar(resolve_data_dir(Path(self.root), name, major, self.data_root,
+                                                expected_f=self.published_f(name, major)))
         targets = [table] if table else list(sidecar)
         for t in targets:
             meta = sidecar.get(t)
@@ -1187,10 +1977,17 @@ class Driver:
                 # `source_f` is the source's actual published freshness, which the data + CDC cursor ride.
                 src_ps = self.state.pond_states.get(src_key)
                 source_f = _iso(src_ps.end_f) if src_ps and src_ps.end_f > NEVER else _iso(f)
+                # A table-less Spout egresses the source's SERVICEABLE set (its declared public products;
+                # plans/data-serving.md) when serving is in play — resolved live per delivery. With NO
+                # serviceable declaration it falls back to every table (the pre-serving behaviour, so an
+                # existing egress isn't silently stopped). An explicit `table` still ships just that one.
+                serviceable = set() if cfg.get("table") else self.serviceable(src_key)
+                tables = sorted(serviceable) if serviceable else None
                 jobs.append({
                     "spout_key": skey, "f": _iso(f), "source_f": source_f,
                     "pond_name": src["name"], "major": src["major"],
-                    "table": cfg.get("table"), "destination": cfg.get("destination"), "mode": cfg.get("mode"),
+                    "table": cfg.get("table"), "tables": tables,
+                    "destination": cfg.get("destination"), "mode": cfg.get("mode"),
                 })
             self._pending_egress = []
             return jobs
@@ -1242,7 +2039,8 @@ class Driver:
     # ─── Alerts (failure & freshness notifications — see plans/alerts.md) ────────
 
     def add_channel(self, name: str, destination: str, scope: str | None,
-                    events: str = "all", stale_ms: int | None = None) -> None:
+                    events: str = "all", stale_ms: int | None = None,
+                    renotify_ms: int | None = None) -> None:
         """Create a notification channel (operational config, like a Spout). ``scope`` is ``"name@major"``
         (one line) or ``None`` (catchment-wide) — a Pond-scoped channel is always a specific major. A bare
         ``"name"`` resolves to the Pond's **highest deployed major** (like every other CLI/API surface); an
@@ -1265,21 +2063,21 @@ class Driver:
             if existing:
                 raise ValueError(f"An alert channel named '{name}' already exists")
             self.db.execute(
-                "INSERT INTO alert_channel (name, destination, scope_name, scope_major, events, stale_ms) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (name, destination, scope_name, scope_major, events, stale_ms),
+                "INSERT INTO alert_channel (name, destination, scope_name, scope_major, events, stale_ms, "
+                "renotify_ms) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (name, destination, scope_name, scope_major, events, stale_ms, renotify_ms),
             )
             self.db.commit()
 
     def list_channels(self) -> list[dict]:
         with self.lock:
             rows = self.db.execute(
-                "SELECT name, destination, scope_name, scope_major, events, stale_ms, enabled, created_at "
-                "FROM alert_channel ORDER BY name"
+                "SELECT name, destination, scope_name, scope_major, events, stale_ms, enabled, created_at, "
+                "renotify_ms FROM alert_channel ORDER BY name"
             ).fetchall()
             return [
                 {"name": r[0], "destination": r[1], "scope": _format_scope(r[2], r[3]), "events": r[4],
-                 "stale_ms": r[5], "enabled": bool(r[6]), "created_at": r[7]}
+                 "stale_ms": r[5], "enabled": bool(r[6]), "created_at": r[7], "renotify_ms": r[8]}
                 for r in rows
             ]
 
@@ -1359,12 +2157,12 @@ class Driver:
 
             wanted = match_kinds or (kind,)
             channels = self.db.execute(
-                "SELECT id, events, scope_name, scope_major FROM alert_channel WHERE enabled = 1"
+                "SELECT id, events, scope_name, scope_major, renotify_ms FROM alert_channel WHERE enabled = 1"
             ).fetchall()
             if not channels:
                 return
             enqueued = False
-            for cid, events, scope_name, ch_major in channels:
+            for cid, events, scope_name, ch_major, renotify_ms in channels:
                 # A Pond-scoped channel matches exactly its (name, major); catchment-wide (name NULL) matches all.
                 if scope_name is not None and (scope_name != scope_pond or ch_major != scope_major):
                     continue
@@ -1376,6 +2174,12 @@ class Driver:
                     f=f, catchment=self._catchment_display(), detail=detail or {},
                 )
                 dedup = f"{kind}:{scope_pond or '-'}:{f or '-'}"
+                # Re-notify cadence (opt-in): a channel with renotify_ms fences per TIME BUCKET, not per
+                # episode — the tick's re-emission then passes the UNIQUE fence once per interval while
+                # the episode persists. A recovery stays once-per-episode (nothing re-fires it).
+                if renotify_ms and kind != "recovery":
+                    bucket = int(_now().timestamp() * 1000 // int(renotify_ms))
+                    dedup = f"{dedup}:r{bucket}"
                 cur = self.db.execute(
                     "INSERT OR IGNORE INTO alert_delivery "
                     "(channel_id, dedup_key, event_kind, pond_name, severity, payload) "
@@ -1401,7 +2205,9 @@ class Driver:
         detail = {"blocked_downstream": blocked} if blocked else {}
         self._emit_alert(kind, scope_pond=scope_pond, scope_major=scope_major, severity="error",
                          title=title, message=message, f=f, detail=detail)
-        self._alerted_failures[key] = (kind, scope_pond, scope_major, f)
+        # Remember the episode (for the recovery on clear, and for _check_renotify's re-emission —
+        # title/message ride along so a re-notify repeats the original alert verbatim).
+        self._alerted_failures[key] = (kind, scope_pond, scope_major, f, title, message)
 
     def _emit_recoveries(self) -> None:
         """Emit a `recovery` for any Pond/Spout that was alerted as failed and has since cleared. Called
@@ -1410,7 +2216,7 @@ class Driver:
             ps = self.state.pond_states.get(key)
             if ps is not None and (ps.is_failed or ps.is_killed):
                 continue  # still down (or killed — a kill is intentional, not a recovery)
-            kind, scope_pond, scope_major, _f = self._alerted_failures.pop(key)
+            kind, scope_pond, scope_major, _f, _title, _message = self._alerted_failures.pop(key)
             label = self.meta.get(key, {}).get("name", key)
             self._emit_alert(
                 "recovery", scope_pond=scope_pond, scope_major=scope_major, severity="info",
@@ -1428,6 +2234,7 @@ class Driver:
         ).fetchall()
         if not channels:
             return
+        self._renotify_channels = self._any_renotify()  # computed once per sweep
         for cid, scope_name, ch_major, events, stale_ms in channels:
             from ..alerts import normalise_events
             if "freshness" not in normalise_events(events):
@@ -1444,15 +2251,20 @@ class Driver:
                     continue
                 stale = (now - ps.end_f) > bound
                 token = (cid, key)
-                if stale and token not in self._stale_breached:
+                if stale:
+                    first = token not in self._stale_breached
                     self._stale_breached.add(token)
+                    # Emitted on the transition AND on every later tick while breached: for a channel
+                    # without renotify_ms the dedup fence swallows the repeats (once per episode); with
+                    # it, the bucketed key re-fires once per interval (the re-notify cadence).
                     age = int((now - ps.end_f).total_seconds())
-                    self._emit_alert(
-                        "freshness", scope_pond=name, scope_major=major, severity="warning",
-                        title=f"'{name}' is stale", f=_iso(ps.end_f),
-                        message=f"'{name}' has not been fresh for {age}s (SLA {int(stale_ms / 1000)}s).",
-                        detail={"stale_seconds": age},
-                    )
+                    if first or self._renotify_channels:
+                        self._emit_alert(
+                            "freshness", scope_pond=name, scope_major=major, severity="warning",
+                            title=f"'{name}' is stale", f=_iso(ps.end_f),
+                            message=f"'{name}' has not been fresh for {age}s (SLA {int(stale_ms / 1000)}s).",
+                            detail={"stale_seconds": age},
+                        )
                 elif not stale and token in self._stale_breached:
                     self._stale_breached.discard(token)
                     self._emit_alert(
@@ -1462,12 +2274,33 @@ class Driver:
                         match_kinds=("recovery", "freshness"),
                     )
 
+    def _any_renotify(self) -> bool:
+        return self.db.execute(
+            "SELECT 1 FROM alert_channel WHERE enabled = 1 AND renotify_ms IS NOT NULL LIMIT 1"
+        ).fetchone() is not None
+
+    def _check_renotify(self, now: datetime) -> None:
+        """The tick-driven re-notify sweep (alongside _check_freshness): while a **failure episode
+        persists** (the Pond is still failed), re-emit the original alert. Channels without
+        ``renotify_ms`` swallow the repeat at their once-per-episode dedup fence; channels with it
+        re-fire once per interval via the time-bucketed key (see _emit_alert). Freshness re-notify rides
+        _check_freshness's own sweep. No-op without a renotify channel — zero cost on the default path."""
+        if not self._alerted_failures or not self._any_renotify():
+            return
+        for key, (kind, scope_pond, scope_major, f, title, message) in list(self._alerted_failures.items()):
+            ps = self.state.pond_states.get(key)
+            if ps is None or not ps.is_failed or ps.is_killed:
+                continue  # cleared (recovery handles it) or killed (intentional — never re-notified)
+            self._emit_alert(kind, scope_pond=scope_pond, scope_major=scope_major, severity="error",
+                             title=title, message=message, f=f)
+
     # ─── Duck events ──────────────────────────────────────────────────────────
 
     def on_event(self, pond: str, payload: dict) -> None:
         with self.lock:
             now = _now()
             self.last_seen[pond] = now  # any event proves the Duck is alive
+            self._awaiting_first_contact.discard(pond)  # it spoke — steady-state liveness from here
             kind = payload.get("kind")
             f = payload.get("f")
             status = payload.get("status", "success")
@@ -1492,6 +2325,10 @@ class Driver:
                         retry=payload.get("retry", 0),
                         error=payload.get("error"), traceback=payload.get("traceback"),
                     )
+                    if payload.get("lineage"):
+                        self._record_lineage(pond, rname, f, payload.get("retry", 0), payload["lineage"])
+                    if payload.get("flock"):
+                        self._record_flock(pond, payload["flock"])
                     self._process(now)
             elif kind == "failed":
                 # The Pond Run gave up at this Ripple's freshness: fail the Pond (and block downstream).
@@ -1538,14 +2375,23 @@ class Driver:
                     self._process(now)
             elif kind == "run_completed":
                 self.state = clear_missing_asset(self.state, pond)  # a clean read → the wait (if any) is over
+                self.data_version += 1  # the Pond published new output → the serving surface changed
                 self._finish_pond_run(pond, f, now, changed=payload.get("changed", True))
                 # Freeze the published output schema as the version's contract (the substrate the
                 # additive gate and min_version enforcement build on).
                 if payload.get("schema"):
                     self._capture_schema(pond, payload["schema"])
+                self._emit_openlineage(pond, f, payload.get("schema"))  # catalog emission (opt-in channels)
                 self._process(now)
                 self._advance_repair(pond, now)  # if this Pond was a repair step, release its children
                 self._signal_egress()  # the Pond published → wake the egress worker for its Spouts
+            elif kind == "persist":
+                # The Duck mirrored its local publish to the durable layer (plans/persist.md). A separate
+                # log item from the Pond Run (which closed at local publish); success advances the
+                # persisted_f watermark. Pure observability in phase 2 — no engine state changes.
+                self._record_persist(pond, f, payload.get("status", "success"), payload.get("error"), now,
+                                     started_at=payload.get("started_at"),
+                                     finished_at=payload.get("finished_at"))
             elif kind == "contract_failed":
                 # The Duck refused to publish: the output broke the major line's additive contract.
                 # Fail the Pond at this Run (keeping last-good data) and block downstream, like any failure.
@@ -1569,6 +2415,7 @@ class Driver:
     def take_jobs(self, pond: str) -> list[dict]:
         with self.lock:
             self.last_seen[pond] = _now()  # the Duck is alive — it just polled
+            self._awaiting_first_contact.discard(pond)
             jobs = self.jobs.get(pond, [])
             self.jobs[pond] = []
             return jobs
@@ -1648,6 +2495,7 @@ class Driver:
             rs.start_f = datetime.fromisoformat(f)
             self.state = complete_ripple(self.state, eid, now)
             self._record_ripple_run(pond, "draw", f, "success", started_at=started, finished_at=_iso(now))
+            self.data_version += 1  # the Draw landed new data → the serving surface changed
             self._finish_pond_run(pond, f, now)
             self._process(now, notify=False)  # poller-driven
 
@@ -1849,6 +2697,7 @@ class Driver:
         pond_id, pv_id = prow[0], prow[1]
         db.execute("DELETE FROM ripple_run WHERE pond_version_id = ?", (pv_id,))
         db.execute("DELETE FROM pond_run WHERE pond_version_id = ?", (pv_id,))
+        db.execute("DELETE FROM ripple_run_lineage WHERE pond_version_id = ?", (pv_id,))
         for tbl in ("pond_state", "pond_target", "pond_open", "pond_trigger", "pond_retry", "pond_window"):
             db.execute(f"DELETE FROM {tbl} WHERE pond_id = ?", (pond_id,))
         db.execute("DELETE FROM pond WHERE id = ?", (pond_id,))
@@ -1913,8 +2762,9 @@ class Driver:
         (pn_id,) = db.execute("SELECT pond_name_id FROM pond WHERE id = ?", (pond_id,)).fetchone()
         db.execute("DELETE FROM ripple_run WHERE pond_version_id = ?", (pv_id,))
         db.execute("DELETE FROM pond_run WHERE pond_version_id = ?", (pv_id,))
+        db.execute("DELETE FROM ripple_run_lineage WHERE pond_version_id = ?", (pv_id,))
         for tbl in ("pond_state", "pond_target", "pond_open", "pond_trigger", "pond_retry",
-                    "pond_window", "pond_spout", "pond_to_pond"):
+                    "pond_window", "pond_spout", "pond_duck", "pond_to_pond"):
             db.execute(f"DELETE FROM {tbl} WHERE pond_id = ?", (pond_id,))
         db.execute("DELETE FROM pond WHERE id = ?", (pond_id,))
         db.execute("DELETE FROM ripple WHERE pond_version_id = ?", (pv_id,))
@@ -1935,6 +2785,121 @@ class Driver:
             self._check_liveness(now)
             self._tick_process(now)
             self._check_freshness(now)
+            self._check_renotify(now)
+            self._check_disk_pressure(now)
+
+    # Registry eviction under disk pressure (plans/persist.md phase 6). Registries (and, once mirrored,
+    # local publishes) are reconstructible caches — under pressure the Catchment Pool sheds idle Ponds'
+    # hot state, LRU, and they rehydrate on next demand. Free-space floor: DUCKSTRING_MIN_FREE_BYTES
+    # (default 1 GiB; 0 disables). Checked cheaply every tick (one statvfs); the eviction scan runs only
+    # below the floor.
+    _EVICT_CHECK_EVERY = timedelta(seconds=30)
+
+    def _min_free_bytes(self) -> int:
+        try:
+            return int(os.environ.get("DUCKSTRING_MIN_FREE_BYTES", str(1 << 30)))
+        except ValueError:
+            return 1 << 30
+
+    def _check_disk_pressure(self, now: datetime) -> None:
+        floor = self._min_free_bytes()
+        if floor <= 0 or not self.launcher.manages_processes:
+            return
+        last = getattr(self, "_last_evict_check", None)
+        if last is not None and (now - last) < self._EVICT_CHECK_EVERY:
+            return
+        self._last_evict_check = now
+        try:
+            st = os.statvfs(str(self.root))
+            free = st.f_bavail * st.f_frsize
+        except Exception:
+            return
+        if free >= floor:
+            return
+        self._evict_idle_registries(now, floor - free)
+
+    def _evict_idle_registries(self, now: datetime, needed: int) -> None:
+        """Shed idle Ponds' reconstructible hot state, LRU by last completion, until ``needed`` bytes are
+        reclaimed or candidates run out. Two safety-tiered forms per Pond:
+
+        - the **registry** (registry.duckdb) — evictable whenever the Pond's published content survives
+          somewhere it can rehydrate from (the local publish, or the durable plane);
+        - the **local publish** too — ONLY when the durable plane holds everything (``persisted_f >=
+          changed_f``): reads then resolve to the plane and rehydration comes from it. Never evicted
+          when un-mirrored content exists — eviction must never lose data.
+
+        Only idle, demand-free, non-running Ponds qualify (their Duck is terminated first). Draws/Spouts
+        hold no registry."""
+        import shutil
+        from pathlib import Path as _Path
+
+        from ..trickle_io import load_sidecar
+        from .registry import pond_data_dir, pond_registry_path
+
+        root = _Path(self.root)
+        candidates = []
+        for key, pond in self.state.ponds.items():
+            if pond.is_draw or pond.is_spout:
+                continue
+            ps = self.state.pond_states[key]
+            if ps.start_f > ps.end_f or ps.has_pull or ps.targets or key in self.jobs and self.jobs[key]:
+                continue  # running or demanded — never evict live work
+            if self.launcher.is_running(key):
+                continue  # warm Duck (standing trigger keeps it) — reaping is the reaper's job, not ours
+            meta = self.meta[key]
+            reg = pond_registry_path(root, meta["name"], meta["major"])
+            if not reg.exists():
+                continue  # nothing to shed
+            local_dir = pond_data_dir(root, meta["name"], meta["major"], None)
+            try:
+                local_f = _plane_freshness(load_sidecar(local_dir))
+            except Exception:
+                local_f = None
+            claimed = _iso(ps.changed_f) if ps.changed_f != NEVER else None
+            mirrored = pond.async_persist and claimed is not None and _iso(ps.persisted_f) >= claimed
+            backed_local = claimed is None or (local_f is not None and local_f >= claimed)
+            if not (backed_local or mirrored):
+                continue  # the registry is the only copy of something — never evict
+            last_done = ps.completion_times[-1] if ps.completion_times else NEVER
+            candidates.append((last_done, key, reg, local_dir, mirrored))
+        candidates.sort()  # LRU: oldest completion first
+        reclaimed = 0
+        for _, key, reg, local_dir, mirrored in candidates:
+            if reclaimed >= needed:
+                break
+            self.launcher.terminate(key, wait=True)
+            size = 0
+            for p in (reg, reg.with_name(reg.name + ".wal"), reg.with_name(reg.name + ".shm")):
+                try:
+                    size += p.stat().st_size
+                    p.unlink()
+                except OSError:
+                    pass
+            if mirrored:  # tier 2: the plane holds everything — the local publish is shed too
+                try:
+                    size += sum(f.stat().st_size for f in local_dir.root.rglob("*") if f.is_file())
+                    shutil.rmtree(local_dir.root, ignore_errors=True)
+                except OSError:
+                    pass
+            reclaimed += size
+            print(f"[driver] disk pressure: evicted {key}'s hot state "
+                  f"({size / 1e6:.0f} MB; {'registry+publish' if mirrored else 'registry'}) — "
+                  f"rehydrates on next demand", flush=True)
+
+    def _silence_window(self, pond: str) -> timedelta:
+        """How long this Pond's Duck may be silent before it counts as dead. Once it has spoken, the
+        steady-state window; before that, the provider's startup grace — booting an EC2 instance is
+        minutes, and judging it by the steady-state 60 s failed every cold EC2 pool's first run."""
+        if pond not in self._awaiting_first_contact:
+            return _DUCK_DEAD_AFTER
+        provider = "catchment"
+        try:
+            duck = self.duck_config(pond)
+            if duck.get("remote"):
+                provider = (duck.get("pool") or {}).get("provider") or "fargate"
+        except Exception:
+            pass
+        return max(_STARTUP_GRACE.get(provider, _DUCK_DEAD_AFTER), _DUCK_DEAD_AFTER)
 
     def _check_liveness(self, now: datetime) -> None:
         """Fail any Pond whose Duck has died (process gone) or fallen silent (no contact) while a Run
@@ -1955,11 +2920,23 @@ class Driver:
                 continue
             last = self.last_seen.get(pond)
             dead = not self.launcher.is_running(pond)
-            silent = last is not None and (now - last) > _DUCK_DEAD_AFTER
+            silent = last is not None and (now - last) > self._silence_window(pond)
             if dead:
-                self._fail_whole_pond(pond, now, "Duck process is not running (it crashed or exited)")
+                # Prefer the launcher's specific spawn-failure reason (e.g. a remote pool missing its
+                # image/AMI/IAM) over the generic crash message, so the operator sees the real cause.
+                reason = getattr(self.launcher, "launch_error", lambda _k: None)(pond)
+                self.launcher.terminate(pond)  # clear any dead record so a retry re-spawns
+                self._fail_whole_pond(pond, now, reason or "Duck process is not running (it crashed or exited)")
             elif silent:
-                self._fail_whole_pond(pond, now, "Lost contact with the Duck (no events received)")
+                # A remote Duck that launched but never (or no longer) dials back: ask its backend what the
+                # provider knows (e.g. ECS stoppedReason) — the single most opaque failure otherwise.
+                detail = getattr(self.launcher, "diagnose", lambda _k: None)(pond)
+                # Tear the Duck down BEFORE failing: _fail_whole_pond's cascade may re-dispatch a
+                # retry-on-change Run, and a stale task/instance record would make the backend's ensure()
+                # a silent no-op — the Pond then wedges failing this same way forever.
+                self.launcher.terminate(pond)
+                msg = "Lost contact with the Duck (no events received)"
+                self._fail_whole_pond(pond, now, f"{msg}: {detail}" if detail else msg)
 
     # ─── Core processing ──────────────────────────────────────────────────────
 
@@ -1968,6 +2945,10 @@ class Driver:
         self._process(now)
 
     def _process(self, now: datetime, notify: bool = True) -> None:
+        # Pause the engine while a data-plane migration copies/adopts — Ducks are quiesced and the old
+        # plane must not receive new writes (that a spawned run would produce) before the re-point.
+        if self.migration is not None and self.migration.get("status") in ("copying", "adopting"):
+            return
         self.state, _started = sentinel(now, self.state)
         for cmd in drain_begin_runs(self.state):
             self._dispatch_begin_run(cmd.pond_id, cmd.f, now, force=cmd.force, refresh=cmd.refresh,
@@ -2013,12 +2994,13 @@ class Driver:
                 self._pending_egress.append((pond, f))
             self._signal_egress()
             return
-        self.launcher.ensure(pond, meta["version"], meta["source_path"])
+        self.launcher.ensure(pond, meta["version"], meta["source_path"], duck=self.duck_config(pond))
         self.last_seen[pond] = now  # grace clock: a freshly (re)spawned Duck isn't immediately stale
+        self._awaiting_first_contact.add(pond)  # until it speaks, judge it by the spawn grace (see below)
         self._idle_since.pop(pond, None)  # it's running again — reset its reap grace clock
         # Cancel any not-yet-collected shutdown: this Pond is running again, so the Duck must not exit.
         self.jobs[pond] = [j for j in self.jobs.get(pond, []) if j.get("kind") != "shutdown"]
-        self.jobs[pond].append({
+        self._enqueue_job(pond, {
             "kind": "begin_run", "f": _iso(f), "force": force, "refresh": refresh,
             "sources_changed": sources_changed,  # backs pond.sources_changed() (for always_run gating)
             "immediate_retries": self.state.ponds[pond].retry_immediately,  # live budget, per Run
@@ -2028,6 +3010,9 @@ class Driver:
             # The major line's additive schema contract this Run must keep (vetted by the Duck before
             # publishing); None for a first run or a deliberate rollback (governed by min_version).
             "contract": self._contract_for(pond),
+            # What each Source has published ({name: iso}), so a foreign read can reject a stale LOCAL
+            # publish left behind by a Source that moved to a remote Pool (registry.resolve_data_dir).
+            "source_f": self._source_published_f(pond),
         })
         # Write started_at as tz-aware ISO (UTC) to match finished_at; the SQLite `datetime('now')`
         # default is naive and would be misread as local time by the UI. A Force re-opens the Run.
@@ -2062,7 +3047,7 @@ class Driver:
             # that re-runs on any sub-grace cadence keeps its Duck and never hits the reap/respawn race.
             since = self._idle_since.setdefault(name, now)
             if now - since >= _REAP_GRACE:
-                self.jobs.setdefault(name, []).append({"kind": "shutdown"})
+                self._enqueue_job(name, {"kind": "shutdown"})
                 self._idle_since.pop(name, None)
 
     # ─── History + persistence ────────────────────────────────────────────────
@@ -2092,6 +3077,62 @@ class Driver:
             (_iso(now), int(changed), meta["version_id"], f),
         )
         self.db.commit()
+        self._close_abandoned_runs(pond, f, now)
+
+    def _close_abandoned_runs(self, pond: str, through_f: str, now: datetime) -> None:
+        """Close any OLDER ``running`` row for this version — the Pond has demonstrably moved past them.
+
+        The invariant: a Pond that is not in flight has no running rows. A row is only closed by the Duck
+        reporting *that* Run, so any path where the Pond advances without a report (an operator clear over
+        an in-flight Run, a Duck that vanished before its report landed, a replaced spawn) strands one at
+        ``running`` forever — liveness will not touch it, because the Pond is no longer in flight. It then
+        sits in the history looking like work still in progress, which is what made a live box look like
+        it had a stuck Run three separate times.
+
+        Deliberately reconciliation rather than a fix at each call site: it holds for paths not yet
+        enumerated, which is the useful property when the exact sequence has resisted reproduction."""
+        meta = self.meta[pond]
+        cur = self.db.execute(
+            "UPDATE pond_run SET finished_at = ?, status = 'failed', "
+            "error = COALESCE(error, 'abandoned — the Pond advanced past this Run without completing it') "
+            "WHERE pond_version_id = ? AND status = 'running' AND f < ?",
+            (_iso(now), meta["version_id"], through_f),
+        )
+        if cur.rowcount:
+            self.db.commit()
+
+    def _record_persist(self, pond: str, f: str | None, status: str, error: str | None, now: datetime,
+                        started_at: str | None = None, finished_at: str | None = None) -> None:
+        """Record a Duck's persist report (plans/persist.md): upsert the ``pond_persist`` log row and, on
+        success, advance the ``persisted_f`` watermark (monotonic — a replayed/stale report never regresses
+        it) in the DB **and the engine** — cross-Pool Sinks gate on it (``source_visible_f``), so the
+        advance is a demand-relevant event and the cascade is driven (``_process``). Idempotent on
+        ``(pond, f)`` so event replay after a reconnect is safe."""
+        if not f:
+            return
+        meta = self.meta.get(pond)
+        if meta is None:
+            return
+        self.db.execute(
+            "INSERT OR REPLACE INTO pond_persist (pond_id, f, status, error, started_at, finished_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (meta["pond_id"], f, status, error, started_at, finished_at or _iso(now)),
+        )
+        if status == "success":
+            prev = self.persisted.get(pond)
+            if prev is None or f > prev:  # ISO-8601 UTC sorts lexically
+                self.persisted[pond] = f
+                self.db.execute("UPDATE pond_state SET persisted_f = ? WHERE pond_id = ?",
+                                (f, meta["pond_id"]))
+            if pond in self.state.pond_states:
+                record_persist(self.state, pond, datetime.fromisoformat(f))
+            # The durable plane just gained this line's output — the readable surface changed: refresh
+            # the status-poll caches (a Pool-run Pond's has_tables flips HERE, not at run completion,
+            # because the Catchment reads it from the plane) and the warm serving connections.
+            self.data_version += 1
+        self.db.commit()
+        if status == "success":
+            self._process(now)  # a cross-Pool Sink waiting on this Source's mirror may now be runnable
 
     def _record_pass(self, pond: str, f: datetime, now: datetime) -> None:
         """An engine-synthesised pass (no Duck): record an instant, successful no-change pond_run so the
@@ -2133,6 +3174,184 @@ class Driver:
             return None  # rollback — governed by min_version, not the forward-only schema gate
         return by_version[high_water]
 
+    def _record_lineage(self, pond: str, ripple: str, f: str, retry: int, lineage: dict) -> None:
+        """Persist a Ripple attempt's observed reads/writes (plans/lineage.md Phase 1). Idempotent on
+        replay (INSERT OR IGNORE over the full row key); wrapped so a lineage write can never fail a run
+        — lineage is observability, not orchestration."""
+        try:
+            vid = self.meta[pond]["version_id"]
+            rows = [(vid, ripple, f, retry, "read", s or "", t) for s, t in lineage.get("reads", [])]
+            rows += [(vid, ripple, f, retry, "write", "", t) for t in lineage.get("writes", [])]
+            self.db.executemany(
+                "INSERT OR IGNORE INTO ripple_run_lineage "
+                "(pond_version_id, ripple, f, retry, direction, source_name, table_name) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)", rows,
+            )
+            self.db.commit()
+        except Exception as exc:  # noqa: BLE001 — never let bookkeeping break a run
+            print(f"[catchment] lineage record failed ({pond}.{ripple}): {exc}", flush=True)
+
+    def lineage(self, pond: str | None = None, major: int | None = None, table: str | None = None,
+                columns: bool = False) -> dict:
+        """The observed table-level lineage graph (plans/lineage.md Phase 1), from each Ripple's **latest
+        recorded run** on each selected version. ``pond`` narrows to one Pond (its selected version on
+        ``major``, default the highest deployed); ``table`` narrows to edges touching that table name.
+        Returns ``{"ponds": [{"id", "name", "major", "version", "ripples": [{"ripple", "f", "reads":
+        [{"source", "table"}], "writes": [table]}]}]}`` — reads with ``source: null`` are own tables."""
+        with self.lock:
+            keys = [k for k in self.meta if not self.meta[k].get("is_spout") and not self.meta[k].get("is_draw")]
+            if pond is not None:
+                keys = [k for k in keys if self.meta[k]["name"] == pond
+                        and (major is None or self.meta[k]["major"] == major)]
+                if pond is not None and major is None and len(keys) > 1:  # bare name → highest major
+                    keys = [max(keys, key=lambda k: self.meta[k]["major"])]
+            out = []
+            for key in sorted(keys):
+                m = self.meta[key]
+                rows = self.db.execute(
+                    "SELECT l.ripple, l.f, l.direction, l.source_name, l.table_name "
+                    "FROM ripple_run_lineage l "
+                    "WHERE l.pond_version_id = ? AND l.f = ("
+                    "  SELECT MAX(l2.f) FROM ripple_run_lineage l2 "
+                    "  WHERE l2.pond_version_id = l.pond_version_id AND l2.ripple = l.ripple) "
+                    "ORDER BY l.ripple, l.direction, l.source_name, l.table_name",
+                    (m["version_id"],),
+                ).fetchall()
+                ripples: dict[str, dict] = {}
+                for rname, f, direction, source, tname in rows:
+                    r = ripples.setdefault(rname, {"ripple": rname, "f": f, "reads": [], "writes": []})
+                    if direction == "read":
+                        r["reads"].append({"source": source or None, "table": tname})
+                    else:
+                        r["writes"].append(tname)
+                if table is not None:  # narrow to ripples touching this table name
+                    ripples = {n: r for n, r in ripples.items()
+                               if table in r["writes"] or any(rd["table"] == table for rd in r["reads"])}
+                entry = {"id": key, "name": m["name"], "major": m["major"], "version": m["version"],
+                         "ripples": sorted(ripples.values(), key=lambda r: r["ripple"])}
+                if columns:
+                    entry["columns"] = self._column_lineage_of(m["version_id"], table)
+                if pond is None and not ripples and not entry.get("columns"):
+                    continue  # the catchment-wide view lists only ponds with recorded lineage
+                out.append(entry)
+            return {"ponds": out}
+
+    def _column_lineage_of(self, version_id: int, table: str | None = None) -> dict:
+        """The deploy-captured static column lineage (plans/lineage.md Phase 2) for one version:
+        ``{table: {column: [{"ref", "column"}] | "constant" | "opaque"} | "opaque"}``. Absent columns
+        were simply not captured (a non-capturable ripple) — absent, never guessed."""
+        rows = self.db.execute(
+            'SELECT "table", "column", kind, src_ref, src_column FROM pond_version_column_lineage '
+            'WHERE pond_version_id = ? ORDER BY "table", "column", src_ref, src_column', (version_id,),
+        ).fetchall()
+        out: dict = {}
+        for tname, col, kind, src_ref, src_col in rows:
+            if table is not None and tname != table:
+                continue
+            if col == "" and kind == "opaque":
+                out[tname] = "opaque"  # the whole table is unprovable (a .sql() output)
+                continue
+            t = out.setdefault(tname, {})
+            if not isinstance(t, dict):
+                continue
+            if kind == "exact":
+                t.setdefault(col, []).append({"ref": src_ref, "column": src_col})
+            else:
+                t[col] = kind  # "constant" | "opaque"
+        return out
+
+    def trace_run(self, pond_name: str, major: int, row_f: str) -> dict:
+        """Temporal provenance for a row freshness (plans/lineage.md Phase 4): the run that produced it
+        (version, timings, status), its input window ``(previous_f, f]`` (the bracket every Source was
+        read over — ``previous_f`` is the prior *successful* run), and the declared Sources."""
+        with self.lock:
+            row = self.db.execute(
+                "SELECT pr.f, pv.version, pr.started_at, pr.finished_at, pr.status "
+                "FROM pond_run pr JOIN pond_version pv ON pv.id = pr.pond_version_id "
+                "JOIN pond_name pn ON pn.id = pv.pond_name_id "
+                "WHERE pn.name = ? AND pv.major = ? AND pr.f = ? "
+                "ORDER BY pr.finished_at DESC LIMIT 1", (pond_name, major, row_f),
+            ).fetchone()
+            prev = self.db.execute(
+                "SELECT MAX(pr.f) FROM pond_run pr JOIN pond_version pv ON pv.id = pr.pond_version_id "
+                "JOIN pond_name pn ON pn.id = pv.pond_name_id "
+                "WHERE pn.name = ? AND pv.major = ? AND pr.f < ? AND pr.status = 'success'",
+                (pond_name, major, row_f),
+            ).fetchone()
+            key = f"{pond_name}@{major}"
+            sources = sorted(
+                self.meta[sk]["name"] for sk in
+                (self.state.ponds[key].sources if key in self.state.ponds else [])
+                if sk in self.meta
+            )
+            run = None
+            if row is not None:
+                run = {"f": row[0], "version": row[1], "started_at": row[2],
+                       "finished_at": row[3], "status": row[4]}
+            return {"run": run,
+                    "window": {"previous_f": prev[0] if prev else None, "f": row_f},
+                    "sources": sources}
+
+    def _emit_openlineage(self, pond: str, f: str, schema: dict | None) -> None:
+        """Emit a standard OpenLineage RunEvent (COMPLETE) for a finished Pond Run to any channel
+        subscribed to the ``openlineage`` kind (plans/lineage.md Phase 4 — the integrate-don't-compete
+        move: one emitter slots Duckstring into whatever catalog a team already runs). The event body is
+        assembled from facts already in hand — the run identity, the observed table reads/writes
+        (``ripple_run_lineage`` at this ``f``), and the captured output schema as facets — and delivered
+        through the alert outbox (retries, audit, a catalog outage never touches a run). Deliberately
+        NOT in the ``all`` subscription (a Slack channel must not receive raw catalog events); a channel
+        opts in with ``--on openlineage``. Wrapped: emission can never break a run."""
+        try:
+            import uuid
+
+            if not self._openlineage_channels():
+                return  # no subscriber — build nothing
+            m = self.meta[pond]
+            cid = self._catchment_uuid() or "catchment"
+            namespace = f"duckstring://{cid}"
+            rows = self.db.execute(
+                "SELECT DISTINCT direction, source_name, table_name FROM ripple_run_lineage "
+                "WHERE pond_version_id = ? AND f = ?", (m["version_id"], f),
+            ).fetchall()
+            inputs = [{"namespace": namespace, "name": f"{src}.{t}"}
+                      for d, src, t in sorted(rows) if d == "read" and src]
+            out_names = sorted({t for d, src, t in rows if d == "write"} | set((schema or {}).keys()))
+            outputs = []
+            for t in out_names:
+                ds: dict = {"namespace": namespace, "name": f"{m['name']}.{t}"}
+                if schema and t in schema:
+                    ds["facets"] = {"schema": {
+                        "_producer": _OL_PRODUCER, "_schemaURL": _OL_SCHEMA_FACET,
+                        "fields": [{"name": c, "type": ty} for c, ty in schema[t].items()],
+                    }}
+                outputs.append(ds)
+            event = {
+                "eventType": "COMPLETE",
+                "eventTime": _iso(_now()),
+                "producer": _OL_PRODUCER,
+                "schemaURL": _OL_SCHEMA_URL,
+                "run": {"runId": str(uuid.uuid5(uuid.NAMESPACE_URL, f"{cid}:{pond}:{f}"))},
+                "job": {"namespace": namespace, "name": pond},
+                "inputs": inputs,
+                "outputs": outputs,
+            }
+            self._emit_alert(
+                "openlineage", scope_pond=m["name"], scope_major=m["major"], severity="info",
+                title=f"OpenLineage: {pond} run complete", message=f"Run at {f} completed.",
+                f=f, detail={"event": event},
+            )
+        except Exception as exc:  # noqa: BLE001 — lineage emission must never break a run
+            print(f"[catchment] openlineage emit failed ({pond}): {exc}", flush=True)
+
+    def _openlineage_channels(self) -> bool:
+        return self.db.execute(
+            "SELECT 1 FROM alert_channel WHERE enabled = 1 AND events LIKE '%openlineage%' LIMIT 1"
+        ).fetchone() is not None
+
+    def _catchment_uuid(self) -> str | None:
+        row = self.db.execute("SELECT value FROM catchment_meta WHERE key = 'id'").fetchone()
+        return row[0] if row and row[0] else None
+
     def _capture_schema(self, pond: str, schema: dict) -> None:
         """Freeze a Pond version's published output schema as its contract (idempotent upsert, keyed on
         ``pond_version``). Only reached for accepted runs — the Duck publishes only what passed the gate."""
@@ -2146,6 +3365,68 @@ class Driver:
                     (vid, table, column, type_),
                 )
         self.db.commit()
+
+    def reset_contract(self, pond: str) -> dict:
+        """Drop the captured output schema for this major line, so the NEXT accepted run re-freezes the
+        contract from what it actually produces.
+
+        The contract is forward-only by design — that is what makes a Sink's pin safe — but it means a
+        genuinely narrowing type change wedges the line permanently: every run fails the gate, and a
+        failed run publishes nothing, so nothing can ever re-capture the schema. Without this the only
+        way out is editing ``pond_version_schema`` by hand (which is exactly what a live incident
+        required). Deliberately explicit and full-gated: it re-opens a Sink's pin, so it belongs with the
+        operator, not with a retry.
+
+        Also clears the failure so the line can run again."""
+        with self.lock:
+            meta = self.meta[pond]
+            rows = self.db.execute(
+                "DELETE FROM pond_version_schema WHERE pond_version_id IN "
+                "(SELECT pv.id FROM pond_version pv JOIN pond_name pn ON pn.id = pv.pond_name_id "
+                " WHERE pn.name = ? AND pv.major = ?)",
+                (meta["name"], meta["major"]),
+            ).rowcount
+            self.db.commit()
+        self.clear(pond)  # takes the lock itself
+        return {"pond": pond, "columns_cleared": max(rows, 0)}
+
+    def _source_published_f(self, pond: str) -> dict[str, str]:
+        """``{source name: published freshness}`` for this Pond's Sources — what the Duck's foreign reads
+        must at least see. Keyed by NAME (not pond key) because that is how a Ripple refers to a Source
+        (``source.table``) and how ``Pond.source_majors`` is keyed."""
+        out: dict[str, str] = {}
+        for skey in self.state.ponds[pond].sources:
+            meta = self.meta.get(skey)
+            if meta is None:
+                continue
+            f = self.published_f(meta["name"], meta["major"])
+            if f is not None:
+                out[meta["name"]] = f
+        return out
+
+    def published_f(self, name: str, major: int) -> str | None:
+        """The freshness this Catchment believes ``name@major`` has PUBLISHED — its ``changed_f`` (the
+        content anchor: a pass advances end_f without writing anything). Passed to ``resolve_data_dir``
+        so a stale local publish left behind by a move to a remote Pool can't shadow the data root.
+        ``None`` when the line is unknown or has never published (nothing to compare against)."""
+        key = pond_key(name, major)
+        ps = self.state.pond_states.get(key)
+        if ps is None or ps.changed_f == NEVER:
+            return None
+        return _iso(ps.changed_f)
+
+    def _record_flock(self, pond: str, delta: dict) -> None:
+        """Accumulate a Duck's Flock dispatch delta (shipped per Ripple Run). Cumulative counters live
+        here rather than in the Duck because a Duck is per-run and can be restarted mid-run; the Duck
+        only ever reports what it just did. Observability only — a bad payload must never touch a Run,
+        hence the defensive coercion."""
+        cur = self.flock_status.setdefault(pond, {"dispatched": 0, "failed": 0, "last_error": None})
+        try:
+            cur["dispatched"] += int(delta.get("dispatched") or 0)
+            cur["failed"] += int(delta.get("failed") or 0)
+            cur["last_error"] = delta.get("last_error")  # None after a clean dispatch → the warning clears
+        except (TypeError, ValueError):
+            pass  # a malformed report is dropped, never raised into a Pond Run
 
     def _fail_whole_pond(
         self, pond: str, now: datetime, error: str | None = None, tb: str | None = None,
@@ -2245,36 +3526,55 @@ class Driver:
     def _exported_tables(self, key: str) -> set[str]:
         """Names of the tables this major line has published to its data dir (the exported Parquet/
         Iceberg snapshot). Best-effort — a data-read hiccup must never break ``status()``; a Draw has
-        no local output. ``list_tables`` globs the flat sidecar, so it needs no Iceberg extension."""
+        no local output. ``list_tables`` globs the flat sidecar, so it needs no Iceberg extension.
+
+        **Cached per ``data_version``** — this runs per Pond on every ~1 s status poll, and for a line
+        with no local publish (a Pool/remote-run Pond) the resolve falls to the data root: an object-store
+        LIST per Pond per poll (the listings cache is off for cross-process correctness) made /api/status
+        take seconds under cloud. The published table set only changes when data does, and every such
+        change bumps ``data_version`` (run completion, persist landing, draw, reload)."""
+        cached = self._tables_cache.get(key)
+        if cached is not None and cached[0] == self.data_version:
+            return cached[1]
         from pathlib import Path
 
         from ..dataplane import get_data_plane
-        from .registry import pond_data_dir
+        from .registry import resolve_data_dir
 
         meta = self.meta.get(key, {})
         if meta.get("is_draw"):
             return set()
         try:
-            data_dir = pond_data_dir(Path(self.root), meta["name"], meta["major"], self.data_root)
-            return set(get_data_plane().list_tables(data_dir))
+            data_dir = resolve_data_dir(Path(self.root), meta["name"], meta["major"], self.data_root,
+                                        expected_f=self.published_f(meta["name"], meta["major"]))
+            out = set(get_data_plane().list_tables(data_dir))
         except Exception:
-            return set()
+            out = set()
+        self._tables_cache[key] = (self.data_version, out)
+        return out
 
     def _has_objects(self, key: str) -> bool:
-        """Whether this major line has published any non-tabular Object — gates the viewer's Objects tab."""
+        """Whether this major line has published any non-tabular Object — gates the viewer's Objects tab.
+        Cached per ``data_version``, same reasoning as :meth:`_exported_tables`."""
+        cached = self._objects_cache.get(key)
+        if cached is not None and cached[0] == self.data_version:
+            return cached[1]
         from pathlib import Path
 
         from ..objects import list_objects
-        from .registry import pond_data_dir
+        from .registry import resolve_data_dir
 
         meta = self.meta.get(key, {})
         if meta.get("is_draw"):
             return False
         try:
-            data_dir = pond_data_dir(Path(self.root), meta["name"], meta["major"], self.data_root)
-            return bool(list_objects(data_dir))
+            data_dir = resolve_data_dir(Path(self.root), meta["name"], meta["major"], self.data_root,
+                                        expected_f=self.published_f(meta["name"], meta["major"]))
+            out = bool(list_objects(data_dir))
         except Exception:
-            return False
+            out = False
+        self._objects_cache[key] = (self.data_version, out)
+        return out
 
     def status(self) -> dict:
         with self.lock:
@@ -2338,14 +3638,20 @@ class Driver:
                         or self.state.pond_states[sp].is_killed
                     )
                 ]
-                # The failure message (freshest failed Run), shown when failed.
+                # The failure message (freshest failed Run), shown when failed — plus its sub-reason:
+                # a contract failure carries the stable CONTRACT_PREFIX in its stored message, so the
+                # kind is derivable here (and after a restart) with no extra state.
                 error = None
+                failure_kind = None
                 if ps.is_failed:
+                    from ..schema_contract import CONTRACT_PREFIX
+
                     row = self.db.execute(
                         "SELECT error FROM pond_run WHERE pond_version_id = ? AND status = 'failed' "
                         "ORDER BY f DESC LIMIT 1", (self.meta[key]["version_id"],),
                     ).fetchone()
                     error = row[0] if row else None
+                    failure_kind = "contract" if (error or "").startswith(CONTRACT_PREFIX) else "error"
 
                 trig = self.state.triggers.get(key)
                 trigger = None
@@ -2362,6 +3668,7 @@ class Driver:
                     "kind": self.meta[key]["kind"],
                     "is_draw": self.meta[key].get("is_draw", False),
                     "is_spout": self.meta[key].get("is_spout", False),
+                    "dbt": self.meta[key].get("dbt", False),  # dbt-mode Pond (models are Ripples) — UI flag
                     # A Spout's egress config + armed state, for the node's control panel.
                     "spout": (
                         {**self.meta[key]["spout"], "armed": ps.standing_wake}
@@ -2378,6 +3685,13 @@ class Driver:
                     "start_f": ts(ps.start_f),
                     "end_f": ts(ps.end_f),
                     "changed_f": ts(ps.changed_f),  # content freshness: held across a pass (no-change run)
+                    # The durable-mirror watermark (plans/persist.md): output persisted to the durable
+                    # plane through this freshness (= end_f for a Pond whose publish is durable at
+                    # completion). Cross-Pool Sinks gate on it (source_visible_f).
+                    "persisted_f": ts(ps.persisted_f),
+                    # The Pool (shared filesystem) this Pond's Duck runs on — "catchment", "pool:{name}"
+                    # (a shared named Pool), or "duck:{key}" (an isolated preset/dedicated machine).
+                    "pool": self.state.ponds[key].pool,
                     "d_ms": int(ps.d.total_seconds() * 1000),
                     "trigger": trigger,
                     "is_failed": ps.is_failed,
@@ -2391,8 +3705,17 @@ class Driver:
                     "missing_sources": self.meta[key].get("missing_sources", []),
                     "blocked_by": blocked_by,
                     "error": error,
+                    "failure_kind": failure_kind,  # "contract" | "error" | null — the failed sub-reason
                     "immediate_retries": self.state.ponds[key].retry_immediately,
                     "source_retries": self.state.ponds[key].retry_on_change,
+                    # The effective compute config (target/size + Flock posture) + its declared/override
+                    # provenance. Draws/Spouts are not run by a Duck, so they carry none.
+                    "duck": (None if self.meta[key].get("is_draw") or self.meta[key].get("is_spout")
+                             else self.duck_config(key)),
+                    # The most recent Flock dispatch failure (None while dispatching cleanly / no Flock).
+                    # A failed dispatch still completes the run locally, so without this a broken Flock is
+                    # indistinguishable from a working one. Sanitised engine message, never a traceback.
+                    "flock_error": (self.flock_status.get(key) or {}).get("last_error"),
                     "ripples": ripples,
                     "ripple_edges": ripple_edges,
                 })
@@ -2419,12 +3742,36 @@ class Driver:
                 m = self.meta[key]
                 ps = self.state.pond_states[key]
                 lag = (now - ps.end_f).total_seconds() if ps.end_f != NEVER else None
-                nodes.append({
+                node = {
                     "name": m["name"], "major": m["major"], "kind": m["kind"],
                     "is_spout": bool(m.get("is_spout")), "is_draw": bool(m.get("is_draw")),
                     "lag_seconds": lag, "runs_completed": ps.runs_completed,
                     "is_failed": ps.is_failed, "is_blocked": ps.is_blocked, "is_killed": ps.is_killed,
-                })
+                }
+                # Compute-cost signal (plans/cloud-config.md increment 4): where the Duck runs + its
+                # Flock posture, so a scrape can attribute cost. Draws/Spouts have no Duck.
+                if not node["is_spout"] and not node["is_draw"]:
+                    dc = self.duck_config(key)
+                    node["duck_target"] = dc["duck_target"]
+                    node["flock_mode"] = dc["flock_mode"]
+                    node["flock_engine"] = dc["flock_engine"] or "none"
+                    fs = self.flock_status.get(key)
+                    if fs:  # the Duck's dispatch counters — a degrading Flock shows up as failures
+                        node["flock_dispatched"] = fs.get("dispatched", 0)
+                        node["flock_dispatch_failures"] = fs.get("failed", 0)
+                nodes.append(node)
+            # Cumulative Duck execution seconds per (name, major) — summed Ripple-Run wall-clock spans
+            # (the closest compute-cost proxy without tracking instance uptime). Monotonic across restarts.
+            runtimes = {
+                (r[0], r[1]): r[2] for r in self.db.execute(
+                    "SELECT pn.name, pv.major, "
+                    "SUM((julianday(rr.finished_at) - julianday(rr.started_at)) * 86400) "
+                    "FROM ripple_run rr JOIN pond_version pv ON pv.id = rr.pond_version_id "
+                    "JOIN pond_name pn ON pn.id = pv.pond_name_id "
+                    "WHERE rr.started_at IS NOT NULL AND rr.finished_at IS NOT NULL "
+                    "GROUP BY pn.name, pv.major"
+                ).fetchall() if r[2] is not None
+            }
             # Cumulative failed Pond Runs per (name, major) — a monotonic counter across restarts.
             failures = {
                 (r[0], r[1]): r[2] for r in self.db.execute(
@@ -2437,7 +3784,8 @@ class Driver:
             deliveries = dict(self.db.execute(
                 "SELECT status, COUNT(*) FROM alert_delivery GROUP BY status"
             ).fetchall())
-            return {"nodes": nodes, "failures": failures, "alert_deliveries": deliveries}
+            return {"nodes": nodes, "failures": failures, "alert_deliveries": deliveries,
+                    "runtimes": runtimes}
 
     def view_fragment(self, scope: list[str] | None) -> dict:
         """This Catchment's slice of the recursive lineage view (see plans/cross-catchment-visibility.md):
@@ -2493,33 +3841,64 @@ class Driver:
                     queue.append(src)
         return seen
 
-    def run_history(self, pond: str | None, lineage: bool, ripples: bool, limit: int) -> list[dict]:
+    def run_history(self, pond: str | None, lineage: bool, ripples: bool, limit: int,
+                    after: str | None = None, before: str | None = None) -> list[dict]:
         """Recent Pond Runs (newest first), optionally filtered to ``pond`` (an engine key,
         ``name@major``) and — when ``lineage`` — its upstream sources. History within a major line
-        spans every version that ran on it. Ripple Runs are nested only when ``ripples`` is set."""
+        spans every version that ran on it. Ripple Runs are nested only when ``ripples`` is set.
+        ``after``/``before`` (UTC ISO) bound the run's ``started_at`` for date-range navigation."""
         with self.lock:
             params: list = []
-            where = ""
+            conds: list[str] = []
             if pond is not None:
                 keys = self._ancestors(pond) if lineage else {pond}
-                where = f"WHERE (pn.name || '@' || pv.major) IN ({','.join('?' * len(keys))})"
+                conds.append(f"(pn.name || '@' || pv.major) IN ({','.join('?' * len(keys))})")
                 params.extend(sorted(keys))
+            if after is not None:
+                conds.append("pr.started_at >= ?")
+                params.append(after)
+            if before is not None:
+                conds.append("pr.started_at <= ?")
+                params.append(before)
+            where = ("WHERE " + " AND ".join(conds)) if conds else ""
+            # Anchor the window: with an ``after`` bound, take the first ``limit`` runs *from* it (ascending
+            # — "from → to/now"); otherwise the most recent ``limit`` (descending — the default feed, and
+            # the ``before``-only case = the runs just prior to it).
+            order = "ASC" if after is not None else "DESC"
             rows = self.db.execute(
                 "SELECT pn.name, pv.major, pv.version, pr.pond_version_id, pr.f, pr.started_at, pr.finished_at, "
                 "pr.status, pr.error, pr.traceback "
                 "FROM pond_run pr "
                 "JOIN pond_version pv ON pv.id = pr.pond_version_id "
                 "JOIN pond_name pn ON pn.id = pv.pond_name_id "
-                f"{where} ORDER BY pr.started_at DESC, pr.f DESC LIMIT ?",
+                f"{where} ORDER BY pr.started_at {order}, pr.f {order} LIMIT ?",
                 (*params, limit),
             ).fetchall()
 
+            # The runs' Persist outcomes (plans/persist.md — a separate log item from the Pond Run: the
+            # run closes at local publish; the mirror to the durable plane lands after, with its own
+            # timings/status). One query for the whole page, matched by (pond_id, f).
+            pond_ids = {self.meta[pond_key(pn, mj)]["pond_id"]
+                        for pn, mj, *_ in rows if pond_key(pn, mj) in self.meta}
+            persists: dict[tuple[int, str], dict] = {}
+            if pond_ids:
+                for pid, pf, pst, perr, psa, pfa in self.db.execute(
+                    f"SELECT pond_id, f, status, error, started_at, finished_at FROM pond_persist "
+                    f"WHERE pond_id IN ({','.join('?' * len(pond_ids))})", tuple(pond_ids),
+                ):
+                    persists[(pid, pf)] = {"status": pst, "error": perr,
+                                           "started_at": psa, "finished_at": pfa}
+
             runs = []
             for pname, major, version, pv_id, f, started_at, finished_at, status, error, tb in rows:
+                key = pond_key(pname, major)
                 run = {
-                    "pond": pname, "major": major, "id": pond_key(pname, major), "version": version, "f": f,
+                    "pond": pname, "major": major, "id": key, "version": version, "f": f,
                     "started_at": started_at, "finished_at": finished_at, "status": status,
                     "error": error, "traceback": tb,
+                    # null = no mirror recorded for this run: no cloud, a remote direct-to-plane Duck,
+                    # or the async mirror hasn't completed/coalesced past this f yet.
+                    "persist": persists.get((self.meta.get(key, {}).get("pond_id"), f)),
                 }
                 if ripples:
                     rrows = self.db.execute(

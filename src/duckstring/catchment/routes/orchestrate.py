@@ -70,6 +70,9 @@ async def status(
     # requests (the draw long-polls, cross-Catchment view recursion) aren't blocked behind it.
     payload = await run_in_threadpool(driver.status)
     payload["access_level"] = auth.LEVEL_TO_NAME[principal.level]
+    # NOTE: the cloud gate (data root + creds + provider readiness + credential validity) is deliberately
+    # NOT on this ~1 s poll — it changes rarely and its checks (secret store, env, the STS refresh) don't
+    # belong in the engine-state hot path. The UI polls it slowly via GET /api/catchment/settings.
     return payload
 
 
@@ -83,6 +86,23 @@ def _redact_tracebacks(runs: list[dict]) -> None:
             ripple["traceback"] = None
 
 
+@router.get("/lineage", dependencies=[auth.read])
+def lineage_graph(
+    request: Request,
+    pond: str | None = None,
+    major: int | None = None,
+    table: str | None = None,
+    columns: bool = False,
+):
+    """The **observed table-level lineage** (plans/lineage.md Phase 1): the tables each Ripple actually
+    read and wrote on its latest recorded run — exact (recorded at the read/write call), never inferred.
+    ``pond`` narrows to one Pond (``major`` picks the line, default highest); ``table`` narrows to the
+    Ripples touching that table name. Reads with ``source: null`` are the Pond's own tables.
+    ``columns=true`` adds the deploy-captured **static column lineage** (Phase 2) per pond —
+    ``{table: {column: [{ref, column}] | "constant" | "opaque"}}``."""
+    return request.app.state.driver.lineage(pond=pond, major=major, table=table, columns=columns)
+
+
 @router.get("/runs", dependencies=[auth.read])
 def runs(
     request: Request,
@@ -92,14 +112,17 @@ def runs(
     lineage: bool = True,
     ripples: bool = False,
     limit: int = 100,
+    after: str | None = None,
+    before: str | None = None,
     principal: auth.Principal = Depends(auth.get_principal),
 ):
     """Recent Pond Run history (newest first). ``pond`` filters to that Pond and, when ``lineage``,
     its upstream sources; ``ripples`` nests each run's Ripple Runs. ``limit`` is clamped to [1, 1000].
-    Tracebacks are redacted below full access (the error message is always kept)."""
+    ``after``/``before`` (UTC ISO) bound the run start for date-range navigation. Tracebacks are
+    redacted below full access (the error message is always kept)."""
     key = _resolve(request, pond, major, version) if pond is not None else None
     limit = max(1, min(limit, 1000))
-    history = _driver(request).run_history(key, lineage, ripples, limit)
+    history = _driver(request).run_history(key, lineage, ripples, limit, after=after, before=before)
     if principal.level != auth.Level.FULL:
         _redact_tracebacks(history)
     return {"runs": history}
@@ -170,6 +193,17 @@ def refresh(
     ``clear=true`` un-sets a pending refresh."""
     _driver(request).refresh(_resolve(request, name, major, version), clear=clear)
     return {"ok": True}
+
+
+@router.post("/ponds/{name}/reset-contract", dependencies=[auth.full])
+def reset_contract(
+    name: str, request: Request, major: int | None = None, version: str | None = None,
+):
+    """Drop this major line's captured output schema so the next accepted run re-freezes it, and clear
+    the failure. The escape hatch for a line wedged by a narrowing type change: the gate is forward-only
+    and a failed run publishes nothing, so without this the line can never recover. It re-opens a Sink's
+    pin — full access only, and never automatic."""
+    return _driver(request).reset_contract(_resolve(request, name, major, version))
 
 
 @router.post("/ponds/{name}/reset", dependencies=[auth.full])
@@ -327,6 +361,49 @@ def get_budget(name: str, request: Request, major: int | None = None, version: s
     return _driver(request).retry_config(_resolve(request, name, major, version))
 
 
+# ─── Duck config (prereqs D5) ────────────────────────────────────────────────
+
+
+class _DuckBody(BaseModel):
+    # Each field: None = keep the current override; ``clear`` drops the whole override (reverts to the
+    # DECLARED pond.toml config, else the Catchment default). Effective config coalesces override ??
+    # declared ?? default (plans/cloud-config.md).
+    duck_target: str | None = None              # 'catchment' | a Duck Pool name | 'dedicated'
+    dedicated_instance_type: str | None = None  # for duck_target='dedicated'
+    dedicated_auto_stop: bool | None = None     # terminate the dedicated box on Pond-run completion
+    deploy_config: dict | None = None           # a dedicated Duck's provider AWS deployment config (validated)
+    flock_mode: str | None = None               # 'off' | 'upgrade' | 'always'
+    flock_engine: str | None = None             # 'athena' | …
+    oom_policy: str | None = None               # 'fail_up' | 'fail'
+    clear: bool = False
+
+
+@router.post("/ponds/{name}/duck", dependencies=[auth.full])
+def set_duck(
+    name: str, body: _DuckBody, request: Request,
+    major: int | None = None, version: str | None = None,
+):
+    """Set the Pond's compute override (Duck target/size + Flock posture). Operator-owned; coalesces
+    over the pond.toml-declared config, and persists across redeploys."""
+    key = _resolve(request, name, major, version)
+    try:
+        _driver(request).set_duck(
+            key, clear=body.clear, duck_target=body.duck_target,
+            dedicated_instance_type=body.dedicated_instance_type,
+            dedicated_auto_stop=body.dedicated_auto_stop, deploy_config=body.deploy_config,
+            flock_mode=body.flock_mode, flock_engine=body.flock_engine, oom_policy=body.oom_policy,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+    return {"ok": True}
+
+
+@router.get("/ponds/{name}/duck", dependencies=[auth.read])
+def get_duck(name: str, request: Request, major: int | None = None, version: str | None = None):
+    """The Pond's effective compute config (override ?? declared ?? Catchment default)."""
+    return _driver(request).duck_config(_resolve(request, name, major, version))
+
+
 # ─── Cross-Catchment exposure (open / tap-on-get) ────────────────────────────
 
 
@@ -414,9 +491,14 @@ def add_spout(
 ):
     """Bind a Spout to a Pond (egress its output to an external destination). 422 on a bad
     destination/mode or a duplicate name. Returns the Spout's (possibly generated) name."""
+    driver = _driver(request)
+    # Default the Spout's major to the SERVED major (plans/data-serving.md) — but only as a creation
+    # default; the Spout is then pinned + independent of later serving promotions.
+    if major is None and version is None:
+        major = driver.served_major(name)
     key = _resolve(request, name, major, version)
     try:
-        final = _driver(request).add_spout(key, body.name, body.table, body.destination, body.mode)
+        final = driver.add_spout(key, body.name, body.table, body.destination, body.mode)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     return {"ok": True, "name": final}

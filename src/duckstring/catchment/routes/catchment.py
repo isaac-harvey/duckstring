@@ -27,6 +27,7 @@ router = APIRouter()
 
 _SKIP_SUFFIXES = (".db-wal", ".db-shm")  # subsumed by the SQLite snapshot
 _SKIP_NAMES = {"secrets.json", "secrets.json.tmp"}  # the write-only secret store never travels in a bundle
+_SERVING_TMP = ".serving-tmp"  # the sandbox's private spill dir (see serving._temp_dir)
 
 
 def _db(request: Request) -> sqlite3.Connection:
@@ -45,6 +46,318 @@ def identity(request: Request):
     identity (which upstream a duct points at, and cutting cycles in the recursive lineage view)."""
     rows = dict(_db(request).execute("SELECT key, value FROM catchment_meta").fetchall())
     return {"id": rows.get("id"), "name": rows.get("name")}
+
+
+# ─── Cloud settings (the data-plane target + the cloud-enable gate) ───────────────
+
+
+@router.get("/catchment/settings", dependencies=[auth.read])
+def get_settings(request: Request):
+    """The Catchment's cloud config: the data-plane target + the cloud-enable gate (remote data root +
+    AWS creds) and its reasons, so the UI can grey out remote-compute options and explain why. Also
+    ``has_data`` — once true the data root is set-once (see PUT)."""
+    from .. import cloud
+    from ..cloud_backends import refresh_credential_status
+
+    app = request.app
+    refresh_credential_status(app.state)  # TTL-throttled background STS check; reads the cache here
+    status = cloud.cloud_status(getattr(app.state, "data_root", None),
+                                getattr(app.state, "secret_store", None),
+                                getattr(app.state, "cloud_creds", None))
+    status["has_data"] = cloud.has_published_data(_db(request))
+    return status
+
+
+def _catchment_name(db) -> str:
+    """The catchment's display name (the switch-confirm token), falling back to its id when unnamed."""
+    rows = dict(db.execute("SELECT key, value FROM catchment_meta").fetchall())
+    return rows.get("name") or rows.get("id") or "unknown"
+
+
+@router.get("/catchment/migration", dependencies=[auth.read])
+def get_migration(request: Request):
+    """The in-flight/last data-plane migration's progress: ``{status, target, pond, total_files,
+    total_bytes, copied_files, copied_bytes, error}`` (``status`` ∈ idle/copying/adopting/done/failed).
+    Read-gated so the UI can show a progress bar."""
+    return request.app.state.driver.migration_status()
+
+
+class _SettingsBody(BaseModel):
+    data_root: str = ""       # an object-store URI (s3://…, gs://…) / path; empty → local (the state root)
+    confirm: str | None = None  # must equal the catchment name to SWITCH once a root / data already exists
+    mode: str = "empty"       # "empty" (reset+dormant) | "adopt" (pick up the target) | "migrate" (copy+adopt)
+
+
+@router.put("/catchment/settings", dependencies=[auth.full])
+def put_settings(request: Request, body: _SettingsBody):
+    """Attach or **switch** the data-plane target (empty ``data_root`` → back to local). Switching leaves
+    every Pond **as if its data had been deleted** and **dormant** — it does NOT auto-rebuild (so there is
+    a window to hand-copy non-rederivable data into the new location before anything runs); the OLD
+    location's data is left intact as a backup / hand-migration source. Because it empties + clears demand,
+    a switch away from an existing root — or a Catchment that already has published data — requires
+    ``confirm`` == the catchment name (so it can't happen by accident). Applied live (future Duck spawns
+    use the new root) and persisted. Full-gated (it moves where all data lives)."""
+    from ...storage import get_storage
+    from .. import cloud
+    from ..data_lease import acquire_lease, release_lease
+
+    app = request.app
+    db = _db(request)
+    if body.mode not in ("empty", "adopt", "migrate"):
+        raise HTTPException(status_code=422, detail="mode must be 'empty', 'adopt', or 'migrate'")
+    new = (body.data_root or "").strip() or None  # empty → local
+    current = getattr(app.state, "data_root", None)
+    if new == current:
+        return {**cloud.cloud_status(current, app.state.secret_store, getattr(app.state, "cloud_creds", None)),
+                "unchanged": True}
+    # Guard against a bare/relative value (e.g. a bucket name with no scheme): it would resolve to a LOCAL
+    # relative directory (created in the process cwd), not the intended object store. Require a recognised
+    # object-store URI (s3://…, gs://…) or an absolute path.
+    if new is not None:
+        import os
+        from urllib.parse import urlsplit
+
+        from ...storage import is_object_uri
+
+        candidate = urlsplit(new).path if new.startswith("file://") else new
+        if not is_object_uri(new) and not os.path.isabs(os.path.expanduser(candidate)):
+            raise HTTPException(status_code=422, detail=(
+                f"data_root must be an object-store URI (s3://…, gs://…) or an absolute path — got {new!r}. "
+                f"A bare name is treated as a LOCAL relative directory; an S3 bucket needs the s3:// prefix."))
+    # A switch to a NON-local target is gated behind the catchment name once there's an existing root or
+    # published data (so it isn't done by accident). Reverting to local (new is None) is the safe escape
+    # hatch — always allowed without confirmation (it needs no creds and keeps the old location intact).
+    name = _catchment_name(db)
+    if new is not None and (current is not None or cloud.has_published_data(db)) and (body.confirm or "") != name:
+        raise HTTPException(status_code=422, detail=(
+            f"switching the data root empties the data plane (every Pond is left with no data and idle — "
+            f"no auto-rebuild; the old location is kept as a backup); confirm by passing the catchment "
+            f"name: {name!r}"))
+    owner_id = dict(db.execute("SELECT key, value FROM catchment_meta").fetchall()).get("id") or "unknown"
+    # Take the single-writer lease on the new store (object stores only; local needs none). get_storage
+    # validates the scheme.
+    new_store = None
+    if new is not None:
+        try:
+            new_store = get_storage(new)
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=f"unusable data root: {exc}") from None
+        try:
+            acquire_lease(new_store, owner_id)
+        except Exception as exc:
+            raise HTTPException(status_code=409, detail=f"data root is in use: {exc}") from None
+    old_lease = getattr(app.state, "data_lease", None)
+
+    def _commit_switch() -> None:
+        # Persist the new root, release the previous store's lease, and refresh the cloud gate live (a
+        # switch can flip cloud enabled if creds are already present) — the backends + the cred banner.
+        cloud.set_setting(db, cloud.DATA_ROOT_KEY, new)  # None → deletes the setting (back to local)
+        if old_lease is not None:
+            try:
+                release_lease(old_lease[0], old_lease[1])
+            except Exception:
+                pass
+        app.state.data_root = new
+        app.state.data_lease = (new_store, owner_id) if new_store is not None else None
+        try:
+            from ..cloud_backends import refresh_cloud_backends, refresh_credential_status
+            refresh_cloud_backends(app)
+            refresh_credential_status(app.state, force=True)
+        except Exception:
+            pass
+
+    # 'migrate' copies the data first, which can be long — run it in the background and report progress via
+    # GET /api/catchment/migration; the switch commits only once the copy+adopt succeeds.
+    if body.mode == "migrate":
+        import threading
+
+        def _run_migration() -> None:
+            try:
+                app.state.driver.migrate(new)
+                _commit_switch()
+            except Exception:
+                # Migration failed → the old plane stays live; drop the NEW store lease we acquired.
+                if new_store is not None:
+                    try:
+                        release_lease(new_store, owner_id)
+                    except Exception:
+                        pass
+
+        threading.Thread(target=_run_migration, daemon=True).start()
+        return {**cloud.cloud_status(current, app.state.secret_store, getattr(app.state, "cloud_creds", None)),
+                "migrating": True}
+
+    # Switch: quiesce, re-point (old location untouched). 'empty' resets + goes dormant; 'adopt' picks up
+    # data already in the target (freshness from its sidecars) and resumes with no rebuild.
+    app.state.driver.switch_data_root(new, mode=body.mode)
+    _commit_switch()
+    return cloud.cloud_status(new, app.state.secret_store, getattr(app.state, "cloud_creds", None))
+
+
+# ─── Duck Pools (Catchment-level named remote compute) ───────────────────────────
+
+
+class _PoolBody(BaseModel):
+    name: str
+    provider: str | None = None       # 'fargate' (default) | 'ec2'
+    instance_type: str | None = None  # EC2 pools
+    cpu: int | None = None            # Fargate task cpu units (256 = 0.25 vCPU)
+    memory: int | None = None         # Fargate task memory (MiB)
+    min_instances: int | None = None
+    max_instances: int | None = None
+    idle_timeout: int | None = None   # seconds before scale-down
+    keep_warm: int | None = None      # spare capacity beyond current load
+    region: str | None = None
+    deploy_config: dict | None = None  # provider AWS deployment config (image/AMI/VPC/IAM); validated
+
+
+@router.get("/catchment/duck-pools", dependencies=[auth.read])
+def list_duck_pools(request: Request):
+    """The defined Duck Pools. A Pool is inert until a remote (EC2) launcher is configured — this is
+    the config a pond.toml `duck = "<pool>"` or an operator override resolves against."""
+    return {"pools": request.app.state.driver.list_pools()}
+
+
+@router.get("/catchment/compute-defaults", dependencies=[auth.read])
+def compute_defaults(request: Request):
+    """The deployment config each provider's launcher already reads from the environment, plus the field +
+    required-field lists — so the UI can show what's inherited from env and validate what's still needed
+    (plans/compute-config-ui.md)."""
+    from .. import cloud_deploy
+
+    return {
+        "fargate": {"fields": list(cloud_deploy.FARGATE_FIELDS), "env": cloud_deploy.env_defaults("fargate"),
+                    "missing_without_input": cloud_deploy.missing_fields("fargate", None)},
+        "ec2": {"fields": list(cloud_deploy.EC2_FIELDS), "env": cloud_deploy.env_defaults("ec2"),
+                "missing_without_input": cloud_deploy.missing_fields("ec2", None)},
+    }
+
+
+@router.post("/catchment/duck-pools", dependencies=[auth.full])
+def upsert_duck_pool(request: Request, body: _PoolBody):
+    """Create or update a named Duck Pool (it provisions billable infra, so full-gated). Rejected if the
+    provider's deployment config (UI ?? env) is inadequate to launch."""
+    try:
+        return request.app.state.driver.add_pool(
+            body.name, provider=body.provider, instance_type=body.instance_type, cpu=body.cpu,
+            memory=body.memory, min_instances=body.min_instances, max_instances=body.max_instances,
+            idle_timeout=body.idle_timeout, keep_warm=body.keep_warm, region=body.region,
+            deploy_config=body.deploy_config)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+
+
+@router.delete("/catchment/duck-pools/{name}", dependencies=[auth.full])
+def delete_duck_pool(request: Request, name: str):
+    """Drop a pool. Ponds pinned to it fall back to the Catchment Duck (never stranded)."""
+    request.app.state.driver.remove_pool(name)
+    return {"ok": True}
+
+
+# ─── AWS discovery (instance types) + the cloud-enable verification probe ─────────
+#
+# Both use the control-plane AWS creds (env / profile / role, or an AWS_* secret loaded into the env by
+# cloud.load_aws_env). Any AWS failure is a 200 result ({available|ok: false, error}), never a 5xx — the
+# UI degrades to free-text entry and shows the reason rather than erroring.
+
+_INSTANCE_TYPES: dict[str, list[dict]] = {}  # region → sorted spec list; process-lifetime cache
+
+
+def _aws_error(exc: Exception) -> str:
+    """A short, non-secret message for the UI. boto3 error strings carry the operation + error code,
+    not credentials, but cap the length so a stray verbose message can't dominate the panel."""
+    msg = str(exc) or exc.__class__.__name__
+    return msg if len(msg) <= 300 else msg[:297] + "..."
+
+
+def _region_from_env() -> str | None:
+    import os
+    return os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
+
+
+def _describe_instance_types(client) -> list[dict]:
+    """Every current-generation EC2 instance type in the client's region, with vCPU / memory / GPU —
+    enough to render an informative, sortable dropdown."""
+    out: list[dict] = []
+    paginator = client.get_paginator("describe_instance_types")
+    for page in paginator.paginate(Filters=[{"Name": "current-generation", "Values": ["true"]}]):
+        for it in page.get("InstanceTypes", []):
+            gpus = sum(g.get("Count", 0) for g in it.get("GpuInfo", {}).get("Gpus", []))
+            out.append({
+                "name": it["InstanceType"],
+                "vcpu": it.get("VCpuInfo", {}).get("DefaultVCpus"),
+                "memory_gib": round(it.get("MemoryInfo", {}).get("SizeInMiB", 0) / 1024, 1),
+                "gpu": gpus,
+            })
+    out.sort(key=lambda t: (t.get("vcpu") or 0, t.get("memory_gib") or 0, t["name"]))
+    return out
+
+
+@router.get("/catchment/instance-types", dependencies=[auth.full])
+def instance_types(request: Request, region: str | None = None):
+    """EC2 instance types offered in ``region`` (current generation) with vCPU/memory/GPU — feeds the
+    compute dropdowns so an operator doesn't type an instance type blind. Full-gated (control-plane
+    creds). Cached per region for the process lifetime."""
+    region = (region or "").strip() or _region_from_env()
+    if not region:
+        return {"available": False, "error": "no region — pass ?region= or set AWS_DEFAULT_REGION", "types": []}
+    if region in _INSTANCE_TYPES:
+        return {"available": True, "region": region, "types": _INSTANCE_TYPES[region]}
+    try:
+        import boto3  # lazy — only a cloud-enabled Catchment ever needs it
+        client = boto3.client("ec2", region_name=region)
+        types = _describe_instance_types(client)
+    except Exception as exc:
+        return {"available": False, "region": region, "error": _aws_error(exc), "types": []}
+    _INSTANCE_TYPES[region] = types
+    return {"available": True, "region": region, "types": types}
+
+
+class _VerifyBody(BaseModel):
+    data_root: str | None = None  # optional: also probe this S3 bucket is writable (before committing it)
+
+
+def _probe_s3_writable(boto3, uri: str, region: str | None) -> None:
+    """Put and delete a tiny probe object under the data-root prefix — proves write access without
+    leaving anything behind. Raises the boto3 error on failure."""
+    rest = uri.split("://", 1)[1]
+    bucket, _, prefix = rest.partition("/")
+    key = f"{prefix.rstrip('/')}/.duckstring-probe" if prefix else ".duckstring-probe"
+    s3 = boto3.client("s3", **({"region_name": region} if region else {}))
+    s3.put_object(Bucket=bucket, Key=key, Body=b"duckstring")
+    s3.delete_object(Bucket=bucket, Key=key)
+
+
+@router.post("/catchment/cloud/verify", dependencies=[auth.full])
+def verify_cloud(request: Request, body: _VerifyBody = _VerifyBody()):
+    """Probe the control-plane AWS creds (STS ``GetCallerIdentity``) and, when a ``data_root`` is given,
+    that its S3 bucket is writable (a probe object put+delete) — so the UI can confirm before committing
+    the set-once data root. Returns ``{ok, account?, arn?, region?, bucket_ok?, bucket_error?, error?}``;
+    a credential/permission problem is a 200 ``{ok: false, error}``, not a 5xx. Full-gated."""
+    region = _region_from_env()
+    signing = region or "us-east-1"  # STS/S3 clients need a region to sign; the identity is global
+    try:
+        import boto3
+    except Exception:
+        return {"ok": False, "error": "boto3 is not installed on the Catchment"}
+    from ..cloud_backends import set_credential_status
+    try:
+        ident = boto3.client("sts", region_name=signing).get_caller_identity()
+    except Exception as exc:
+        err = _aws_error(exc)
+        set_credential_status(request.app.state, False, err)  # update the persistent banner immediately
+        return {"ok": False, "region": region, "error": err}
+    set_credential_status(request.app.state, True, None)
+    result = {"ok": True, "account": ident.get("Account"), "arn": ident.get("Arn"), "region": region}
+    root = (body.data_root or "").strip()
+    if root and root.lower().startswith("s3://"):
+        try:
+            _probe_s3_writable(boto3, root, signing)
+            result["bucket_ok"] = True
+        except Exception as exc:
+            result["bucket_ok"] = False
+            result["bucket_error"] = _aws_error(exc)
+    return result
 
 
 class _ResetBody(BaseModel):
@@ -81,6 +394,8 @@ def _root_files(root: Path) -> list[tuple[Path, str]]:
     for path in sorted(root.rglob("*")):
         if not path.is_file() or path.name.endswith(_SKIP_SUFFIXES) or path.name in _SKIP_NAMES:
             continue
+        if _SERVING_TMP in path.parts:
+            continue  # a serving connection's spill scratch: transient, can be huge, and rebuilt on demand
         files.append((path, path.relative_to(root).as_posix()))
     return files
 

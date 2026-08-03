@@ -148,6 +148,70 @@ def test_query_unknown_catchment_exits(runner):
     assert result.exit_code != 0
 
 
+def _seed_checkpointed_merge(dd, table, n):
+    """Hand-build a **checkpointed** merge Trickle layout — a large cold base (``{table}__base/``, all
+    present rows stamped at ``f_base``) plus a tiny hot changelog above it (one update) plus the sidecar.
+    Driving the real LSM ``checkpoint()`` in isolation is degenerate; the published *layout* is what the
+    browse reconstruction reads, so we write it directly to get a genuinely large base without the machinery."""
+    import json
+
+    import duckdb
+
+    (dd / f"{table}__base").mkdir(parents=True)
+    (dd / f"{table}__changelog").mkdir()
+    con = duckdb.connect()
+    con.execute("SET TimeZone='UTC'")
+    con.execute(f"""COPY (SELECT range AS id, 'v'||range AS v, 1 AS _duckstring_d,
+        TIMESTAMPTZ '2026-06-16T01:00:00+00:00' AS _duckstring_f FROM range({n}))
+        TO '{dd}/{table}__base/2026-06-16T01_00_00+00_00__0.parquet' (FORMAT PARQUET)""")
+    con.execute(f"""COPY (SELECT * FROM (VALUES
+        (5, 'v5', -1, TIMESTAMPTZ '2026-06-16T02:00:00+00:00'),
+        (5, 'X',   1, TIMESTAMPTZ '2026-06-16T02:00:00+00:00'))
+        t(id, v, _duckstring_d, _duckstring_f))
+        TO '{dd}/{table}__changelog/2026-06-16T02_00_00+00_00__0.parquet' (FORMAT PARQUET)""")
+    con.close()
+    (dd / "_trickle.json").write_text(json.dumps({table: {
+        "mode": "merge", "pk": ["id"], "floor": "2026-06-16T01:00:00+00:00",
+        "f": "2026-06-16T02:00:00+00:00", "f_base": "2026-06-16T01:00:00+00:00", "format": 2}}))
+
+
+def test_merge_browse_limit_pushes_down_through_the_base(tmp_path, monkeypatch):
+    """A merge main's default browse reconstructs latest-per-PK over base ⊎ changelog, but with the base
+    checkpointed and the changelog clamped to ``> f_base``, a ``LIMIT`` must push down to the **base**
+    Parquet scan — so browsing a huge (TB-cold) table reads a page, not the whole base. Guards against a
+    regression that reintroduces a full base scan (a materialised reconstruction, a blocking sort/agg on
+    the base side). Also asserts the reconstruction is still correct (the update is applied)."""
+    import re
+
+    import duckdb
+
+    from duckstring.catchment.routes.data import _trickle_base_sql
+    from duckstring.dataplane import ParquetDataPlane
+    from duckstring.storage import LocalStorage
+
+    monkeypatch.setenv("DUCKSTRING_DATA_PLANE", "parquet")
+    n = 200_000
+    dd = tmp_path / "d"
+    _seed_checkpointed_merge(dd, "dim", n)
+    dp = ParquetDataPlane()
+    dds = LocalStorage(dd)
+    con = duckdb.connect()
+    con.execute("SET TimeZone='UTC'")
+    con.execute('CREATE SCHEMA "p"')
+    for t in dp.list_tables(dds):
+        con.execute(f'CREATE VIEW "p"."{t}" AS {dp.read_select(dds, t)}')
+    base = _trickle_base_sql("p", "dim", "merge", ["id"], None, None, f_base="2026-06-16T01:00:00+00:00")
+
+    # Correct current state: N rows, the update applied.
+    assert con.execute(f"SELECT count(*) FROM ({base})").fetchone()[0] == n
+    assert con.execute(f"SELECT v FROM ({base}) WHERE id = 5").fetchone()[0] == "X"
+
+    # Pushdown: no operator in the analysed plan touches anywhere near the whole base.
+    plan = con.execute(f"EXPLAIN ANALYZE SELECT * FROM ({base}) AS _p LIMIT 5").fetchall()[0][1]
+    cardinalities = [int(x.replace(",", "")) for x in re.findall(r"(\d[\d,]*)\s+[Rr]ows?", plan)]
+    assert max(cardinalities) < n // 2, f"LIMIT did not push down; max operator cardinality={max(cardinalities)}"
+
+
 # ── /api/query/page (the data viewer's paged read) ──────────────────────────────
 
 
@@ -161,6 +225,25 @@ def _seed_n(root, pond: str, table: str, n: int):
     con = duckdb.connect()
     con.execute(f"COPY (SELECT i AS id, i * 10 AS v FROM range({n}) t(i)) TO '{dest}' (FORMAT PARQUET)")
     con.close()
+
+
+def _serve_pond(client, name: str, tables: list[str]) -> None:
+    """Register + schema-capture a pond line so the **catchment-wide serving core** (which the custom-``sql``
+    branch of /query/page + /query/count now runs through) can see its published tables. A per-pond
+    ``table`` browse reads the disk snapshot directly and needs none of this."""
+    from duckstring.catchment.routes.deploy import _register
+
+    db = client.app.state.db
+    _register(db, name, "1.0.0", "outlet", f"ponds/{name}/1.0.0",
+              {"sources": {}, "immediate_retries": 0, "source_retries": 0, "kind": "outlet", "serve_tables": tables},
+              [{"func": "f", "name": "r", "parents": []}])
+    pv = db.execute("SELECT pv.id FROM pond_version pv JOIN pond_name pn ON pn.id = pv.pond_name_id "
+                    "WHERE pn.name = ? AND pv.version = '1.0.0'", (name,)).fetchone()[0]
+    for t in tables:
+        db.execute('INSERT OR IGNORE INTO pond_version_schema (pond_version_id, "table", "column", type) '
+                   "VALUES (?, ?, 'id', 'INTEGER')", (pv, t))
+    db.commit()
+    client.app.state.driver.reload()
 
 
 def test_query_page_paginates_with_has_more(catchment_client, tmp_path):
@@ -181,6 +264,7 @@ def test_query_page_paginates_with_has_more(catchment_client, tmp_path):
 
 def test_query_page_wraps_custom_sql(catchment_client, tmp_path):
     _seed_n(tmp_path, "outlet", "daily", 10)
+    _serve_pond(catchment_client, "outlet", ["daily"])
     # A custom query with its own LIMIT — the page wraps it as a subquery, so the user's cap still
     # bounds the result while the page reads within it.
     r = catchment_client.post(
@@ -219,6 +303,7 @@ def test_less_than_predicate_on_floats(catchment_client, tmp_path, monkeypatch):
     # both /query/count and the wrapped /query/page — and agree with each other.
     monkeypatch.setenv("DUCKSTRING_DATA_PLANE", "parquet")
     _seed_typed(tmp_path, "p", "t")
+    _serve_pond(catchment_client, "p", ["t"])
     for col in ("f_real", "f_dbl", "f_dec"):
         sql = f'SELECT * FROM "p"."t" WHERE {col} < 5 LIMIT 1000'
         count = catchment_client.post("/api/query/count", json={"pond": "p", "sql": sql}).json()["count"]
@@ -267,8 +352,9 @@ def test_list_pond_tables_empty(catchment_client, tmp_path):
 
 def test_query_count_table_and_sql(catchment_client, tmp_path):
     _seed_n(tmp_path, "outlet", "daily", 7)
+    _serve_pond(catchment_client, "outlet", ["daily"])
     assert catchment_client.post("/api/query/count", json={"pond": "outlet", "table": "daily"}).json()["count"] == 7
-    # A custom query's count reflects its own shape (here a LIMIT).
+    # A custom query's count reflects its own shape (here a LIMIT). Custom sql runs through the serving core.
     r = catchment_client.post(
         "/api/query/count", json={"pond": "outlet", "sql": 'SELECT * FROM "outlet"."daily" LIMIT 3'}
     )

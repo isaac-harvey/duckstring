@@ -1,6 +1,6 @@
 ---
 title: The Catchment
-description: The reference runtime — a convenience, not the product.
+description: The reference runtime — a server that receives deployed Ponds and executes them.
 ---
 
 # The Catchment

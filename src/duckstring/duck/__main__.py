@@ -8,7 +8,9 @@ keeps draining in-flight Pond Runs and buffering events regardless of Catchment 
 from __future__ import annotations
 
 import argparse
+import logging
 import queue
+import sys
 import threading
 import traceback
 from datetime import datetime, timezone
@@ -17,7 +19,7 @@ from pathlib import Path
 from ..engine import NEVER
 from ..engine import pond as ledger
 from .client import CatchmentClient
-from .core import DuckCore
+from .core import DuckCore, Event
 from .executor import RippleExecutor, load_topology
 
 
@@ -30,6 +32,24 @@ def _now() -> datetime:
 # to absorb the momentary gap between one Ripple finishing and the next being launched.
 _STUCK_GRACE_S = 30.0
 
+log = logging.getLogger("duckstring.duck")
+
+
+# Idle poll backoff. Job delivery is a poll (routes/duck.py explains why it is not a long poll), so the
+# interval IS the dispatch latency — keep it short while there is any reason to expect work, and back off
+# when there is not. A flat 0.1 s meant ten requests a second forever: unnoticeable beside a local
+# Catchment, but continuous network round-trips for a remote Duck, and enough log noise to actively
+# hinder debugging one.
+_POLL_MIN_S = 0.1
+_POLL_MAX_S = 2.0
+
+
+def _poll_delay(idle_rounds: int) -> float:
+    """Back off geometrically from _POLL_MIN_S to _POLL_MAX_S over consecutive empty polls. A Duck that
+    has just been told to do something, or is mid-run, resets to the floor — so responsiveness is
+    unchanged exactly when it matters."""
+    return min(_POLL_MIN_S * (2 ** idle_rounds), _POLL_MAX_S)
+
 
 def serve(core: DuckCore, executor: RippleExecutor, client: CatchmentClient) -> None:
     """Single-threaded event loop fed by a poll thread (jobs) and executor callbacks (completions)."""
@@ -37,14 +57,45 @@ def serve(core: DuckCore, executor: RippleExecutor, client: CatchmentClient) -> 
     stop = threading.Event()
     inflight = 0  # Ripple Runs currently executing in the pool
     last_progress = _now()  # last time a Ripple was launched or finished
+    # Async Persist (plans/persist.md): after a run publishes locally (run_completed already buffered —
+    # co-located Sinks are NOT delayed), mirror the output to the durable layer off-loop, then buffer a
+    # `persist` event. One mirror at a time, COALESCING: runs completing mid-mirror set `pending`, and the
+    # finished mirror immediately re-runs at the newest f (a mirror is a reconcile — persisting at f2
+    # covers f1, so only the latest pending f matters).
+    persist_state = {"running": False, "pending": None}
+
+    def _start_persist(f):
+        if getattr(executor, "persist_dir", None) is None:
+            return  # no durable layer configured — publish is the only copy (exact pre-persist behaviour)
+        if persist_state["running"]:
+            persist_state["pending"] = f
+            return
+        persist_state["running"] = True
+
+        def _run(f=f):
+            err = None
+            started = _now()
+            try:
+                executor.persist()
+            except Exception as exc:
+                err = _msg(exc)
+            q.put(("persisted", (f, err, started, _now())))
+
+        threading.Thread(target=_run, daemon=True).start()
 
     def _poll_loop():
+        idle_rounds = 0
         while not stop.is_set():
             jobs = client.poll_jobs()
             for job in jobs:
                 q.put(("job", job))
-            if not jobs:
-                stop.wait(0.1)  # short poll interval; avoids busy-spinning the Catchment
+            if jobs or inflight:
+                idle_rounds = 0        # work arrived or is running — stay responsive
+                if not jobs:
+                    stop.wait(_POLL_MIN_S)
+            else:
+                stop.wait(_poll_delay(idle_rounds))
+                idle_rounds += 1
 
     def _launch(names):
         nonlocal inflight, last_progress
@@ -56,7 +107,7 @@ def serve(core: DuckCore, executor: RippleExecutor, client: CatchmentClient) -> 
                 name,
                 start_f,
                 core.previous_f_for(start_f),  # the prior run's freshness, exposed as pond.previous_f
-                on_done=lambda n, started, finished: q.put(("done", (n, started, finished))),
+                on_done=lambda n, started, finished, lineage=None: q.put(("done", (n, started, finished, lineage))),
                 on_error=lambda n, exc, started, finished: q.put(("error", (n, exc, started, finished))),
                 sources_changed=core.sources_changed_for(start_f),  # backs pond.sources_changed()
                 skip_sink=(lambda f=start_f: core.mark_skipped(f)),  # backs pond.skip() for this Run
@@ -79,6 +130,9 @@ def serve(core: DuckCore, executor: RippleExecutor, client: CatchmentClient) -> 
                         shutdown_requested = True
                     elif data.get("kind") == "begin_run":
                         prev = data.get("previous_f")
+                        # What the Catchment says each Source has published — foreign reads use it to
+                        # reject a stale local publish (registry.resolve_data_dir).
+                        executor.source_f = data.get("source_f") or {}
                         if data.get("refresh"):
                             executor.wipe()  # cold reset: the run rebuilds from scratch
                         _launch(core.begin_run(
@@ -92,10 +146,27 @@ def serve(core: DuckCore, executor: RippleExecutor, client: CatchmentClient) -> 
                 elif kind == "done":
                     inflight -= 1
                     last_progress = _now()
-                    name, started, finished = data
+                    name, started, finished, lineage = data
+                    events_before = len(core.events)
                     _launch(core.ripple_completed(
-                        name, _now(), started_at=started, finished_at=finished, export=executor.export
+                        name, _now(), started_at=started, finished_at=finished, export=executor.export,
+                        lineage=lineage,
                     ))
+                    # A run just completed (locally published) → kick off/queue the async persist for it.
+                    for ev in core.events[events_before:]:
+                        if ev.kind == "run_completed":
+                            _start_persist(ev.f)
+                elif kind == "persisted":
+                    pf, perr, pstarted, pfinished = data
+                    if perr:
+                        log.error("[%s] persist at %s failed: %s", core.pond_name, pf, perr)
+                    core.events.append(Event(kind="persist", f=pf,
+                                             status="failed" if perr else "success", error=perr,
+                                             started_at=pstarted, finished_at=pfinished))
+                    persist_state["running"] = False
+                    if persist_state["pending"] is not None:
+                        nf, persist_state["pending"] = persist_state["pending"], None
+                        _start_persist(nf)
                 elif kind == "error":
                     inflight -= 1
                     last_progress = _now()
@@ -104,12 +175,12 @@ def serve(core: DuckCore, executor: RippleExecutor, client: CatchmentClient) -> 
                     if isinstance(exc, MissingSourceAsset):
                         # A read of an unpublished Source asset — waiting, not broken. Park it (no retry,
                         # no failure); the Catchment blocks the Pond with a reason. See plans/reset.md.
-                        print(f"[duck:{core.pond_name}] ripple {name} waiting on {exc.source}.{exc.table}", flush=True)
+                        log.warning("[%s] ripple %s waiting on %s.%s", core.pond_name, name, exc.source, exc.table)
                         _launch(core.ripple_missing_source(
                             name, exc.source, exc.table, _now(), started_at=started, finished_at=finished,
                         ))
                     else:
-                        print(f"[duck:{core.pond_name}] ripple {name} failed: {exc}", flush=True)
+                        log.error("[%s] ripple %s failed: %s", core.pond_name, name, exc)
                         _launch(core.ripple_failed(
                             name, _now(), started_at=started, finished_at=finished,
                             error=_msg(exc), traceback=_tb(exc),
@@ -119,17 +190,20 @@ def serve(core: DuckCore, executor: RippleExecutor, client: CatchmentClient) -> 
             except Exception as exc:
                 # A Pond-level error (e.g. a failed ledger write): report it against the most recent
                 # Pond Run and exit. The Catchment fails the Pond (and may retry it on change).
-                print(f"[duck:{core.pond_name}] pond-level failure: {exc}", flush=True)
+                log.error("[%s] pond-level failure: %s", core.pond_name, exc)
                 _report_pond_failure(core, client, _msg(exc), _tb(exc))
                 break
 
             # Watchdog: outstanding work but nothing running, past the grace period → the Run is stuck.
             if not core.idle() and inflight == 0 and (_now() - last_progress).total_seconds() > _STUCK_GRACE_S:
-                print(f"[duck:{core.pond_name}] stuck: active Pond Run with no running Ripple", flush=True)
+                log.error("[%s] stuck: active Pond Run with no running Ripple", core.pond_name)
                 _report_pond_failure(core, client, "stuck: active Pond Run with no running Ripple")
                 break
 
-            if shutdown_requested and core.idle() and not core.events:
+            # Shutdown only when idle, events drained, AND no persist is in flight or queued — a killed
+            # mid-mirror persist is replay-safe but would leave persisted_f needlessly behind.
+            if shutdown_requested and core.idle() and not core.events \
+                    and not persist_state["running"] and persist_state["pending"] is None:
                 break
     finally:
         stop.set()
@@ -175,11 +249,25 @@ def main() -> None:
     ap.add_argument("--source-path", required=True, help="pond source dir relative to root")
     ap.add_argument("--data-root", default="", help="data-plane root URI (object store / Volume / path); "
                                                     "empty = under the state root")
+    ap.add_argument("--persist-root", default="", help="durable persist layer (plans/persist.md): publish "
+                                                       "locally, async-mirror here; empty = publish to "
+                                                       "--data-root directly (remote Duck / no cloud)")
     args = ap.parse_args()
+    # Configure logging at entry: without this a Duck has no handler, so INFO is dropped and
+    # WARNING+ goes through the bare last-resort handler with no timestamp.
+    logging.basicConfig(level=logging.INFO, stream=sys.stderr,
+                        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
     root = Path(args.root)
     data_root = args.data_root or None
+    persist_root = args.persist_root or None
     source_dir = root / args.source_path
+    client = CatchmentClient(args.catchment, args.pond, args.major, args.token)
+    if not source_dir.is_dir():
+        # Remote-Duck boot (prereqs D6): this host doesn't share the Catchment's disk — fetch the
+        # deployed source bundle over the duck channel and unpack it where the executor expects it.
+        _unpack_artifact(client.fetch_artifact(), source_dir)
+        log.info("[%s@%s] fetched source artifact -> %s", args.pond, args.major, source_dir)
     parents = load_topology(source_dir)
     major_dir = pond_major_dir(root, args.pond, args.major)
     major_dir.mkdir(parents=True, exist_ok=True)
@@ -191,11 +279,30 @@ def main() -> None:
     from ..dbt_mode import dbt_project_subpath
     if dbt_project_subpath(read_pond_toml(source_dir)):
         from .dbt_executor import DbtExecutor
-        executor = DbtExecutor(args.pond, args.major, args.version, args.source_path, root, data_root=data_root)
+        executor = DbtExecutor(args.pond, args.major, args.version, args.source_path, root,
+                               data_root=data_root, persist_root=persist_root)
     else:
-        executor = RippleExecutor(args.pond, args.major, args.version, args.source_path, root, data_root=data_root)
-    client = CatchmentClient(args.catchment, args.pond, args.major, args.token)
+        executor = RippleExecutor(args.pond, args.major, args.version, args.source_path, root,
+                                  data_root=data_root, persist_root=persist_root)
     serve(core, executor, client)
+
+
+def _unpack_artifact(tar_bytes: bytes, dest: Path) -> None:
+    """Unpack a fetched source bundle under ``dest``, refusing member paths that escape it (the
+    stdlib data filter where available — 3.12+, and backported 3.10.12/3.11.4 — else a manual check)."""
+    import io
+    import tarfile
+
+    dest.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(fileobj=io.BytesIO(tar_bytes)) as tar:
+        if hasattr(tarfile, "data_filter"):
+            tar.extractall(dest, filter="data")
+        else:  # pragma: no cover — pre-backport interpreters
+            base = dest.resolve()
+            for m in tar.getmembers():
+                if not (base / m.name).resolve().is_relative_to(base):
+                    raise ValueError(f"artifact member escapes destination: {m.name}")
+            tar.extractall(dest)
 
 
 if __name__ == "__main__":

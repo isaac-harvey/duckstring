@@ -154,6 +154,35 @@ def clear(
     typer.echo(f"Cleared failure from '{pond}'.")
 
 
+def reset_contract(
+    pond: str = typer.Argument(..., help="Pond whose captured output schema to drop."),
+    catchment: Optional[str] = _CATCHMENT,
+    major: Optional[int] = _MAJOR,
+    version: Optional[str] = _VERSION,
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation."),
+) -> None:
+    """Drop this major line's recorded output schema so the next run re-freezes it, and clear the failure.
+
+    The escape hatch for a line wedged by a NARROWING type change: the schema gate is forward-only, and a
+    failed run publishes nothing, so the line can otherwise never recover. Widenings no longer need this —
+    they are accepted as additive. Re-opens what a pinned Sink was promised, so it asks first."""
+    from . import _http
+    from .config import resolve_catchment
+    _, cfg = resolve_catchment(catchment)
+    if not yes:
+        typer.confirm(
+            f"Drop the recorded output schema for '{pond}'? A Sink pinned to this major line loses the "
+            "guarantee that its columns keep their types.",
+            abort=True,
+        )
+    r = _http.post(
+        f"{cfg['url']}/api/ponds/{pond}/reset-contract", auth=cfg,
+        params=_http.pond_params(major, version), json={},
+    ).json()
+    typer.echo(f"Contract reset for '{pond}' ({r.get('columns_cleared', 0)} recorded columns dropped); "
+               "the next accepted run re-freezes it.")
+
+
 def failure_budget(
     pond: str = typer.Argument(..., help="Name of the Pond whose retry budgets to show or set."),
     catchment: Optional[str] = _CATCHMENT,

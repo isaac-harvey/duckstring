@@ -180,9 +180,25 @@ def _ts(dt) -> str:
 
 
 def _table_exists(con, name: str) -> bool:
+    """Whether a **relation** named ``name`` exists in the registry — a base table *or a view*. A merge main's
+    base may be a VIEW over the published S3 chunks (the host materialises it lazily, not on every spawn — see
+    plans/s3-resident-state.md), and every existence check here ("does this base/changelog/main exist yet")
+    means the relation, not specifically a physical table. Nothing but the base is ever a view today, so this
+    is behaviour-neutral for the table-only relations."""
     return con.execute(
-        "SELECT 1 FROM duckdb_tables() WHERE table_name = ?", [name]
+        "SELECT 1 FROM duckdb_tables() WHERE table_name = ? "
+        "UNION ALL SELECT 1 FROM duckdb_views() WHERE view_name = ? LIMIT 1", [name, name]
     ).fetchone() is not None
+
+
+def _drop_relation(con, name: str) -> None:
+    """Drop a registry relation named ``name`` whether it is a table or a view (``DROP TABLE IF EXISTS`` errors
+    on a view and vice-versa, so dispatch on the catalog). Used when replacing a base VIEW with a freshly
+    checkpointed base TABLE."""
+    if con.execute("SELECT 1 FROM duckdb_views() WHERE view_name = ?", [name]).fetchone():
+        con.execute(f"DROP VIEW {_q(name)}")
+    else:
+        con.execute(f"DROP TABLE IF EXISTS {_q(name)}")
 
 
 def _user_cols(columns) -> list[str]:
@@ -924,7 +940,8 @@ def checkpoint(con, name: str, target_f, *, retain_t=None, retain_n=None) -> Non
         return
     tmp = unique_name("ckpt")
     con.execute(f'CREATE OR REPLACE TEMP TABLE {_q(tmp)} AS {sql}')   # reads the OLD base + warm + changelog
-    con.execute(f'CREATE OR REPLACE TABLE {_q(name)} AS SELECT * FROM {_q(tmp)}')  # replace the base
+    _drop_relation(con, name)  # the base may be a VIEW over S3 chunks — CREATE OR REPLACE TABLE can't replace it
+    con.execute(f'CREATE TABLE {_q(name)} AS SELECT * FROM {_q(tmp)}')  # the new base, now a local table
     con.execute(f'DROP TABLE IF EXISTS {_q(tmp)}')
     con.execute(f'DROP TABLE IF EXISTS {_q(warm)}')  # the warm tier is now folded into the cold base
     _set_f_base(con, name, target_f)

@@ -104,9 +104,32 @@ Field notes:
 - `gen` / `runs_completed` — runs started / completed since the Catchment loaded.
 - `d_ms` — the Pond's window-derived freshness duration (0 without [Windows](../guides/windows.md)).
 - `trigger` — the standing trigger, e.g. `{"kind": "tide", "bound_ms": 14400000}`, or `null`.
-- The fault fields (`is_failed`, `is_blocked`, `is_killed`, `failed_f`, `failures`) and live budgets are described in [Fault Tolerance](../guides/fault-tolerance.md). When blocked, `missing_sources` (declared Sources absent from this Catchment, as `name@major`) and `blocked_by` (Sources that are themselves down) explain why; `error` carries a failed Pond's message.
+- The fault fields (`is_failed`, `is_blocked`, `is_killed`, `failed_f`, `failures`) and live budgets are described in [Fault Tolerance](../guides/fault-tolerance.md). When blocked, `missing_sources` (declared Sources absent from this Catchment, as `name@major`) and `blocked_by` (Sources that are themselves down) explain why; `error` carries a failed Pond's message, and `failure_kind` its sub-reason — `"contract"` when the Duck refused to publish a breaking schema change (last-good data intact; see [Versioning](../concepts/versioning.md)), `"error"` otherwise, `null` when healthy.
 - `catchment` — this Catchment's [stable identity](../guides/connecting-catchments.md#identity-and-the-lineage-view) `{id, name}`. `is_draw` marks a [Pond Draw](../guides/connecting-catchments.md) (fed by a duct, not run by a worker).
 - `edges` — the inter-Pond graph as `[source, sink]` pairs; `ripple_edges` the intra-Pond graph as `[parent, child]`.
+
+## Lineage
+
+```
+GET /api/lineage?pond={name}&major={int}&table={name}&columns=false
+```
+
+The [observed table-level lineage](../guides/lineage.md): per Pond, what each Ripple actually read and
+wrote on its latest recorded run — `{"ponds": [{"id", "name", "major", "version", "ripples": [{"ripple",
+"f", "reads": [{"source", "table"}], "writes": [table]}]}]}` (a read with `source: null` is an own
+table). `pond` narrows to one Pond (`major` picks the line, default highest); `table` narrows to the
+Ripples touching that name; `columns=true` adds the deploy-captured column derivations per pond —
+`{table: {column: [{ref, column}] | "constant" | "opaque"}}`.
+
+```
+GET /api/ponds/{name}/trace?table={t}&where={sql}&major={int}
+```
+
+Row-level provenance: resolves the newest `_duckstring_f` among the published rows matching `where`
+(the whole table when omitted; a plain overwrite table resolves to its publish `f`), and answers with
+the producing run (`version`, timings, `status`), the input `window` `(previous_f, f]`, and the
+declared `sources`. `{"matched": 0, "run": null}` when nothing matches; `422` on a bad predicate. The
+predicate runs over the exported snapshot at the `/api/query` trust level (read access).
 
 ## Run history
 
@@ -150,8 +173,11 @@ All under `/api/ponds/{name}/…`, all returning `{"ok": true}`; `404` for unkno
 | `POST …/sleep` | `{"upstream": false}` | Clear demand (optionally ancestors too) |
 | `POST …/kill` | — | Terminate the worker; park `killed` |
 | `POST …/clear` | — | Reset failed/killed; unblock downstream |
+| `POST …/reset-contract` | — | Drop the major line's recorded output schema (the next accepted run re-freezes it) and clear the failure — the escape hatch for a line wedged by a narrowing type change |
 | `GET …/budget` | — | `{"immediate_retries", "source_retries"}` |
 | `POST …/budget` | `{"immediate_retries": 1, "source_retries": 2}` | Set the live retry budgets |
+| `GET …/duck` | — | The Pond's effective worker config: `{"size", "flock", "override", "defaults"}` |
+| `POST …/duck` | `{"size": "m", "flock": false}` or `{"clear": true}` | Override (or reset) the Pond's worker preset size / offload flag |
 
 ## Windows
 
@@ -193,8 +219,8 @@ All full-gated. A notification **channel** delivers failures and staleness to an
 
 | Endpoint | Description |
 |---|---|
-| `GET /api/alerts` | `{"channels": [{"name", "destination", "scope", "events", "stale_ms", "enabled", "created_at"}]}`. `scope` is a Pond name or `null` (catchment-wide). |
-| `POST /api/alerts` | Create a channel: `{"name", "destination", "scope"?, "events"?, "stale_ms"?}`. `destination` scheme ∈ `https/http/mailto`; `events` is a CSV of kinds or `all`; `stale_ms` sets a freshness SLA. `422` on a bad destination/event or duplicate name. |
+| `GET /api/alerts` | `{"channels": [{"name", "destination", "scope", "events", "stale_ms", "renotify_ms", "enabled", "created_at"}]}`. `scope` is a Pond name or `null` (catchment-wide). |
+| `POST /api/alerts` | Create a channel: `{"name", "destination", "scope"?, "events"?, "stale_ms"?, "renotify_ms"?}`. `destination` scheme ∈ `https/http/mailto`; `events` is a CSV of kinds or `all`; `stale_ms` sets a freshness SLA; `renotify_ms` repeats the alert at that interval while an episode persists (default: once per episode). `422` on a bad destination/event or duplicate name. |
 | `DELETE /api/alerts/{name}` | Remove a channel (`404` if absent). |
 | `POST /api/alerts/{name}/test` | Send a test notification (validates connectivity/credentials). Returns `{"ok": true}` or `{"ok": false, "error"}` — a connection problem is a `200` result, sanitised (never a credential). |
 | `GET /api/alerts/deliveries?limit=N` | Recent deliveries (`{"deliveries": [{"channel", "kind", "pond", "severity", "status", "attempts", "error", ...}]}`) — the audit log. |
@@ -205,7 +231,7 @@ All full-gated. A notification **channel** delivers failures and staleness to an
 GET /metrics
 ```
 
-A Prometheus text-exposition endpoint at the **root** (not under `/api`) and **unauthenticated** — the exporter convention; a scraper sends no key. Pond names appear as labels, so network-restrict it if those are sensitive. Families (`duckstring_*`): `up`; `pond_freshness_lag_seconds` (the headline — seconds since a Pond last became fresh); `pond_failed`/`blocked`/`killed`; `pond_runs_completed_total`; `pond_failures_total`; `spout_delivery_lag_seconds`; `spout_failed`; `alert_deliveries_total{status}`.
+A Prometheus text-exposition endpoint at the **root** (not under `/api`) and **unauthenticated** — the exporter convention; a scraper sends no key. Pond names appear as labels, so network-restrict it if those are sensitive. Families (`duckstring_*`): `up`; `pond_freshness_lag_seconds` (the headline — seconds since a Pond last became fresh); `pond_failed`/`blocked`/`killed`; `pond_runs_completed_total`; `pond_failures_total`; `pond_run_seconds_total`; `pond_duck_target`; `pond_flock`; `flock_dispatched_total`/`flock_dispatch_failures_total` (a failed Flock dispatch still completes the run on local compute, so the failure counter is the only tell that the Flock is degrading); `spout_delivery_lag_seconds`; `spout_failed`; `alert_deliveries_total{status}`.
 
 ## Data
 
@@ -255,4 +281,4 @@ The recursive upstream lineage: `{catchments: [{id, name, reachable, ponds, edge
 
 ## Worker protocol (informational)
 
-Two further endpoints exist for the Catchment's own worker processes (Ducks) — listed for completeness, not for external use: workers hold a short poll on `GET /api/duck/{name}/{major}/jobs` for commands (`begin_run` / `shutdown`) and report progress to `POST /api/duck/{name}/{major}/events`, idempotently on freshness (one Duck per major line). Both are worker-initiated — the dial-back design that lets local and remote workers share one protocol. See [Architecture](architecture.md).
+Two further endpoints exist for the Catchment's own worker processes (Ducks) — listed for completeness, not for external use: workers hold a short poll on `GET /api/duck/{name}/{major}/jobs` for commands (`begin_run` / `shutdown`), report progress to `POST /api/duck/{name}/{major}/events`, idempotently on freshness (one Duck per major line), and can fetch the deployed source bundle from `GET /api/duck/{name}/{major}/artifact` (how a worker on another host gets its code — the Catchment stays the artifact authority). All are worker-initiated — the dial-back design that lets local and remote workers share one protocol. See [Architecture](architecture.md).

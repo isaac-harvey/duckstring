@@ -30,7 +30,18 @@ from __future__ import annotations
 import re
 
 from .context import SYSTEM_PREFIX
-from .io import D_COL, RESCAN_KINDS, _q, _table_exists, normalize_pk, read_meta, read_registry_delta, unique_name
+from .io import (
+    D_COL,
+    F_COL,
+    RESCAN_KINDS,
+    _q,
+    _table_exists,
+    _ts,
+    normalize_pk,
+    read_meta,
+    read_registry_delta,
+    unique_name,
+)
 
 _W = "_duckstring_w"  # scratch weight column for prior-state reconstruction (distinct from the Z-set D_COL)
 
@@ -488,6 +499,10 @@ class TrickleBuilder:
         if self._materialised is not None:  # comprehensive mode (post-.sql) → diff the relation vs prior main
             changed = ctx.merge_table(name, self._materialised, pk=out_pk, retain_t=retain_t, retain_n=retain_n)
             return self._chain(name, out_pk, changed=changed)
+        remote = self._flock_comprehensive(name, out_pk, ivm)  # env-gated; None ⇒ the local path below
+        if remote is not None:
+            changed = ctx.merge_table(name, remote, pk=out_pk, retain_t=retain_t, retain_n=retain_n)
+            return self._chain(name, out_pk, changed=changed)
         kind, rel = self._compute(out_pk, name, ivm=ivm, key_filter=key_filter)
         if kind == "comprehensive":
             changed = ctx.merge_table(name, rel, pk=out_pk, retain_t=retain_t, retain_n=retain_n)
@@ -536,6 +551,13 @@ class TrickleBuilder:
             )
             return self._chain(name, out_pk, changed=changed)
 
+        remote = self._flock_comprehensive(name, out_pk, ivm)  # env-gated; None ⇒ the local path below
+        if remote is not None:
+            changed = trickle.append_zset(
+                ctx.con, name, trickle._as_zset(remote, 1), ctx.f, out_pk,
+                fail_on_conflict=fail_on_conflict, log_drops=log_drops, retain_t=retain_t, retain_n=retain_n,
+            )
+            return self._chain(name, out_pk, changed=changed)
         kind, rel = self._compute(out_pk, name, ivm=ivm, key_filter=key_filter)
         changed = False
         if kind != "empty":
@@ -645,7 +667,12 @@ class TrickleBuilder:
 
     def _new_spine_rows(self, spine_delta, name: str, out_pk):
         """The spine rows that arrived/changed this run whose (mapped) PK is **not yet** in the output
-        history — the only rows that can produce a new append row when the output is spine-PK keyed."""
+        history — the only rows that can produce a new append row when the output is spine-PK keyed.
+
+        The history prefilter **excludes rows stamped at the current run's ``f``** (this attempt's own
+        output on a same-``f`` replay): ``append_zset``'s replay ``DELETE(@f)`` then re-inserts the epoch's
+        rows, so counting them as history would drop them (silent data loss on any retried/replayed run —
+        first runs are unaffected because no ``f``-stamped output exists yet)."""
         con = self.ctx.con
         new = spine_delta.upserts
         smap = self._spine_pk_passthrough(out_pk, spine_delta.pk)
@@ -655,7 +682,31 @@ class TrickleBuilder:
         new.create_view(v, replace=True)
         spine_cols = ", ".join(_q(smap[p]) for p in out_pk)
         out_cols = ", ".join(_q(p) for p in out_pk)
-        return con.sql(f'SELECT * FROM {_q(v)} WHERE ({spine_cols}) NOT IN (SELECT {out_cols} FROM {_q(name)})')
+        return con.sql(
+            f'SELECT * FROM {_q(v)} WHERE ({spine_cols}) NOT IN '
+            f'(SELECT {out_cols} FROM {_q(name)} WHERE {_q(F_COL)} < {_ts(self.ctx.f)})'
+        )
+
+    # ─── the Flock dispatch hook (over-envelope tier; env-gated, no-op in pure OSS) ──
+
+    def _flock_comprehensive(self, name: str, out_pk, ivm: bool):
+        """Consult the **Flock** (duckstring's over-envelope compute tier — a serverless engine,
+        Athena by default) for this terminal's comprehensive recompute. Returns a relation to
+        hand to the terminal's own comprehensive machinery, or ``None`` (the local path — the
+        overwhelmingly common case). The mode ladder + OOM fail-up live in :mod:`duckstring.flock`;
+        this hook only supplies the Ripple's posture and whether the run is comprehensive-bound
+        (incremental epochs never dispatch — kind preservation). Env-gated: no engine configured
+        ⇒ pure OSS, everything local."""
+        from .. import flock
+
+        if not flock.enabled():
+            return None
+        comprehensive_bound = (not ivm) or (name not in read_meta(self.ctx.con))
+        return flock.comprehensive(
+            self, out_pk,
+            pond_mode=getattr(self.ctx, "flock", None),
+            comprehensive_bound=comprehensive_bound,
+        )
 
     # ─── compute (the shared ΔO step behind .merge() and .append()) ───────────────
 
@@ -1060,6 +1111,11 @@ class TrickleBuilder:
         """Thread the just-materialised output forward as a chainable in-run operand — its delta read back
         from the registry (same coverage rule as the published read_delta). ``changed`` records whether the
         write actually changed the output, surfaced on the returned handle via :meth:`was_changed`."""
+        # Observed-lineage hook (optional host capability, like ``count_table``): a terminal just wrote
+        # ``name`` straight to the registry, so tell the host — trickle/ stays dependency-free.
+        hook = getattr(self.ctx, "record_lineage_write", None)
+        if hook is not None:
+            hook(name)
         threaded = read_registry_delta(self.ctx.con, name, self.ctx.previous_f, self.ctx.f, out_pk)
         nxt = TrickleBuilder(self.ctx, name, _spine_delta=threaded)
         nxt._was_changed = changed

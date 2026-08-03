@@ -141,6 +141,23 @@ def get_principal(request: Request) -> Principal:
     return Principal(level=None, is_duck=False)
 
 
+def level_for_key(con: sqlite3.Connection | None, api_key: str | None, supplied: str) -> Level | None:
+    """The access :class:`Level` for a raw key — the reusable core of :func:`get_principal`, for
+    non-HTTP front doors (the pg / Flight wire servers, where the key arrives as a password). Open mode
+    (no keys configured) → FULL; a bad/absent key → None."""
+    if not auth_configured(con, api_key):
+        return Level.FULL
+    if supplied:
+        if con is not None:
+            h = hash_key(supplied)
+            for level, khash in _key_hashes(con).items():
+                if secrets.compare_digest(khash, h):
+                    return NAME_TO_LEVEL[level]
+        if api_key and secrets.compare_digest(supplied, api_key):
+            return Level.FULL
+    return None
+
+
 # ─── Route guards (declared on each route as `dependencies=[...]`) ────────────
 
 

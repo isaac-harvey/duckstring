@@ -117,6 +117,8 @@ Anywhere that runs an ASGI app can host a Catchment. The packaged entry is `duck
 | `DUCKSTRING_CHECKPOINT_INTERVAL` | `60s` | The Tier-1 (`duck.db`) backup cadence, e.g. `30s`. |
 | `DUCKSTRING_API_KEY` | *(unset)* | The built-in API key. Leave unset when the platform already gates requests (see [Authentication](#authentication)). |
 | `DUCKSTRING_CATCHMENT_URL` | *(unset)* | The Duck dial-back address. Normally unset: the Catchment learns its bound address from the first request it serves, and its Ducks dial that directly. |
+| `DUCKSTRING_FLOCK_MODE` / `DUCKSTRING_FLOCK_ENGINE` / `DUCKSTRING_FLOCK_OOM_POLICY` | `off` / `athena` / `fail_up` | Catchment-wide default Flock posture (over-envelope offload). Per-Pond via `pond.toml` `[flock]` or `duckstring duck set`. Inert on a stock local Catchment (no engine configured). `DUCKSTRING_FLOCK_ENGINE` also takes a `module:Class` spec to plug in your own engine; an unimportable spec turns the Flock **off** rather than failing a run — the Flock is never load-bearing. |
+| `DUCKSTRING_DUCK_LAUNCHER` | *(unset)* | A `module:Class` import spec replacing the local subprocess worker launcher — how a hosting platform runs each Pond's worker elsewhere (its own container, another host). The worker still dials back over the same protocol and fetches its code from the Catchment. |
 | `DUCKSTRING_DATA_PLANE` | `iceberg` | How Ponds publish their tables for each other — `iceberg` (default; snapshots + schema metadata) or `parquet` (whole-table snapshots, the lightest/offline opt-out). Both work on an object-store data root. See [the data plane](#the-data-plane). |
 
 One rule applies everywhere: **run exactly one process of the app.** The Catchment is a single brain — one scheduler, one database, one set of Ducks. Multiple workers (a `--workers` flag, a platform's process autoscaling) would double-dispatch runs.
@@ -158,6 +160,11 @@ Object-store credentials are `${env:NAME}` references in the data-root URI query
 
 The three recipes below are the common shapes.
 
+:::tip Running workers on cloud compute
+This section covers pointing the **data plane** at S3. To also run *workers* on Fargate or EC2 — IAM,
+networking, the worker image, and the Flock — see [Running on AWS](cloud.md).
+:::
+
 ### Recipe: a Catchment backed by S3
 
 A VM / container with a local disk and the data plane in an S3 bucket.
@@ -185,6 +192,9 @@ A VM / container with a local disk and the data plane in an S3 bucket.
        --data-root 's3://acme-lake/duckstring?region=eu-west-1' \
        --generate-key
    ```
+   Provisioning under a supervisor (systemd, a container entrypoint)? Add `--no-start`: `init` then
+   registers and mints the keys **without** serving in the foreground, and the supervisor owns the
+   process via `duckstring catchment start prod`.
 4. **(Ephemeral disk only) add a state backup** so a redeploy / scale-to-zero survives:
    ```bash
    DUCKSTRING_STATE_BACKUP_URI=s3://acme-lake/duckstring-state
@@ -327,7 +337,10 @@ duckstring_pond_failed{pond="sales",major="1"}                  # 0/1
 duckstring_pond_failures_total{pond="sales",major="1"}          # cumulative failed runs
 duckstring_spout_delivery_lag_seconds{spout="sales#warehouse"}  # egress lag
 duckstring_alert_deliveries_total{status="failed"}              # notification health
+duckstring_flock_dispatch_failures_total{pond="priced"}         # Flock degrading to local compute
 ```
+
+A note on that last one: a failed Flock dispatch still completes the run on local compute (by design — the engine is never load-bearing), which means a misconfigured Flock produces correct results while silently paying full local compute every run. The failure counter — and the `flock_error` field on `/api/status` — is how you notice.
 
 ## Restart behaviour
 

@@ -173,8 +173,30 @@ def pond_source_f(s: EngineState, pid: PondId, now: datetime) -> tuple[datetime 
         return now, ZERO
     required = [sp for sp in pond.sources if sp not in pond.optional_sources]
     if required:
-        return min(s.pond_states[sp].end_f for sp in required), ZERO
-    return max(s.pond_states[sp].end_f for sp in pond.sources), ZERO
+        return min(source_visible_f(s, sp, pid) for sp in required), ZERO
+    return max(source_visible_f(s, sp, pid) for sp in pond.sources), ZERO
+
+
+def source_visible_f(s: EngineState, sp: PondId, sink: PondId) -> datetime:
+    """The freshness of Source ``sp``'s output AS VISIBLE to ``sink`` (the Pool-aware gating rule,
+    plans/persist.md): its ``end_f`` when they share a Pool (the local publish is the handoff) or when
+    the Source's publish is already durable at completion (``async_persist`` off — no cloud, or a remote
+    Duck writing the data root directly); its ``persisted_f`` otherwise — a cross-Pool Sink can only read
+    what the async mirror has landed on the durable plane. ``persisted_f <= end_f`` always, so this only
+    ever *delays* a Sink, never invents freshness."""
+    src = s.ponds[sp]
+    if not src.async_persist or src.pool == s.ponds[sink].pool:
+        return s.pond_states[sp].end_f
+    return s.pond_states[sp].persisted_f
+
+
+def record_persist(s: EngineState, pid: PondId, f: datetime) -> None:
+    """The durable mirror for ``pid`` completed through ``f`` — advance its ``persisted_f`` watermark
+    (monotonic; a replayed/stale report never regresses it). Cross-Pool Sinks waiting on this Source
+    become runnable; the caller drives the cascade (``sentinel``/``_process``)."""
+    ps = s.pond_states[pid]
+    if f > ps.persisted_f:
+        ps.persisted_f = f
 
 
 def ripple_source_f(s: EngineState, rid: RippleId) -> datetime:
@@ -298,7 +320,7 @@ def block_on_missing_asset(state: EngineState, pid: PondId, reason: str, now: da
     # Source republish, not the aggregate min-freshness (which the missing Source's own advance need not
     # move). Without this the rewound run re-fires at the same freshness every Duck round-trip — a busy-loop
     # that read-misses forever, floods run history, and starves the Catchment. See plans/reset.md.
-    ps.missing_asset_f = max((s.pond_states[sp].end_f for sp in s.ponds[pid].sources), default=NEVER)
+    ps.missing_asset_f = max((source_visible_f(s, sp, pid) for sp in s.ponds[pid].sources), default=NEVER)
     ps.start_f = ps.end_f  # abandon the incomplete run (the read failed; nothing published)
     for rid in ripples_of(s, pid):
         rs = s.ripple_states[rid]
@@ -339,7 +361,9 @@ def can_start_pond(s: EngineState, pid: PondId, now: datetime) -> bool:
     # busy-loop). Keyed on max(Source end_f), not the min-based `f`, so the missing Source's own republish
     # (which need not raise the min) still triggers recovery. See plans/reset.md.
     if ps.missing_asset is not None:
-        src_f = max((s.pond_states[sp].end_f for sp in s.ponds[pid].sources), default=NEVER)
+        # Visible freshness (Pool-aware): a cross-Pool Source counts as republished only once its mirror
+        # lands — the re-attempt would otherwise read the durable plane and miss again.
+        src_f = max((source_visible_f(s, sp, pid) for sp in s.ponds[pid].sources), default=NEVER)
         if src_f <= ps.missing_asset_f:
             return False
     if not ps.is_failed:  # a blocked-but-not-failed Pond still drains available Source freshness
@@ -492,6 +516,11 @@ def _complete_pond_run(s: EngineState, pid: PondId, new_end: datetime, now: date
     ``changed`` advances ``changed_f`` only when the Run actually produced new output — a pass holds it."""
     ps = s.pond_states[pid]
     ps.end_f = new_end
+    if not s.ponds[pid].async_persist:
+        # The publish is already durable at completion (no cloud / a remote Duck writing the plane
+        # directly) — the persist watermark tracks end_f exactly. An async_persist Pond's advances via
+        # record_persist when its mirror completes (plans/persist.md).
+        ps.persisted_f = new_end
     if changed:
         ps.changed_f = new_end
     # A completed Run satisfies every target up to its freshness — drop them so a target that was added

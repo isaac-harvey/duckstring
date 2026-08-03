@@ -25,7 +25,7 @@ from .executor import _export_data
 
 class DbtExecutor:
     def __init__(self, pond_name: str, major: int, version: str, source_path: str, root: Path,
-                 data_root: str | None = None):
+                 data_root: str | None = None, persist_root: str | None = None):
         from ..core import read_pond_toml
         from ..dbt_mode import parse_manifest, project_dir, write_profile
         from ..keys import spec_major
@@ -37,13 +37,20 @@ class DbtExecutor:
         self.data_root = data_root
         self.registry_path = pond_registry_path(root, pond_name, major)
         self.registry_path.parent.mkdir(parents=True, exist_ok=True)
-        self.own_data_dir = pond_data_dir(root, pond_name, major, data_root)
+        # Local-first publish + async persist, same as RippleExecutor (plans/persist.md).
+        if persist_root:
+            self.own_data_dir = pond_data_dir(root, pond_name, major, None)
+            self.persist_dir = pond_data_dir(root, pond_name, major, persist_root)
+        else:
+            self.own_data_dir = pond_data_dir(root, pond_name, major, data_root)
+            self.persist_dir = None
 
         source_dir = root / source_path
         info = read_pond_toml(source_dir)
         self.proj_dir = project_dir(source_dir, info)
         self.declared_sources = set(info.get("sources", {}).keys())
         self.source_majors = {s: spec_major(spec) for s, spec in info.get("sources", {}).items()}
+        self.source_f: dict[str, str] = {}  # set per begin_run job (see duck/__main__)
 
         # dbt's writable areas, isolated per major line under the Pond's dir; the profile points dbt at
         # this line's registry. Parse once for the per-model source lookup materialisation needs.
@@ -51,6 +58,9 @@ class DbtExecutor:
         self.profiles_dir = write_profile(major_dir / "dbt_profiles", str(self.registry_path))
         self.target_dir = major_dir / "dbt_target"
         self.manifest = parse_manifest(self.proj_dir, self.profiles_dir)
+        from ..dbt_mode import manifest_topology
+
+        self._parents = manifest_topology(self.manifest)  # model → parent models (lineage's declared half)
 
         # One lock over ALL registry access (materialise / dbt run / export / wipe) so no two DuckDB
         # connections to the registry file are ever open at once.
@@ -61,14 +71,21 @@ class DbtExecutor:
                sources_changed: bool = True, skip_sink=None):
         """Run the dbt model ``ripple_name`` at freshness ``f``. dbt models are plain overwrite nodes, so
         ``sources_changed``/``skip_sink`` (the no-change-skip hooks) don't apply. Callbacks fire on the
-        pool thread, matching RippleExecutor."""
-        timing: dict[str, datetime] = {}
+        pool thread, matching RippleExecutor — ``on_done(name, started, finished, lineage)``, where the
+        model's lineage is the cross-Pond sources it materialised (observed via the Pond handle) plus its
+        parent models (from the manifest — dbt's ``ref()`` graph is declared, no observation needed)."""
+        timing: dict = {}
 
         def _task():
             timing["started"] = datetime.now(timezone.utc)
             with self._lock:
-                self._materialize(ripple_name, f, previous_f)  # opens + closes its own connection
-                self._run(ripple_name)                          # dbt opens + closes its own connection
+                src_reads = self._materialize(ripple_name, f, previous_f)  # opens + closes its own connection
+                self._run(ripple_name)                                      # dbt opens + closes its own connection
+            parents = self._parents.get(ripple_name, [])
+            timing["lineage"] = {
+                "reads": sorted(src_reads + [[None, p] for p in parents], key=lambda p: (p[0] or "", p[1])),
+                "writes": [ripple_name],
+            }
 
         fut = self._pool.submit(_task)
 
@@ -79,12 +96,12 @@ class DbtExecutor:
             if exc:
                 on_error(ripple_name, exc, started, finished)
             else:
-                on_done(ripple_name, started, finished)
+                on_done(ripple_name, started, finished, timing.get("lineage"))
 
         fut.add_done_callback(_cb)
         return fut
 
-    def _materialize(self, model_name, f, previous_f) -> None:
+    def _materialize(self, model_name, f, previous_f) -> list:
         import duckdb
 
         from ..core import Pond
@@ -94,9 +111,11 @@ class DbtExecutor:
         try:
             pond = Pond(
                 name=self.pond_name, version=self.version, con=con, root=Path(self.root),
-                source_majors=self.source_majors, f=f, previous_f=previous_f, data_root=self.data_root,
+                source_majors=self.source_majors, source_f=self.source_f, f=f, previous_f=previous_f,
+                data_root=self.data_root,
             )
             materialize_sources(pond, self.manifest, model_name, self.declared_sources)
+            return pond.take_lineage()["reads"]  # the cross-Pond source tables this model consumed
         finally:
             con.close()
 
@@ -114,6 +133,14 @@ class DbtExecutor:
         with self._lock:
             con = duckdb.connect(str(self.registry_path))
             return _export_data(con.cursor(), self.own_data_dir, f, contract)
+
+    def persist(self) -> int:
+        """Mirror the local publish to the durable layer — see :meth:`RippleExecutor.persist`."""
+        if self.persist_dir is None:
+            return 0
+        from ..dataplane import persist_tree
+
+        return persist_tree(self.own_data_dir, self.persist_dir)
 
     def wipe(self) -> None:
         """A Refresh's cold reset: drop the model tables so the next run rebuilds from scratch. Source

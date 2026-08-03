@@ -43,6 +43,21 @@ export function setApiKey(key: string | null): void {
   }
 }
 
+// Key handoff: a console can deep-link the UI as {url}/#key={apiKey} — the key is moved into
+// localStorage on load and stripped from the URL (history.replaceState, so it never lands in the
+// address bar, browser history, or a copy-paste). Runs once at module init, before the first fetch.
+function adoptHashKey(): void {
+  try {
+    const m = window.location.hash.match(/^#key=([^&]+)/);
+    if (!m) return;
+    setApiKey(decodeURIComponent(m[1]));
+    window.history.replaceState(null, '', window.location.pathname + window.location.search);
+  } catch {
+    /* no window (SSR/export prerender) or storage unavailable — the hash is simply ignored */
+  }
+}
+if (typeof window !== 'undefined') adoptHashKey();
+
 function authHeaders(extra: Record<string, string> = {}): Record<string, string> {
   const key = getApiKey();
   return key ? { ...extra, authorization: `Bearer ${key}` } : extra;
@@ -68,6 +83,7 @@ export interface RawPond {
   kind: string;
   is_draw: boolean; // a Pond Draw — fed by a duct from an upstream Catchment, not run by a Duck
   is_spout: boolean; // a Spout — egresses its source's output to an external system (run by the egress worker)
+  dbt: boolean; // a dbt-mode Pond — its Ripples are dbt models
   spout: { destination: string; table: string | null; mode: string; armed: boolean } | null;
   version: string;
   has_tables: boolean; // this major line has published at least one table — the data viewer is offered
@@ -92,10 +108,89 @@ export interface RawPond {
   missing_sources: string[]; // declared Sources absent from the Catchment (pond keys "name@major")
   blocked_by: string[]; // required Sources that are down (failed/killed/blocked) — the upstream block
   error: string | null; // failure message of the freshest failed Run, when failed
+  failure_kind?: 'contract' | 'error' | null; // the failed sub-reason (contract = the schema gate refused the publish)
   immediate_retries: number;
   source_retries: number;
+  // The effective compute config (Duck target/size + Flock posture) with declared/override provenance;
+  // null for Draws/Spouts (no Duck runs them). See plans/cloud-config.md.
+  duck: DuckConfig | null;
+  flock_error?: string | null; // most recent Flock dispatch failure (the run still completed, locally)
   ripples: RawRipple[];
   ripple_edges: [string, string][]; // [sourceName, sinkName] within the Pond
+}
+
+// A named Duck Pool — Catchment-level remote compute (plans/cloud-config.md). On DSC the S/M/L/XL
+// presets are just pools; the picker renders whatever /catchment/duck-pools returns.
+export interface DuckPool {
+  name: string;
+  provider: string; // 'fargate' (default) | 'ec2'
+  instance_type: string | null; // EC2 pools
+  cpu: number | null; // Fargate task cpu units
+  memory: number | null; // Fargate task memory (MiB)
+  min_instances: number;
+  max_instances: number;
+  idle_timeout: number | null;
+  keep_warm: number;
+  region: string | null;
+  deploy_config?: Record<string, string> | null; // provider AWS deployment config (image/AMI/VPC/IAM)
+  managed?: boolean; // a built-in preset (S/M/L/XL) — not editable/removable
+}
+
+// Per-provider deployment config metadata (GET /catchment/compute-defaults): which fields the launcher
+// already reads from env (shown as inherited) + the required fields still missing without any UI input.
+export interface ComputeDefaults {
+  fargate: { fields: string[]; env: Record<string, string>; missing_without_input: string[] };
+  ec2: { fields: string[]; env: Record<string, string>; missing_without_input: string[] };
+}
+
+export function fetchComputeDefaults(): Promise<ComputeDefaults> {
+  return getJSON<ComputeDefaults>('/catchment/compute-defaults');
+}
+
+// A Pond's effective compute config = override ?? declared ?? Catchment default (coalesce). Sizing is
+// concrete (a pool / dedicated instance type) — there is no abstract size field.
+export interface DuckConfig {
+  duck_target: string; // 'catchment' | a pool name | 'dedicated'
+  remote: boolean;
+  pool: DuckPool | null;
+  dedicated_instance_type: string | null;
+  dedicated_auto_stop: boolean | null;
+  deploy_config: Record<string, string> | null; // dedicated Duck's provider deployment config
+  flock_mode: string; // 'off' | 'upgrade' | 'always'
+  flock_engine: string | null;
+  oom_policy: string; // 'fail_up' | 'fail'
+  declared: {
+    duck_target?: string | null;
+    flock_mode?: string | null;
+    flock_engine?: string | null;
+    oom_policy?: string | null;
+  };
+  override: {
+    duck_target: string | null;
+    dedicated_instance_type: string | null;
+    dedicated_auto_stop: boolean | null;
+    flock_mode: string | null;
+    flock_engine: string | null;
+    oom_policy: string | null;
+  };
+  defaults: { duck_target: string; flock_mode: string; flock_engine: string | null; oom_policy: string };
+}
+
+// The cloud-enable gate — remote data root + AWS creds (plans/cloud-config.md). Surfaced on /api/status
+// so the UI greys out remote-compute options until both hold.
+export interface CloudGate {
+  data_root: string | null;
+  data_root_remote: boolean;
+  aws_configured: boolean;
+  cloud_enabled: boolean;
+  // Provider readiness (Cloud enabled + the provider's env deployment config is adequate). fargate_enabled
+  // gates the S/M/L/XL presets — they rely on the env, so they aren't offered until Fargate is ready.
+  fargate_enabled: boolean;
+  ec2_enabled: boolean;
+  // Live credential validity (STS GetCallerIdentity), cached server-side. null = not yet checked / gate
+  // off (no warning); false = enabled but the creds are rejected → the UI warns persistently.
+  creds_valid: boolean | null;
+  creds_error: string | null;
 }
 
 // The caller's access level — a total order read ⊂ demand ⊂ full. The UI gates its controls on it.
@@ -105,6 +200,7 @@ export interface StatusPayload {
   catchment: { id: string | null; name: string | null } | null; // this Catchment's stable identity
   version: number; // change token for the /api/status long-poll (pass back as ?since=)
   access_level: AccessLevel; // the caller's level (always 'full' when the Catchment is open/unauthed)
+  cloud?: CloudGate; // the cloud-enable gate + reasons (remote data root + AWS creds)
   ponds: RawPond[];
   edges: [string, string][]; // [sourceId, sinkId] — pond keys ("name@major")
 }
@@ -130,7 +226,17 @@ export interface RawPondRun {
   status: string;
   error: string | null;
   traceback: string | null;
+  // The run's Persist (the async mirror to the durable plane — a separate log item from the run, which
+  // closes at local publish). null = no mirror recorded (no cloud / direct-to-plane / not landed yet).
+  persist?: RawPersist | null;
   ripples?: RawRippleRun[];
+}
+
+export interface RawPersist {
+  status: string; // success | failed
+  error: string | null;
+  started_at: string | null;
+  finished_at: string | null;
 }
 
 export interface RawWindow {
@@ -194,6 +300,8 @@ export interface RunsQuery {
   lineage?: boolean;
   ripples?: boolean;
   limit?: number;
+  after?: string; // UTC ISO — runs started at/after this bound
+  before?: string; // UTC ISO — runs started at/before this bound
 }
 
 export async function fetchRuns(q: RunsQuery = {}): Promise<RawPondRun[]> {
@@ -206,6 +314,8 @@ export async function fetchRuns(q: RunsQuery = {}): Promise<RawPondRun[]> {
   if (q.lineage !== undefined) params.set('lineage', String(q.lineage));
   if (q.ripples !== undefined) params.set('ripples', String(q.ripples));
   if (q.limit !== undefined) params.set('limit', String(q.limit));
+  if (q.after) params.set('after', q.after);
+  if (q.before) params.set('before', q.before);
   const qs = params.toString();
   const data = await getJSON<{ runs: RawPondRun[] }>(`/runs${qs ? `?${qs}` : ''}`);
   return data.runs;
@@ -317,6 +427,139 @@ export function setBudget(pond: string, immediateRetries: number, sourceRetries:
   });
 }
 
+// Compute override (Duck target/size + Flock posture). Only the fields passed change; clear=true drops
+// the whole override (reverts to the pond.toml-declared config, else the Catchment default).
+export interface DuckOverrideBody {
+  duck_target?: string | null;
+  dedicated_instance_type?: string | null;
+  dedicated_auto_stop?: boolean | null;
+  deploy_config?: Record<string, string> | null;  // dedicated Duck's provider AWS deployment config
+  flock_mode?: string | null;
+  flock_engine?: string | null;
+  oom_policy?: string | null;
+  clear?: boolean;
+}
+
+export function setDuck(pond: string, body: DuckOverrideBody): Promise<void> {
+  return postJSON(pondPath(pond, 'duck'), body);
+}
+
+// ─── Cloud config (Catchment-level: the data-plane target + Duck Pools) ───────
+
+export interface CloudSettings extends CloudGate {
+  has_data: boolean; // once true the data root is set-once (switching would strand data)
+}
+
+export function fetchCloudSettings(): Promise<CloudSettings> {
+  return getJSON<CloudSettings>('/catchment/settings');
+}
+
+// Attach or SWITCH the data-plane target (empty string → back to local). Switching rebuilds into the new
+// location (the old one is kept as a backup) and needs `confirm` == the catchment name once a root / data
+// already exists. Returns the updated gate, or throws the 422/409 detail (needs confirm / in use / unusable).
+export async function setDataRoot(dataRoot: string, confirm?: string, mode: 'empty' | 'adopt' | 'migrate' = 'empty'): Promise<CloudSettings> {
+  const res = await fetch(`${apiBase()}/catchment/settings`, {
+    method: 'PUT',
+    headers: authHeaders({ 'content-type': 'application/json' }),
+    body: JSON.stringify({ data_root: dataRoot, confirm: confirm ?? null, mode }),
+  });
+  if (res.status === 401) throw new UnauthorizedError();
+  if (!res.ok) throw new Error((await res.json().catch(() => null))?.detail ?? `set data root failed (${res.status})`);
+  return res.json();
+}
+
+// Progress of the in-flight/last data-plane migration (GET /catchment/migration).
+export interface MigrationStatus {
+  status: 'idle' | 'copying' | 'adopting' | 'done' | 'failed';
+  target?: string | null;
+  pond?: string | null;
+  total_files?: number;
+  total_bytes?: number;
+  copied_files?: number;
+  copied_bytes?: number;
+  error?: string | null;
+}
+
+export function fetchMigration(): Promise<MigrationStatus> {
+  return getJSON<MigrationStatus>('/catchment/migration');
+}
+
+export function fetchDuckPools(): Promise<DuckPool[]> {
+  return getJSON<{ pools: DuckPool[] }>('/catchment/duck-pools').then((d) => d.pools);
+}
+
+export function addDuckPool(body: {
+  name: string;
+  provider?: string | null;
+  cpu?: number | null;
+  memory?: number | null;
+  instance_type?: string | null;
+  min_instances?: number | null;
+  max_instances?: number | null;
+  keep_warm?: number | null;
+  idle_timeout?: number | null;
+  region?: string | null;
+  deploy_config?: Record<string, string> | null;
+}): Promise<void> {
+  return postJSON('/catchment/duck-pools', body);
+}
+
+export async function removeDuckPool(name: string): Promise<void> {
+  const res = await fetch(`${apiBase()}/catchment/duck-pools/${encodeURIComponent(name)}`, {
+    method: 'DELETE',
+    headers: authHeaders(),
+  });
+  if (res.status === 401) throw new UnauthorizedError();
+  if (!res.ok) throw new Error(`remove pool failed (${res.status})`);
+}
+
+// ─── AWS discovery + the cloud-enable verification probe ──────────────────────
+
+// One EC2 instance type + its specs (from the Catchment's DescribeInstanceTypes) — powers the compute
+// dropdowns so nobody types an instance type blind.
+export interface InstanceType {
+  name: string;
+  vcpu: number | null;
+  memory_gib: number | null;
+  gpu: number;
+}
+export interface InstanceTypesResult {
+  available: boolean; // false → AWS unreachable / no creds / no region; UI falls back to free text
+  region?: string;
+  error?: string;
+  types: InstanceType[];
+}
+
+// Fetch the offered instance types for a region (defaults to the Catchment's AWS region). Cached
+// Catchment-side; never throws on an AWS problem (returns available:false).
+export function fetchInstanceTypes(region?: string): Promise<InstanceTypesResult> {
+  const q = region ? `?region=${encodeURIComponent(region)}` : '';
+  return getJSON<InstanceTypesResult>(`/catchment/instance-types${q}`);
+}
+
+export interface CloudVerifyResult {
+  ok: boolean;            // STS GetCallerIdentity succeeded (creds are valid)
+  account?: string;
+  arn?: string;
+  region?: string | null;
+  bucket_ok?: boolean;    // present only when a data_root was probed
+  bucket_error?: string;
+  error?: string;
+}
+
+// Probe the control-plane AWS creds (and, if given, that the data-root bucket is writable) — a 200 with
+// ok:false on a credential/permission problem, so read the body rather than catching.
+export async function verifyCloud(dataRoot?: string): Promise<CloudVerifyResult> {
+  const res = await fetch(`${apiBase()}/catchment/cloud/verify`, {
+    method: 'POST',
+    headers: authHeaders({ 'content-type': 'application/json' }),
+    body: JSON.stringify({ data_root: dataRoot ?? null }),
+  });
+  if (res.status === 401) throw new UnauthorizedError();
+  if (!res.ok) throw new Error((await res.json().catch(() => null))?.detail ?? `verify failed (${res.status})`);
+  return res.json();
+}
+
 // ─── Spouts (egress) ─────────────────────────────────────────────────────────
 
 export interface RawSpout {
@@ -410,6 +653,43 @@ export async function removeSecret(name: string): Promise<void> {
   if (!res.ok) throw new Error(`remove secret failed (${res.status})`);
 }
 
+// ─── Data serving (the Catalog — plans/data-serving.md) ─────────────────────
+
+export interface CatalogTable {
+  table: string;
+  exposed: boolean;
+  source: string; // 'declared' | 'override' | 'hidden'
+  major: number;
+}
+
+export interface CatalogPond {
+  name: string;
+  served_major: number;
+  majors: number[];
+  tables: CatalogTable[];
+}
+
+export interface Catalog {
+  catchment: string | null;
+  ponds: CatalogPond[];
+  connect: Record<string, string>; // {pg: "host:port", flight: "host:port"} for configured wires
+}
+
+export function fetchCatalog(): Promise<Catalog> {
+  return getJSON<Catalog>('/serve');
+}
+
+// Cross-pond hand-written SQL now runs through the paginated /query/page + /query/count surface (the data
+// viewer's query mode) — the standalone /serve/query is the CLI/wire JSON path, not a frontend client.
+
+export function promoteServe(pond: string, major: number): Promise<void> {
+  return postJSON(`/ponds/${encodeURIComponent(pond)}/serve/promote`, { major });
+}
+
+export function exposeTable(pond: string, table: string, exposed: boolean | null, major?: number): Promise<void> {
+  return postJSON(pondPath(pond, 'serve/expose') + (major != null ? `?major=${major}` : ''), { table, exposed });
+}
+
 // ─── Alerts (failure & freshness notification channels — full-gated) ─────────
 
 export interface RawAlertChannel {
@@ -418,6 +698,7 @@ export interface RawAlertChannel {
   scope: string | null; // a pond name, or null for catchment-wide
   events: string; // CSV of kinds, or 'all'
   stale_ms: number | null;
+  renotify_ms?: number | null; // re-notify interval while an episode persists; null = once per episode
   enabled: boolean;
   created_at: string | null;
 }
@@ -434,6 +715,31 @@ export interface RawAlertDelivery {
   sent_at: string | null;
 }
 
+// ─── Observed table-level lineage (plans/lineage.md Phase 1) ─────────────────
+
+export interface RawLineageRipple {
+  ripple: string;
+  f: string; // the latest recorded run
+  reads: { source: string | null; table: string }[]; // source null = an own table
+  writes: string[];
+}
+
+export interface RawLineagePond {
+  id: string;
+  name: string;
+  major: number;
+  version: string;
+  ripples: RawLineageRipple[];
+}
+
+export function fetchLineage(pond?: string, major?: number): Promise<RawLineagePond[]> {
+  const params = new URLSearchParams();
+  if (pond !== undefined) params.set('pond', pond);
+  if (major !== undefined) params.set('major', String(major));
+  const q = params.toString();
+  return getJSON<{ ponds: RawLineagePond[] }>(`/lineage${q ? `?${q}` : ''}`).then((d) => d.ponds);
+}
+
 export function fetchAlerts(): Promise<RawAlertChannel[]> {
   return getJSON<{ channels: RawAlertChannel[] }>('/alerts').then((d) => d.channels);
 }
@@ -445,6 +751,7 @@ export function addAlert(body: {
   scope?: string | null;
   events?: string;
   stale_ms?: number | null;
+  renotify_ms?: number | null;
 }): Promise<void> {
   return postJSON('/alerts', body);
 }

@@ -14,6 +14,12 @@ from datetime import datetime, timezone
 # The event vocabulary. `freshness` is tick-driven (the SLA sweep); the rest are transition-driven.
 KNOWN_EVENTS = ("failure", "contract", "spout", "recovery", "freshness")
 
+# Machine-consumer kinds: valid subscriptions, but deliberately EXCLUDED from the `all` expansion —
+# an ops Slack channel subscribed to `all` must never receive raw catalog events. `openlineage` carries
+# a standard OpenLineage RunEvent per completed Pond Run (plans/lineage.md Phase 4); the webhook
+# notifier posts it verbatim (no Slack `text` wrapper).
+EXPLICIT_EVENTS = ("openlineage",)
+
 # Default severity per kind (a channel filters by kind, not severity — this is only for the payload/label).
 SEVERITY = {
     "failure": "error",
@@ -21,13 +27,15 @@ SEVERITY = {
     "spout": "error",
     "freshness": "warning",
     "recovery": "info",
+    "openlineage": "info",
 }
 
 
 def normalise_events(events: str | None) -> tuple[str, ...]:
     """Parse a channel's ``events`` CSV (or ``all``/empty) into a validated tuple of known kinds.
 
-    ``all`` / empty → every kind. Raises :class:`ValueError` naming an unknown kind."""
+    ``all`` / empty → every *notification* kind (machine-consumer kinds like ``openlineage`` need an
+    explicit subscription). Raises :class:`ValueError` naming an unknown kind."""
     if not events or events.strip().lower() == "all":
         return KNOWN_EVENTS
     out = []
@@ -35,8 +43,11 @@ def normalise_events(events: str | None) -> tuple[str, ...]:
         kind = raw.strip().lower()
         if not kind:
             continue
-        if kind not in KNOWN_EVENTS:
-            raise ValueError(f"unknown alert event {kind!r} — choose from {', '.join(KNOWN_EVENTS)} (or 'all')")
+        if kind not in KNOWN_EVENTS and kind not in EXPLICIT_EVENTS:
+            raise ValueError(
+                f"unknown alert event {kind!r} — choose from "
+                f"{', '.join(KNOWN_EVENTS + EXPLICIT_EVENTS)} (or 'all')"
+            )
         out.append(kind)
     if not out:
         return KNOWN_EVENTS

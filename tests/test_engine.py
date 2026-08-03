@@ -986,3 +986,77 @@ def test_wave_steady_state_only_inlet_runs_when_nothing_changes():
     assert p2.runs_completed > p2_completed  # p2 kept completing — as passes
     assert d.state.ripple_states["s1"].runs_started == s1_runs  # but its Ripple never ran again
     assert p2.changed_f == p2_changed_f  # content mark frozen
+
+
+# ─── Pool-aware freshness visibility (plans/persist.md phase 3) ────────────────
+
+
+def test_cross_pool_sink_gates_on_persisted_f_same_pool_on_end_f():
+    """The one-rule protocol: a Sink sees its Source at ``end_f`` when they share a Pool (the local
+    publish is the handoff), at ``persisted_f`` otherwise (it can only read what the durable mirror has
+    landed). So a same-Pool Sink starts as soon as the Source completes; a cross-Pool Sink holds until
+    ``record_persist`` — and then starts at the persisted freshness."""
+    from duckstring.engine import record_persist
+
+    src = Pond("src", "src", pool="catchment", async_persist=True)
+    loc = Pond("loc", "loc", sources=["src"], pool="catchment")   # same Pool → end_f
+    rmt = Pond("rmt", "rmt", sources=["src"], pool="duck:rmt")    # cross-Pool → persisted_f
+    s = build([src, loc, rmt], [])
+
+    # The Source has completed a run locally, but its mirror has not landed yet.
+    s.pond_states["src"].start_f = s.pond_states["src"].end_f = T0
+    s = tap_pond(s, "loc", T0)
+    s = tap_pond(s, "rmt", T0)
+    s = tick(T0, s)
+    s, _ = sentinel(T0, s)
+    started = [b.pond_id for b in s.pending_begin_runs]
+    assert "loc" in started, "a same-Pool Sink must start at the Source's end_f"
+    assert "rmt" not in started, "a cross-Pool Sink must NOT start before the Source's mirror lands"
+    assert s.pond_states["rmt"].start_f == NEVER
+
+    # The mirror lands → the cross-Pool Sink becomes runnable at the persisted freshness.
+    s.pending_begin_runs.clear()
+    record_persist(s, "src", T0)
+    at = T0 + STEP
+    s = tick(at, s)
+    s, _ = sentinel(at, s)
+    assert "rmt" in [b.pond_id for b in s.pending_begin_runs]
+    assert s.pond_states["rmt"].start_f == T0
+
+
+def test_record_persist_is_monotonic():
+    """A replayed/stale persist report never regresses the watermark."""
+    from duckstring.engine import record_persist
+
+    src = Pond("src", "src", pool="catchment", async_persist=True)
+    s = build([src], [])
+    record_persist(s, "src", T0 + secs(10))
+    record_persist(s, "src", T0)  # a stale replay
+    assert s.pond_states["src"].persisted_f == T0 + secs(10)
+
+
+def test_non_async_pond_persisted_f_tracks_end_f_on_completion():
+    """A Pond whose publish is durable at completion (no cloud / a remote Duck writing the plane
+    directly) keeps ``persisted_f == end_f`` — cross-Pool visibility never lags, and the pre-Pool
+    behaviour is exactly preserved (source_visible_f returns end_f for it regardless)."""
+    src = Pond("src", "src")  # defaults: pool="catchment", async_persist=False
+    s = build([src], [Ripple("r", "src", "r")])
+    s.pond_states["src"].start_f = T0
+    s.ripple_states["r"].start_f = T0
+    s.ripple_states["r"].is_running = True
+    s = complete_ripple(s, "r", T0)
+    assert s.pond_states["src"].end_f == T0
+    assert s.pond_states["src"].persisted_f == T0
+
+
+def test_async_pond_persisted_f_lags_until_recorded():
+    """An async_persist Pond's completion advances end_f but NOT persisted_f — the mirror is off the
+    critical path, and only record_persist (the Duck's persist event) advances the watermark."""
+    src = Pond("src", "src", async_persist=True)
+    s = build([src], [Ripple("r", "src", "r")])
+    s.pond_states["src"].start_f = T0
+    s.ripple_states["r"].start_f = T0
+    s.ripple_states["r"].is_running = True
+    s = complete_ripple(s, "r", T0)
+    assert s.pond_states["src"].end_f == T0
+    assert s.pond_states["src"].persisted_f == NEVER

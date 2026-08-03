@@ -165,6 +165,11 @@ class Storage:
         """Atomically write ``data`` to the addressed file."""
         raise NotImplementedError
 
+    def put_file(self, local: Path, *parts: str) -> None:
+        """Upload one local file to the addressed location — streaming (never whole-file-in-memory),
+        atomic at the destination. The Persist mirror's per-file primitive (plans/persist.md)."""
+        raise NotImplementedError
+
     @contextmanager
     def copy_to(self, *parts: str) -> Iterator[str]:
         """Yield a URI for DuckDB to ``COPY … TO``, committing the result **atomically** to the addressed
@@ -200,6 +205,25 @@ class Storage:
     def duckdb_setup(self, con) -> None:
         """Configure ``con`` so DuckDB can read/write this storage (load ``httpfs`` + a credential
         secret for an object store). A no-op for local paths."""
+
+
+
+def _s3_endpoint(params: dict) -> str | None:
+    """An S3-compatible endpoint override (MinIO, Ceph, R2, moto), from the URI's ``?endpoint=`` or the
+    ``DUCKSTRING_S3_ENDPOINT`` environment. Absent for real AWS, which addresses buckets by region."""
+    from .egress import credentials
+
+    raw = params.get("endpoint") or os.environ.get("DUCKSTRING_S3_ENDPOINT")
+    return credentials.resolve(raw) if raw else None
+
+
+def _split_endpoint(endpoint: str) -> tuple[str, bool]:
+    """``(host:port, use_ssl)`` — DuckDB wants the host without a scheme plus a USE_SSL flag, where
+    fsspec wants a full URL. A bare host defaults to https, as AWS does."""
+    if "://" in endpoint:
+        scheme, _, rest = endpoint.partition("://")
+        return rest.rstrip("/"), scheme.lower() != "http"
+    return endpoint.rstrip("/"), True
 
 
 class LocalStorage(Storage):
@@ -271,6 +295,17 @@ class LocalStorage(Storage):
         tmp.write_bytes(data)
         tmp.replace(dest)
 
+    def put_file(self, local: Path, *parts: str) -> None:
+        """Upload one local file to this storage at ``parts`` — streaming (never whole-file-in-memory),
+        atomic at the destination. The Persist mirror's per-file primitive (plans/persist.md)."""
+        import shutil
+
+        dest = self._abs(*parts)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        tmp = dest.with_name(dest.name + ".tmp")
+        shutil.copyfile(local, tmp)
+        tmp.replace(dest)
+
     @contextmanager
     def copy_to(self, *parts: str) -> Iterator[str]:
         dest = self._abs(*parts)
@@ -334,14 +369,28 @@ class ObjectStorage(Storage):
 
             from .egress import credentials
 
-            opts = {}
-            for k, v in self.params.items():
-                if k in ("region",) or k.startswith("client_kwargs") or k in (
-                    "key", "key_id", "secret", "token", "account_name", "account_key", "anon",
-                ):
-                    opts[_FSSPEC_OPT.get(k, k)] = credentials.resolve(v)
             scheme = urlsplit(self.base).scheme
-            self._fs = fsspec.filesystem(_FSSPEC_PROTOCOL.get(scheme, scheme), **opts)
+            protocol = _FSSPEC_PROTOCOL.get(scheme, scheme)
+            # NEVER cache directory listings. The Catchment and each Duck are SEPARATE processes writing to
+            # the same object store; a Duck publishes a table's parts and the Catchment must see them on the
+            # very next read. fsspec's default listings cache serves a stale PARENT listing — so `isdir` of a
+            # freshly-written child returns False, `parquet_names` comes back empty, and a merge read raises
+            # FileNotFoundError (an opaque 500 on the data viewer). Correctness across processes forbids it.
+            opts: dict = {"use_listings_cache": False}
+            for k, v in self.params.items():
+                if k == "region":
+                    # s3fs/aiobotocore takes the region under client_kwargs.region_name, NOT a bare
+                    # ``region=`` kwarg (which raises); other backends derive it, so only pass it to s3.
+                    if protocol == "s3":
+                        opts.setdefault("client_kwargs", {})["region_name"] = credentials.resolve(v)
+                elif k in ("key", "key_id", "secret", "token", "account_name", "account_key", "anon"):
+                    opts[_FSSPEC_OPT.get(k, k)] = credentials.resolve(v)
+            if protocol == "s3":
+                endpoint = _s3_endpoint(self.params)
+                if endpoint:
+                    host, ssl = _split_endpoint(endpoint)
+                    opts.setdefault("client_kwargs", {})["endpoint_url"] = f"{'https' if ssl else 'http'}://{host}"
+            self._fs = fsspec.filesystem(protocol, **opts)
         return self._fs
 
     def _key(self, *parts: str) -> str:
@@ -377,32 +426,34 @@ class ObjectStorage(Storage):
         except FileNotFoundError:
             return 0
 
-    def parquet_names(self, *parts: str) -> list[str]:
-        key = self._key(*parts)
-        if not self.fs.isdir(key):
+    def _ls(self, key: str) -> list[dict]:
+        """``fs.ls(key)`` returning ``[]`` for a missing prefix. Deliberately does NOT pre-check ``isdir``:
+        that consults a (now-disabled) cached parent listing and can falsely report a freshly-written child
+        absent — the very staleness that surfaced as a 500 on the data viewer. Listing the key directly is
+        both correct and one S3 round-trip cheaper."""
+        try:
+            return self.fs.ls(key, detail=True)
+        except FileNotFoundError:
             return []
+
+    def parquet_names(self, *parts: str) -> list[str]:
         return sorted(
-            k.rstrip("/").rsplit("/", 1)[-1]
-            for k in self.fs.ls(key, detail=False)
-            if k.endswith(".parquet")
+            e["name"].rstrip("/").rsplit("/", 1)[-1]
+            for e in self._ls(self._key(*parts))
+            if e.get("type") == "file" and e["name"].endswith(".parquet")
         )
 
     def names(self, *parts: str) -> list[str]:
-        key = self._key(*parts)
-        if not self.fs.isdir(key):
-            return []
         return sorted(
             e["name"].rstrip("/").rsplit("/", 1)[-1]
-            for e in self.fs.ls(key, detail=True)
+            for e in self._ls(self._key(*parts))
             if e.get("type") == "file"
         )
 
     def subdir_names(self) -> list[str]:
-        if not self.fs.isdir(self.base):
-            return []
         return sorted(
             e["name"].rstrip("/").rsplit("/", 1)[-1]
-            for e in self.fs.ls(self.base, detail=True)
+            for e in self._ls(self.base)
             if e.get("type") == "directory"
         )
 
@@ -467,6 +518,11 @@ class ObjectStorage(Storage):
     def write_bytes(self, data: bytes, *parts: str) -> None:
         self.fs.pipe_file(self._key(*parts), data)  # single-object PUT — atomic
 
+    def put_file(self, local: Path, *parts: str) -> None:
+        """Upload one local file — fsspec streams it (multipart for a large object), and a single-object
+        PUT is atomic, so no tmp+rename is needed."""
+        self.fs.put_file(str(local), self._key(*parts))
+
     @contextmanager
     def copy_to(self, *parts: str) -> Iterator[str]:
         # A single-object PUT is atomic at the object level → write the final object directly, no tmp.
@@ -524,7 +580,9 @@ class ObjectStorage(Storage):
         bits = [f"TYPE {duck_type}"]
         key = self.params.get("key_id") or self.params.get("key")
         secret = self.params.get("secret")
-        region = self.params.get("region")
+        # Region: explicit query param, else the ambient AWS region from the environment. DuckDB needs it
+        # to address the bucket — without it an S3 read fails with "in region ''".
+        region = self.params.get("region") or os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
         try:
             if key and secret:
                 bits.append(f"KEY_ID '{credentials.resolve(key)}'")
@@ -533,6 +591,12 @@ class ObjectStorage(Storage):
                 bits.append("PROVIDER credential_chain")
             if region:
                 bits.append(f"REGION '{credentials.resolve(region)}'")
+            endpoint = _s3_endpoint(self.params) if duck_type == "S3" else None
+            if endpoint:
+                host, ssl = _split_endpoint(endpoint)
+                # Path-style addressing: an S3-compatible server is rarely reachable as
+                # bucket.host, and virtual-host style silently resolves nowhere.
+                bits += [f"ENDPOINT '{host}'", f"USE_SSL {str(ssl).lower()}", "URL_STYLE 'path'"]
             con.execute(f"CREATE OR REPLACE SECRET duckstring_data ({', '.join(bits)})")
         except Exception:  # never echo a credential value in the error
             raise RuntimeError(f"failed to configure DuckDB {duck_type} credentials for the data plane") from None
@@ -541,3 +605,60 @@ class ObjectStorage(Storage):
 # fsspec protocol / option-name remaps for the schemes we accept.
 _FSSPEC_PROTOCOL = {"gs": "gcs", "s3a": "s3", "az": "abfs", "wasb": "abfs", "wasbs": "abfs", "dbfs": "databricks"}
 _FSSPEC_OPT = {"key_id": "key", "account_key": "account_key"}
+
+
+# ─── cross-store tree copy (data-plane migration) ────────────────────────────────
+
+def _copy_file(src: "Storage", dst: "Storage", name: str) -> None:
+    """Copy one file src/name → dst/name. **Server-side** when both are object stores sharing one fsspec
+    filesystem (same provider + credentials → an S3 ``CopyObject``, no bytes through this process); a
+    streamed byte-copy otherwise (local↔object, cross-provider)."""
+    if isinstance(src, ObjectStorage) and isinstance(dst, ObjectStorage) and src.fs is dst.fs:
+        src.fs.copy(src._key(name), dst._key(name))
+    else:
+        dst.write_bytes(src.read_bytes(name), name)
+
+
+def tree_size(src: "Storage", *, skip_top: "frozenset[str]" = frozenset()) -> "tuple[int, int]":
+    """``(file_count, byte_count)`` under ``src`` (recursive), with the same ``skip_top`` semantics as
+    :func:`copy_tree` — a metadata-only pass to seed a migration progress total. Missing/empty → ``(0, 0)``."""
+    if not src.exists() or not src.is_dir():
+        return (0, 0)
+    files, nbytes = 0, 0
+    for name in src.names():
+        if name in skip_top:
+            continue
+        files += 1
+        nbytes += src.size(name)
+    for sub in src.subdir_names():
+        if sub in skip_top:
+            continue
+        f, b = tree_size(src.child(sub))
+        files += f
+        nbytes += b
+    return (files, nbytes)
+
+
+def copy_tree(src: "Storage", dst: "Storage", *, skip_top: "frozenset[str]" = frozenset(), on_file=None) -> int:
+    """Recursively copy every file under ``src`` into ``dst``, returning the file count. ``skip_top`` names
+    (files or dirs) are skipped **at the top level only** — the data-plane migration passes the Iceberg
+    ``catalog.json`` + ``pond.db`` namespace here (self-contained flat Parquet is carried; the absolute-
+    pathed Iceberg metadata is left behind and regenerated at the target). ``on_file(nbytes)`` is called
+    after each file (for progress). Uses :func:`_copy_file`, so it is server-side for same-provider object
+    stores. A missing/empty source is a no-op."""
+    if not src.exists() or not src.is_dir():
+        return 0
+    count = 0
+    for name in src.names():
+        if name in skip_top:
+            continue
+        nbytes = src.size(name) if on_file else 0
+        _copy_file(src, dst, name)
+        count += 1
+        if on_file:
+            on_file(nbytes)
+    for sub in src.subdir_names():
+        if sub in skip_top:
+            continue
+        count += copy_tree(src.child(sub), dst.child(sub), on_file=on_file)  # skip only applies at the top
+    return count

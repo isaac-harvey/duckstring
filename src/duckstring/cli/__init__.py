@@ -5,12 +5,26 @@ import typer
 from . import alert as alert_cmd
 from . import bulk as bulk_cmd
 from . import catchment as catchment_cmd
+from . import duck as duck_cmd
 from . import duct as duct_cmd
+from . import lineage as lineage_cmd
 from . import pond as pond_cmd
 from . import puddle as puddle_cmd
 from . import secret as secret_cmd
+from . import serve as serve_cmd
 from . import spout as spout_cmd
-from .control import clear, failure_budget, force, kill, refresh, repair, reset, sleep, wake
+from .control import (
+    clear,
+    failure_budget,
+    force,
+    kill,
+    refresh,
+    repair,
+    reset,
+    reset_contract,
+    sleep,
+    wake,
+)
 from .data import delete_object, delete_table, get, get_object, objects, query
 from .deploy import deploy
 from .deploy import remove as remove_pond
@@ -61,6 +75,7 @@ control_app.command("wake")(wake)
 control_app.command("sleep")(sleep)
 control_app.command("kill")(kill)
 control_app.command("clear")(clear)
+control_app.command("reset-contract")(reset_contract)
 control_app.command("failure-budget")(failure_budget)
 
 catchment_cmd.app.command("open")(duct_cmd.open_pond)
@@ -72,14 +87,18 @@ app.add_typer(pond_cmd.app, name="pond")
 app.add_typer(puddle_cmd.app, name="puddle")
 app.add_typer(trigger_app, name="trigger")
 app.add_typer(control_app, name="control")
+app.add_typer(duck_cmd.app, name="duck")
 app.add_typer(spout_cmd.app, name="spout")
 app.add_typer(secret_cmd.app, name="secret")
+app.add_typer(serve_cmd.app, name="serve")
 app.add_typer(alert_cmd.app, name="alert")
 
 pond_cmd.app.command("deploy")(deploy)
 pond_cmd.app.command("remove")(remove_pond)
 app.command("do")(bulk_cmd.do)
 app.command("status")(status)
+app.command("lineage")(lineage_cmd.show)
+app.command("trace")(lineage_cmd.trace)
 app.command("get")(get)
 app.command("query")(query)
 app.command("objects")(objects)

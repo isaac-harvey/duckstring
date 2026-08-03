@@ -40,6 +40,9 @@ def add(
                                               "failure,contract,spout,recovery,freshness (or 'all')."),
     stale: Optional[str] = typer.Option(None, "--stale", help="Freshness-SLA bound, e.g. 1h, 30m — alert when a "
                                                              "scoped Pond is stale longer than this."),
+    renotify: Optional[str] = typer.Option(None, "--renotify", help="Re-notify interval, e.g. 6h — repeat the alert "
+                                                                    "while a failure/staleness episode persists "
+                                                                    "(default: once per episode)."),
     catchment: Optional[str] = typer.Option(None, "--catchment", "-c", help="Catchment to use (default if omitted)."),
 ) -> None:
     """Add a notification channel."""
@@ -49,12 +52,14 @@ def add(
     from .window import _parse_duration
 
     stale_ms = _parse_duration(stale) * 1000 if stale else None
+    renotify_ms = _parse_duration(renotify) * 1000 if renotify else None
     final = name or urlparse(to).scheme.lower() or "alert"
     scope = f"{pond}@{major}" if pond and major is not None else pond  # "name@major" | "name" | None
     url, cfg = _resolve(catchment)
     resp = _http.post(
         f"{url}/api/alerts", auth=cfg,
-        json={"name": final, "destination": to, "scope": scope, "events": on, "stale_ms": stale_ms},
+        json={"name": final, "destination": to, "scope": scope, "events": on, "stale_ms": stale_ms,
+              "renotify_ms": renotify_ms},
     ).json()
     label = f" on '{scope}'" if scope else " (catchment-wide)"
     typer.echo(f"Alert channel '{resp['name']}'{label} → {to}")
@@ -76,12 +81,13 @@ def ls(
         typer.echo("No alert channels.")
         return
     table = Table(show_header=True, header_style="bold dim", box=None, padding=(0, 1))
-    for col in ("Name", "Scope", "Events", "Freshness SLA", "Destination", "Enabled"):
+    for col in ("Name", "Scope", "Events", "Freshness SLA", "Re-notify", "Destination", "Enabled"):
         table.add_column(col)
     for c in channels:
         sla = f"{int(c['stale_ms'] / 1000)}s" if c.get("stale_ms") else "[dim]—[/dim]"
+        ren = f"{int(c['renotify_ms'] / 1000)}s" if c.get("renotify_ms") else "[dim]—[/dim]"
         table.add_row(
-            c["name"], c.get("scope") or "[dim]all[/dim]", c["events"], sla, c["destination"],
+            c["name"], c.get("scope") or "[dim]all[/dim]", c["events"], sla, ren, c["destination"],
             "[green]yes[/green]" if c["enabled"] else "[red]no[/red]",
         )
     Console().print(table)

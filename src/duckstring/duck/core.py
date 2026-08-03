@@ -42,6 +42,14 @@ class Event:
                           # Catchment so downstream skips. See plans/no-change-skip.md.
     source: str | None = None  # missing_source event: the Source + table the Ripple couldn't read (it is
     table: str | None = None   # not published) — the Catchment parks the Pond blocked-with-a-reason.
+    lineage: dict | None = None  # the Ripple's observed reads/writes ({"reads": [[source|None, table]…],
+                                 # "writes": [name…]}) — persisted per attempt at the Catchment
+                                 # (plans/lineage.md Phase 1).
+    flock: dict | None = None  # Flock dispatches during THIS Ripple Run ({dispatched, failed, last_error}
+                               # — a delta, see flock.take_stats), accumulated Catchment-side so a
+                               # degrading Flock is visible (/metrics + /api/status): a failed dispatch
+                               # still runs local, so it is otherwise indistinguishable from a working
+                               # one. Observability only — never engine state.
 
     def payload(self) -> dict:
         d = {"kind": self.kind, "f": self.f.isoformat(), "status": self.status, "retry": self.retry,
@@ -62,6 +70,10 @@ class Event:
             d["source"] = self.source
         if self.table is not None:
             d["table"] = self.table
+        if self.lineage is not None:
+            d["lineage"] = self.lineage
+        if self.flock is not None:
+            d["flock"] = self.flock
         return d
 
 
@@ -121,16 +133,20 @@ class DuckCore:
         ))
 
     def ripple_completed(
-        self, name: str, now: datetime, started_at=None, finished_at=None, export=None
+        self, name: str, now: datetime, started_at=None, finished_at=None, export=None, lineage=None,
     ) -> list[str]:
         """Record a finished Ripple, buffer a report, and (if a Pond Run just completed) export +
         buffer the run completion. ``started_at``/``finished_at`` are the Ripple's wall-clock span
-        (run-history duration telemetry). Returns any newly launchable Ripple names."""
+        (run-history duration telemetry); ``lineage`` is the Ripple's observed reads/writes
+        (plans/lineage.md). Returns any newly launchable Ripple names."""
         end_f = self.state.states[name].start_f
         ledger.record_ripple_complete(self.con, name, end_f)
         self.state, rc = worker.complete_ripple(self.state, name, now)
+        from .. import flock as _flock  # the Flock dispatch delta for THIS Ripple Run (None if it never ran)
+
         ripple_event = Event(kind="ripple", ripple=name, f=end_f, retry=self.attempts.pop(name, 0),
-                             started_at=started_at, finished_at=finished_at)
+                             started_at=started_at, finished_at=finished_at, lineage=lineage,
+                             flock=_flock.take_stats())
         self.events.append(ripple_event)
         if rc is not None:
             # The Run completed at this Ripple — decide whether its output changed and stamp it on this

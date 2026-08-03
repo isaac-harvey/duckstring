@@ -23,7 +23,7 @@ Most commands that talk to a Catchment share these:
 
 | Command | Description |
 |---|---|
-| `catchment init -n {name} [--host H] [-p PORT] [--root DIR] [--key KEY \| --generate-key] [--header 'N: v']… [-y]` | Create and register a local Catchment, then start its server. Defaults: host `127.0.0.1`, port `7474`, root `~/.duckstring/{name}`, no API key (open). `--generate-key` mints the read/demand/full key ladder, prints all three once, and stores the full key (mutually exclusive with `--key`, which sets a single full-access key). Offers to set as default (`-y` accepts). |
+| `catchment init -n {name} [--host H] [-p PORT] [--root DIR] [--key KEY \| --generate-key] [--header 'N: v']… [-y] [--no-start]` | Create and register a local Catchment, then start its server. Defaults: host `127.0.0.1`, port `7474`, root `~/.duckstring/{name}`, no API key (open). `--generate-key` mints the read/demand/full key ladder, prints all three once, and stores the full key (mutually exclusive with `--key`, which sets a single full-access key). Offers to set as default (`-y` accepts). `--no-start` registers (and mints keys) without starting the server — for scripted provisioning where systemd or a container runtime owns the process via `catchment start`. |
 | `catchment start {name}` | Start the server for a registered local Catchment. |
 | `catchment rotate-keys [-c NAME] [--level read\|demand\|full]… [-y]` | Reroll a Catchment's access keys (default all three; `--level` repeatable for a subset), printing the new keys once. The old key for each rerolled level stops working; the internal Duck token is untouched. If the full key is rerolled, the stored registration is updated. Requires a full-access key. |
 | `catchment connect -n {name} --path {url} [--key KEY] [--header 'N: v']… [-y]` | Register a remote Catchment by URL; `--key` stores its API key (sent as a Bearer header — use a `demand` key for a downstream that only solicits and draws), `--header` stores arbitrary headers for platform auth (e.g. `'Authorization: Key …'` for Posit Connect) — both attached to every request. |
@@ -97,7 +97,7 @@ See [Windows](../guides/windows.md). The Pond name comes directly after `window`
 
 ## `duckstring spout` — egress bindings
 
-Publish a Pond's output to external systems. A Spout is operational config (persisted, survives redeploys), not declared in `pond.toml`. Credentials go in the destination URI as `${env:NAME}` (process environment) or `${secret:NAME}` ([secret store](#duckstring-secret--credential-store)) references, resolved only at egress time — never stored in the binding or logged. After each successful Pond Run, the egress worker delivers the Pond's published tables to the destination as snapshot Parquet (`{prefix}/{table}.parquet`).
+Publish a Pond's output to external systems. A Spout is operational config (persisted, survives redeploys), not declared in `pond.toml`. Credentials go in the destination URI as `${env:NAME}` (process environment) or `${secret:NAME}` ([secret store](#duckstring-secret--credential-store)) references, resolved only at egress time — never stored in the binding or logged. After each successful Pond Run, the egress worker delivers the Pond's published tables to the destination: by default (`--mode auto`/`full`) as snapshot Parquet (`{prefix}/{table}.parquet`); with **`--mode append`** an object-store destination instead **mirrors the table's published Duckstring collection** (the per-run parts, changelog and tiers, and the sidecar) — each delivery ships only the new files, so it stays cheap for large [Trickle](../guides/trickle.md) tables, and the destination is directly readable as a Duckstring layout (by another Catchment, or anything that reads the parts).
 
 `file://`, `s3://`, `gs://`, and `postgres://` work today. Object-store credentials go in the URI query: `s3://bucket/prefix?key_id=${env:AWS_KEY}&secret=${env:AWS_SECRET}&region=us-east-1` (also `endpoint`, `url_style`, `use_ssl`, `session_token`); `s3://` with no key falls back to the AWS credential chain (env / instance profile); `gs://` needs HMAC `key_id`+`secret`.
 
@@ -131,17 +131,17 @@ The value **is** sent to the Catchment over the wire when you set it (an HTTPS P
 
 Deliver failures and staleness to the channels a team already watches. A **channel** is operational config (persisted, survives redeploys), not declared in `pond.toml`. It fires on the events you subscribe it to — `failure` (a Pond Run gave up), `contract` (a breaking schema change), `spout` (an egress delivery failed), `recovery` (a failed Pond/Spout cleared), and `freshness` (a Pond stayed stale past an SLA) — and **root-cause dedup** means one failed Source that blocks twenty downstream Ponds pages you once (about the root, with the blocked names as blast radius), not twenty times. Credentials in the destination URI are `${env:NAME}`/`${secret:NAME}` references, resolved only at send time. Managing channels requires **full access**.
 
-Two destinations work today: a **webhook** (`https://…`/`http://…`, a Slack-incoming-webhook-compatible JSON POST — also any generic receiver) and **email** (`mailto:you@example.com?smtp=host:587&from=alerts@example.com`; SMTP settings from the URI query or the `DUCKSTRING_SMTP_*` environment).
+Two destinations work today: a **webhook** (`https://…`/`http://…`, a Slack-incoming-webhook-compatible JSON POST — also any generic receiver) and **email** (`mailto:you@example.com?smtp=host:587&from=alerts@example.com`; SMTP settings from the URI query or the `DUCKSTRING_SMTP_*` environment). A channel may also subscribe to the machine-consumer kind **`openlineage`** (`--on openlineage` — never part of `all`): each completed Pond Run then posts a standard OpenLineage RunEvent to the destination verbatim, which is how Duckstring [feeds a data catalog](../guides/lineage.md#feeding-a-catalog).
 
 | Command | Description |
 |---|---|
-| `alert add --to {uri} [--pond N [--major M]] [--on failure,…\|all] [--stale 1h] [--name N]` | Add a channel. `--to` is an `https://`/`http://`/`mailto:` URI; `--pond` scopes it to one Pond line (`--major` picks the major, default: the Pond's highest deployed major; omit `--pond` for catchment-wide); `--on` is the event kinds (default `all`); `--stale` sets a freshness SLA (e.g. `1h`, `30m`) — required for `freshness` to fire; `--name` defaults to the scheme/scope. |
+| `alert add --to {uri} [--pond N [--major M]] [--on failure,…\|all] [--stale 1h] [--renotify 6h] [--name N]` | Add a channel. `--to` is an `https://`/`http://`/`mailto:` URI; `--pond` scopes it to one Pond line (`--major` picks the major, default: the Pond's highest deployed major; omit `--pond` for catchment-wide); `--on` is the event kinds (default `all`); `--stale` sets a freshness SLA (e.g. `1h`, `30m`) — required for `freshness` to fire; `--renotify` repeats the alert at that interval while the failure/staleness persists (default: once per episode); `--name` defaults to the scheme/scope. |
 | `alert ls` | List channels with their scope, events, SLA, and destination. |
 | `alert rm {name}` | Remove a channel. |
 | `alert test {name}` | Send a test notification through the channel (validates connectivity + credentials). |
 | `alert log [--limit N]` | Recent deliveries (channel, kind, pond, status, error) — the audit trail. |
 
-**Freshness is the headline.** A pipeline can be green with zero failures and still be *wrong* because nothing has refreshed it — a `--stale` channel is how you find out. A delivery failure never affects a Pond: it is retried and, if a channel stays broken, parked as `failed` in `alert log`, never cascaded. Channels are also managed from the web UI — a catchment-wide **Alerts** menu (beside 🔑 Secrets) and a per-Pond **Alerts** section in the sidebar. See also the Prometheus [`/metrics`](../guides/running-a-catchment.md#monitoring) endpoint.
+**Freshness is the headline.** A pipeline can be green with zero failures and still be *wrong* because nothing has refreshed it — a `--stale` channel is how you find out. By default a channel fires **once per episode** (and once on recovery); add `--renotify` if a webhook that fires once and then stays silently red for a week isn't enough — recovery still fires exactly once either way. A delivery failure never affects a Pond: it is retried and, if a channel stays broken, parked as `failed` in `alert log`, never cascaded. Channels are also managed from the web UI — a catchment-wide **Alerts** menu (beside 🔑 Secrets) and a per-Pond **Alerts** section in the sidebar. See also the Prometheus [`/metrics`](../guides/running-a-catchment.md#monitoring) endpoint.
 
 ## `duckstring control` — execution & health
 
@@ -157,7 +157,22 @@ See [Control](../guides/control.md) and [Fault Tolerance](../guides/fault-tolera
 | `control sleep {pond} [--upstream]` | Clear all demand (started runs complete). `--upstream` also sleeps every ancestor. |
 | `control kill {pond}` | Terminate the Pond's worker and cancel its run; parks the Pond `killed` until wake/force/clear. |
 | `control clear {pond}` | Reset a failed/killed Pond to idle and unblock downstream, without running. |
+| `control reset-contract {pond} [-y]` | Drop the major line's recorded output schema so the next accepted run re-freezes it, and clear the failure. The escape hatch for a line wedged by a **narrowing** type change — the schema gate is forward-only, and a failed run publishes nothing, so the line could otherwise never recover. Widenings need no reset: they are accepted as additive. Re-opens what a pinned Sink was promised, so it confirms first. |
 | `control failure-budget {pond} [-i N] [-o N]` | Show (no flags) or set the retry budgets: `--immediate` Ripple retries per run, `--on-change` Pond Runs retried as Sources update. |
+
+## `duckstring duck` — per-Pond compute config
+
+```bash
+duckstring duck show [pond]
+duckstring duck set {pond} [--duck catchment|POOL|dedicated] [--flock off|upgrade|always] \
+                           [--engine NAME] [--oom fail_up|fail] [--instance-type T] [--auto-stop] [--clear]
+duckstring duck pool ls
+duckstring duck pool add {name} [--provider fargate|ec2] [--cpu N --memory MiB] [--instance-type T] \
+                                [--min N] [--max N] [--keep-warm N] [--idle-timeout S]
+duckstring duck pool rm {name}
+```
+
+Where a Pond's worker (Duck) runs and its over-envelope offload posture (the **Flock**). The Duck target is the Catchment's own box (`catchment`), a named **Duck Pool**, or a `dedicated` box; there is no abstract size — sizing is the pool's Fargate `cpu`/`memory` (or an EC2 `instance_type`). A pool picks its provider: **`fargate`** (default — fast serverless containers) or **`ec2`** (the escape hatch for big/GPU jobs). Built-in **`S`/`M`/`L`/`XL`** preset pools (Fargate) always exist, so `duck = "M"` works with zero setup — and Duckstring Cloud ships the same names, so a project transfers seamlessly. These may be **declared in `pond.toml`** (`[pond] duck`, `[flock] mode`/`engine`/`oom_policy`) and are re-read on every redeploy; an operator override set here **coalesces over the declaration** and survives redeploys (`--clear` reverts to the declared config, else the Catchment default). Inert on a stock local Catchment — the local worker is whatever the host is; pools/dedicated boxes are acted on by a remote launcher once **cloud is enabled** (a remote data root + AWS creds, under Options → Cloud or `duckstring catchment settings`).
 
 ## `duckstring status` — live monitor
 
@@ -166,6 +181,21 @@ duckstring status [pond] [-c NAME] [--once]
 ```
 
 Live view of deployed Ponds: state, freshness, staleness, and standing triggers — open until `Ctrl+C`. With a `pond` argument, shows only that Pond and its upstream lineage. `--once` prints a snapshot and exits; `-m`/`-v` narrow a named Pond to one major line.
+
+## `duckstring lineage` / `trace` — lineage & provenance
+
+See [Lineage](../guides/lineage.md).
+
+```bash
+duckstring lineage [pond] [-t TABLE] [--columns] [-m M] [-c NAME]
+duckstring trace {pond}.{table} [--where "id = 42"] [-m M] [-c NAME]
+```
+
+`lineage` prints what each Ripple actually read and wrote on its latest run (observed at the call —
+exact, never inferred); `--columns` adds the deploy-captured column derivations (which source columns
+each output column comes from; `opaque` where unprovable — install `duckstring[lineage]` to resolve
+`.sql()` outputs). `trace` is row-level provenance: which run produced the matching row(s), its version
+and timings, and the input window `(previous_f, f]` each Source was read over.
 
 ## `duckstring get` / `query` — data access
 

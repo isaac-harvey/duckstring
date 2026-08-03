@@ -78,8 +78,25 @@ def test_status_flags_ponds_with_exported_tables(tmp_path):
     con.execute(f"COPY (SELECT 1 AS id) TO '{data_dir / 'anything.parquet'}' (FORMAT PARQUET)")
     con.close()
 
+    # has_tables is cached per data_version (the ~1s status poll must never re-list storage — over an
+    # object store that made /api/status take seconds). Every real data arrival bumps it (run
+    # completion, persist, draw, deploy/reload); this test wrote the file BEHIND the driver's back, so
+    # it does what an operator hand-placing data would: reload.
+    d.reload()
     assert _pond(d.status(), "src")["has_tables"] is True
     assert _pond(d.status(), "snk")["has_tables"] is False  # only src exported
+
+
+def test_status_flags_dbt_mode_pond(tmp_path):
+    db = connect(tmp_path / "duck.db")
+    migrate(db)
+    _register(db, "py", "1.0.0", "pond", "ponds/py/1.0.0", _cfg(kind="pond"), _RIPPLES)
+    _register(db, "shop", "1.0.0", "pond", "ponds/shop/1.0.0",
+              {**_cfg(kind="pond"), "dbt_project": "dbt/"}, _RIPPLES)
+    d = Driver(db, tmp_path, "http://x", NoopLauncher())
+    st = {p["id"]: p for p in d.status()["ponds"]}
+    assert st["shop@1"]["dbt"] is True
+    assert st["py@1"]["dbt"] is False
 
 
 def test_status_exposes_d_ms_and_null_trigger_by_default(tmp_path):
@@ -176,6 +193,79 @@ def test_clear_failed_pond_is_not_refailed_by_liveness(tmp_path):
     assert d.state.pond_states["src@1"].start_f == d.state.pond_states["src@1"].end_f  # idle, not in-flight
 
 
+def test_silent_duck_clears_launcher_record_and_carries_diagnosis(tmp_path):
+    """The gate-run wedge: a remote Duck that launched but never dialled back must (a) be torn down so
+    the backend's ensure() re-spawns on the next attempt — a stale task record made every retry a silent
+    no-op — and (b) carry the provider's diagnosis (e.g. ECS stoppedReason) in the failure message."""
+    from datetime import timedelta
+
+    terminated = []
+
+    class _SilentLauncher(NoopLauncher):
+        manages_processes = True
+
+        def is_running(self, pond_name: str) -> bool:
+            return True  # a live task record — the wedge precondition
+
+        def diagnose(self, pond_name: str) -> str:
+            return "fargate: task STOPPED; TaskFailedToStart; boom"
+
+        def terminate(self, pond_name: str, wait: bool = False) -> None:
+            terminated.append(pond_name)
+
+    from duckstring.catchment.driver import _now
+
+    d = _inlet_driver(tmp_path, "silent.db", _SilentLauncher())
+    d.pulse("src@1")  # a Run in flight
+    d.take_jobs("src@1")  # it spoke once, so the steady-state silence window applies (not spawn grace)
+    d.last_seen["src@1"] = _now() - timedelta(seconds=120)  # contact aged past the heartbeat
+    d._check_liveness(_now())
+    assert d.state.pond_states["src@1"].is_failed
+    assert "src@1" in terminated, "the silent Duck's record must be cleared so a retry re-spawns"
+    (error,) = d.db.execute("SELECT error FROM pond_run WHERE status = 'failed'").fetchone()
+    assert "Lost contact" in error and "TaskFailedToStart" in error  # the provider's reason travels
+
+
+def test_a_remote_duck_gets_its_providers_startup_grace(tmp_path):
+    """First contact is a different quantity from steady-state silence: a local subprocess talks in a
+    second, an EC2 instance boots an OS first. Judging a cold EC2 spawn by the 60 s silence window failed
+    every first run on a fresh pool, however well configured. The grace applies only until it speaks."""
+    from datetime import timedelta
+
+    d = _inlet_driver(tmp_path, "grace.db", _DeadLauncher())
+    key = "src@1"
+    d._awaiting_first_contact.add(key)
+
+    d.duck_config = lambda _k: {"remote": False, "pool": None}
+    assert d._silence_window(key) == timedelta(seconds=60)
+    d.duck_config = lambda _k: {"remote": True, "pool": {"provider": "fargate"}}
+    assert d._silence_window(key) == timedelta(minutes=3)
+    d.duck_config = lambda _k: {"remote": True, "pool": {"provider": "ec2"}}
+    assert d._silence_window(key) == timedelta(minutes=8)
+
+    # Once the Duck speaks — here by collecting its jobs, the very first thing it does — the
+    # steady-state window governs: a warm EC2 Duck that goes quiet is still caught in 60 s.
+    d.take_jobs(key)
+    assert key not in d._awaiting_first_contact
+    assert d._silence_window(key) == timedelta(seconds=60)
+
+
+def test_dead_duck_clears_launcher_record(tmp_path):
+    from duckstring.catchment.driver import _now
+
+    terminated = []
+
+    class _DeadRecordingLauncher(_DeadLauncher):
+        def terminate(self, pond_name: str, wait: bool = False) -> None:
+            terminated.append(pond_name)
+
+    d = _inlet_driver(tmp_path, "deadrec.db", _DeadRecordingLauncher())
+    d.pulse("src@1")
+    d._check_liveness(_now())
+    assert d.state.pond_states["src@1"].is_failed
+    assert "src@1" in terminated
+
+
 def test_kill_terminates_duck_and_parks(tmp_path):
     terminated = []
 
@@ -234,6 +324,45 @@ def test_run_history_nests_ripple_runs_when_requested(tmp_path):
     assert nested == {"r1": "success", "r2": "success"}
 
 
+def test_run_history_date_range_filters_started_at(tmp_path):
+    # The plot's range navigation bounds a run's started_at at second granularity. Stored values are
+    # Python isoformat (UTC, +00:00); the bounds arrive as the frontend sends them (JS toISOString → Z).
+    d = _driver(tmp_path)
+    d.pulse("src@1")
+    f = _complete_run(d, "src@1")
+    d.db.execute("UPDATE pond_run SET started_at = '2026-07-22T14:35:40.500000+00:00' WHERE f = ?", (f,))
+    d.db.commit()
+
+    def hist(**kw):
+        return d.run_history("src@1", lineage=False, ripples=False, limit=100, **kw)
+
+    # A tight window around the run (Z-suffixed bounds vs +00:00-stored) selects it…
+    assert [r["f"] for r in hist(after="2026-07-22T14:35:30.000Z", before="2026-07-22T14:36:00.000Z")] == [f]
+    # …and a window seconds off — same day — excludes it (granularity is seconds, not days).
+    assert hist(after="2026-07-22T14:35:45.000Z") == []
+    assert hist(before="2026-07-22T14:35:35.000Z") == []
+
+
+def test_run_history_range_anchoring_and_order(tmp_path):
+    # The window anchors on the bound: "from" → the first `limit` runs ascending from it; "to"-only (and
+    # the default) → the most-recent `limit`, descending.
+    d = _driver(tmp_path)
+    pv = d.db.execute("SELECT pv.id FROM pond_version pv JOIN pond_name pn ON pn.id = pv.pond_name_id "
+                      "WHERE pn.name = 'src'").fetchone()[0]
+    for h in (10, 11, 12):
+        ts = f"2026-07-22T{h:02d}:00:00+00:00"
+        d.db.execute("INSERT INTO pond_run (pond_version_id, f, started_at, finished_at, status) "
+                     "VALUES (?, ?, ?, ?, 'success')", (pv, ts, ts, ts))
+    d.db.commit()
+
+    def hours(**kw):
+        return [r["started_at"][11:13] for r in d.run_history("src@1", lineage=False, ripples=False, **kw)]
+
+    assert hours(limit=2) == ["12", "11"]                                   # default: most recent
+    assert hours(limit=2, after="2026-07-22T10:30:00Z") == ["11", "12"]      # from → forward (ascending)
+    assert hours(limit=2, before="2026-07-22T11:30:00Z") == ["11", "10"]     # to-only → the runs just prior
+
+
 # ─── HTTP layer ──────────────────────────────────────────────────────────────────
 
 
@@ -275,3 +404,82 @@ def test_runs_route_params_and_unknown_pond(tmp_path):
     assert client.get("/api/runs", params={"limit": 100000}).status_code == 200
     snk = _pond(client.get("/api/status").json(), "snk")
     assert snk["ripple_edges"] == [["r1", "r2"]]
+
+
+def _run_rows(d):
+    return [r[0] for r in d.db.execute("SELECT status FROM pond_run ORDER BY f").fetchall()]
+
+
+def test_clear_closes_the_run_it_abandons(tmp_path):
+    """`clear` rolls start_f back to end_f so the halted Run is not re-failed by liveness — which also
+    means liveness can never CLOSE it. Without this the Run sits at 'running' in the history forever,
+    looking like work still in progress."""
+    from duckstring.catchment.driver import _now
+
+    d = _inlet_driver(tmp_path, "clearrun.db", _DeadLauncher())
+    d.pulse("src@1")
+    assert _run_rows(d) == ["running"]
+
+    d.clear("src@1")                # abandons the in-flight Run by design
+    d._check_liveness(_now())       # that Run is not in flight any more → liveness never touches it
+    assert "running" not in _run_rows(d), "clear left an orphaned 'running' row"
+
+
+def test_abandoning_a_run_records_why_and_spares_finished_ones(tmp_path):
+    """The closure carries its reason, and never rewrites a Run the Duck already reported."""
+    from duckstring.catchment.driver import _now
+
+    d = _inlet_driver(tmp_path, "abandon.db", _DeadLauncher())
+    d.pulse("src@1")
+    f = d.state.pond_states["src@1"].start_f.isoformat()
+
+    d._abandon_pond_run("src@1", f, _now())
+    status, err = d.db.execute("SELECT status, error FROM pond_run WHERE f = ?", (f,)).fetchone()
+    assert status == "failed" and "abandoned by an operator clear" in err
+
+    # Re-running it must not touch the now-finished row (nor invent one for an unknown f).
+    d._abandon_pond_run("src@1", f, _now())
+    d._abandon_pond_run("src@1", "2099-01-01T00:00:00+00:00", _now())
+    assert d.db.execute("SELECT count(*) FROM pond_run").fetchone()[0] == 1
+    (err2,) = d.db.execute("SELECT error FROM pond_run WHERE f = ?", (f,)).fetchone()
+    assert err2 == err
+
+
+def test_a_pond_that_moves_on_closes_runs_left_behind(tmp_path):
+    """The general invariant: a Pond not in flight has no 'running' rows. A Run is normally closed only by
+    the Duck reporting IT, so any path where the Pond advances without that report — a vanished Duck, a
+    replaced spawn — strands one. Reconciliation covers the paths not yet enumerated, which matters
+    because the live sighting resisted reproduction."""
+    d = _inlet_driver(tmp_path, "moved.db", _DeadLauncher())
+    d.pulse("src@1")
+    stale_f = d.state.pond_states["src@1"].start_f.isoformat()
+    assert _run_rows(d) == ["running"]
+
+    # A later Run completes without the earlier one ever being reported.
+    later = d.state.pond_states["src@1"].start_f + timedelta(seconds=30)
+    d._dispatch_begin_run("src@1", later, later)
+    d.on_event("src@1", {"kind": "ripple", "ripple": "r1", "f": later.isoformat(), "status": "success"})
+    d.on_event("src@1", {"kind": "run_completed", "f": later.isoformat()})
+
+    rows = dict(d.db.execute("SELECT f, status FROM pond_run").fetchall())
+    assert rows[later.isoformat()] == "success"
+    assert rows[stale_f] == "failed", f"the abandoned earlier Run was left behind: {rows}"
+
+
+def test_closing_abandoned_runs_never_rewrites_a_reported_outcome(tmp_path):
+    """A Run the Duck already reported keeps its own outcome — reconciliation only touches rows still
+    sitting at 'running'."""
+    d = _inlet_driver(tmp_path, "keep.db", _DeadLauncher())
+    d.pulse("src@1")
+    first = d.state.pond_states["src@1"].start_f
+    d.on_event("src@1", {"kind": "failed", "ripple": "r1", "f": first.isoformat(),
+                         "status": "failed", "error": "boom"})
+    later = first + timedelta(seconds=30)
+    d._dispatch_begin_run("src@1", later, later)
+    d.on_event("src@1", {"kind": "ripple", "ripple": "r1", "f": later.isoformat(), "status": "success"})
+    d.on_event("src@1", {"kind": "run_completed", "f": later.isoformat()})
+
+    rows = dict(d.db.execute("SELECT f, status FROM pond_run").fetchall())
+    assert rows[first.isoformat()] == "failed"
+    (err,) = d.db.execute("SELECT error FROM pond_run WHERE f = ?", (first.isoformat(),)).fetchone()
+    assert err == "boom", "the Duck's own failure message was overwritten"

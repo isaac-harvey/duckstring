@@ -8,6 +8,7 @@ when it finished".
 
 from __future__ import annotations
 
+import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -74,27 +75,32 @@ def _run_ripple(
     func, pond_name: str, version: str, con, root_str: str,
     source_majors: dict[str, int], f: datetime | None, previous_f: datetime | None,
     data_root: str | None = None, sources_changed: bool = True, skip_sink=None,
-    staging_dir=None, own_data_dir=None,
-) -> None:
+    staging_dir=None, own_data_dir=None, source_f: dict[str, str] | None = None,
+) -> dict:
     from ..core import Pond
 
     # ``con`` is a cursor off the executor's single shared registry instance (see RippleExecutor).
     # Ripples run concurrently on pool threads, each with its own cursor — they share the one instance,
     # so they coexist without the "file handle conflict" two separate connect()s to the same file raise.
+    pond = Pond(
+        name=pond_name, version=version, con=con, root=Path(root_str),
+        source_majors=source_majors, source_f=source_f, f=f, previous_f=previous_f, data_root=data_root,
+        sources_changed=sources_changed, skip_sink=skip_sink,
+        staging_dir=staging_dir, own_data_dir=own_data_dir,
+        # Flock is a Pond-level posture now (not per-Ripple): the Duck's config env carries the
+        # resolved mode. flock.comprehensive still applies engine-eligibility + the OOM fail-up.
+        flock=os.environ.get("DUCKSTRING_FLOCK_MODE"),
+    )
     try:
-        func(Pond(
-            name=pond_name, version=version, con=con, root=Path(root_str),
-            source_majors=source_majors, f=f, previous_f=previous_f, data_root=data_root,
-            sources_changed=sources_changed, skip_sink=skip_sink,
-            staging_dir=staging_dir, own_data_dir=own_data_dir,
-        ))
+        func(pond)
+        return pond.take_lineage()  # the observed reads/writes this Ripple made (plans/lineage.md)
     finally:
         con.close()
 
 
 def _export_data(con, data_dir, f: datetime | None, contract=None) -> dict | None:
     from ..dataplane import get_data_plane
-    from ..schema_contract import ContractViolation, contract_violations, extract_schema
+    from ..schema_contract import CONTRACT_PREFIX, ContractViolation, contract_violations, extract_schema
 
     # ``con`` is a cursor off the shared instance: the export reads a consistent MVCC snapshot and shares
     # the ripples' configuration, so it neither clashes with their open connections nor conflicts on the
@@ -106,7 +112,9 @@ def _export_data(con, data_dir, f: datetime | None, contract=None) -> dict | Non
         # live tables keep last-good data; the Catchment fails the Pond and blocks downstream.
         violations = contract_violations(schema, contract)
         if violations:
-            raise ContractViolation("; ".join(violations))
+            # The stable prefix is the failure's machine-readable sub-reason: the Catchment's status
+            # derives failure_kind="contract" from it (survives restarts — no extra state to persist).
+            raise ContractViolation(f"{CONTRACT_PREFIX}{'; '.join(violations)}")
         get_data_plane().export(con, data_dir, mode="overwrite", f=f)
         return schema
     finally:
@@ -115,7 +123,7 @@ def _export_data(con, data_dir, f: datetime | None, contract=None) -> dict | Non
 
 class RippleExecutor:
     def __init__(self, pond_name: str, major: int, version: str, source_path: str, root: Path,
-                 max_workers: int = 8, data_root: str | None = None):
+                 max_workers: int = 8, data_root: str | None = None, persist_root: str | None = None):
         import duckdb
 
         from ..core import read_pond_toml
@@ -131,15 +139,63 @@ class RippleExecutor:
         self.registry_path.parent.mkdir(parents=True, exist_ok=True)
         # Object (non-tabular output) staging + own published location — see objects.py.
         self.staging_dir = pond_major_dir(root, pond_name, major) / STAGING_DIR
-        self.own_data_dir = pond_data_dir(root, pond_name, major, data_root)
+        # LOCAL-FIRST PUBLISH (plans/persist.md): with `persist_root` set (a Duck on the Catchment Pool,
+        # cloud enabled) the run publishes to the LOCAL layout — the fast handoff co-located Sinks read —
+        # and `persist()` asynchronously mirrors it to the durable layer afterwards. Without it (no cloud,
+        # or a remote-Pool Duck whose local disk nothing else can reach) the publish target is data_root
+        # directly, exactly as before.
+        if persist_root:
+            self.own_data_dir = pond_data_dir(root, pond_name, major, None)
+            self.persist_dir = pond_data_dir(root, pond_name, major, persist_root)
+        else:
+            self.own_data_dir = pond_data_dir(root, pond_name, major, data_root)
+            self.persist_dir = None
+        # Registry-loss recovery: the registry FILE is gone (host loss / migration / scale-to-zero)
+        # but published state survives → rebuild the registry from it (tiers + meta + the Extension-1
+        # agg/acc snapshots), so the next run resumes *incrementally* instead of re-bootstrapping.
+        # Deliberately keyed on the file's absence, NOT on an empty registry: a Refresh `wipe()` empties
+        # the file in place, and re-hydrating behind a wipe would defeat the cold rebuild.
+        recover = not self.registry_path.exists()
         # ONE registry instance for the Duck's life: ripples (and the export) each run on a `.cursor()`
         # off it. Separate `connect()`s to the same file in one process raise a "file handle conflict"
         # (a Binder error, not a transient lock) the moment two overlap — single instance avoids it.
         self._registry = duckdb.connect(str(self.registry_path))
+        # A containerised Duck must hit DuckDB's own limit (a catchable OutOfMemoryException,
+        # with disk spill first) rather than the kernel's cgroup OOM-kill: the launcher sets
+        # DUCKSTRING_MEMORY_LIMIT to ~80% of the pod cap. Absent env => DuckDB defaults, no change.
+        mem_limit = os.environ.get("DUCKSTRING_MEMORY_LIMIT")
+        if mem_limit:
+            spill = Path(self.root) / "tmp"
+            spill.mkdir(parents=True, exist_ok=True)
+            self._registry.execute(f"SET memory_limit = '{mem_limit}'")
+            self._registry.execute(f"SET temp_directory = '{spill}'")
+        # Configure the data-plane's object-store credentials on the registry INSTANCE up front (a DuckDB
+        # SECRET is instance-wide, shared by every cursor), so registry-loss hydration below, cross-Pond
+        # foreign reads, and the export can all reach S3/GCS. A no-op for a local data root. Without this,
+        # the first S3 read (typically hydration) fails with a 403 "no credentials provided".
+        self.own_data_dir.duckdb_setup(self._registry)
+        if recover:
+            from ..dataplane import hydrate_registry
+
+            # Hydrate from the local publish first (co-located, cheap). A true box loss (local publish
+            # gone too) falls back to the durable persist layer — the whole point of always-persist.
+            source_dir = self.own_data_dir
+            if self.persist_dir is not None and not self.own_data_dir.exists("_trickle.json") \
+                    and self.persist_dir.exists("_trickle.json"):
+                source_dir = self.persist_dir
+            hydrated = hydrate_registry(self._registry, source_dir)
+            if hydrated:
+                where = "persist layer" if source_dir is self.persist_dir else "published state"
+                print(f"[executor] registry file was missing — hydrated {len(hydrated)} table(s) "
+                      f"from the {where}: {', '.join(hydrated)}", flush=True)
         self._cursor_lock = threading.Lock()
         # Which major line of each Source this Pond's reads resolve to (its pond.toml pins).
         sources = read_pond_toml(root / source_path).get("sources", {})
         self.source_majors = {sname: spec_major(spec) for sname, spec in sources.items()}
+        # What the Catchment says each Source has published ({name: iso}) — carried on the begin_run job
+        # and used to reject a stale LOCAL publish left behind by a Source that moved to a remote Pool.
+        # Empty until a job supplies it; then the resolve is only ever more correct, never less.
+        self.source_f: dict[str, str] = {}
         self._pool = ThreadPoolExecutor(max_workers=max_workers)
 
     def _cursor(self):
@@ -152,18 +208,22 @@ class RippleExecutor:
                sources_changed: bool = True, skip_sink=None):
         """Load and run ``ripple_name`` at freshness ``f`` (exposed to the ripple as ``pond.f``, with
         the prior run's freshness as ``pond.previous_f``); call ``on_done(name, started_at,
-        finished_at)`` on success and ``on_error(name, exc, started_at, finished_at)`` on failure
+        finished_at, lineage)`` on success — ``lineage`` is the Ripple's observed reads/writes
+        (plans/lineage.md) — and ``on_error(name, exc, started_at, finished_at)`` on failure
         (timings wall-clock UTC, for the run-history duration; both fire on a pool thread).
         ``sources_changed``/``skip_sink`` back ``pond.sources_changed()`` / ``pond.skip()``."""
-        timing: dict[str, datetime] = {}
+        timing: dict = {}
 
         def _task():
             timing["started"] = datetime.now(timezone.utc)
             func = _load_ripple(self.source_path, str(self.root), ripple_name)
-            _run_ripple(
+            # Over-envelope offload happens inside the ripple, at the pond.trickle(...) terminals
+            # (the Flock seam — duckstring.flock, env-gated, engine-pluggable). The executor just
+            # runs the ripple classically; the terminal hook decides local-vs-Flock per output.
+            timing["lineage"] = _run_ripple(
                 func, self.pond_name, self.version, self._cursor(), str(self.root),
                 self.source_majors, f, previous_f, self.data_root,
-                sources_changed=sources_changed, skip_sink=skip_sink,
+                sources_changed=sources_changed, skip_sink=skip_sink, source_f=self.source_f,
                 staging_dir=self.staging_dir, own_data_dir=self.own_data_dir,
             )
 
@@ -176,7 +236,7 @@ class RippleExecutor:
             if exc:
                 on_error(ripple_name, exc, started, finished)
             else:
-                on_done(ripple_name, started, finished)
+                on_done(ripple_name, started, finished, timing.get("lineage"))
 
         fut.add_done_callback(_cb)
         return fut
@@ -193,6 +253,17 @@ class RippleExecutor:
         # last-good Object intact (the staged writes are discarded on the next run / wipe).
         commit_objects(self.staging_dir, self.own_data_dir, f)
         return schema
+
+    def persist(self) -> int:
+        """Mirror the locally-published output to the durable persist layer (plans/persist.md) — the
+        async step behind ``persisted_f``. Reconciles by file name (parts idempotent, wholesale re-upload,
+        prunes what local no longer holds); replay-safe. No-op (0) when there is no persist layer.
+        Runs off the serve loop — it touches only published files, never the registry."""
+        if self.persist_dir is None:
+            return 0
+        from ..dataplane import persist_tree
+
+        return persist_tree(self.own_data_dir, self.persist_dir)
 
     def wipe(self) -> None:
         """Drop every table in the Pond's registry — a Refresh's cold reset. The next run then reads its

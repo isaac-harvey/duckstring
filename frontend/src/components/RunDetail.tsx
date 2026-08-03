@@ -75,6 +75,21 @@ function StatusPill({ status }: { status: string }) {
   );
 }
 
+function PersistField({ p }: { p: NonNullable<import('../lib/types').PondRun['persist']> }) {
+  const ok = p.status === 'success';
+  const dur = durationOf(p.startedAt, p.finishedAt);
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+      <span style={{ fontSize: 9, fontWeight: 700, color: '#52525b', letterSpacing: '0.1em', textTransform: 'uppercase' }}>
+        Persisted
+      </span>
+      <span style={{ fontSize: 12, color: ok ? '#4ade80' : '#f87171' }}>
+        {ok ? `✓ ${dur || 'done'}` : `✗ ${p.error || 'failed'}`}
+      </span>
+    </div>
+  );
+}
+
 function Field({ label, value }: { label: string; value: string }) {
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
@@ -122,7 +137,7 @@ export function RunDetail() {
 
   return (
     <div style={{ height: '100%', display: 'flex', flexDirection: 'column', background: '#0c0c10', fontFamily: 'ui-monospace, SFMono-Regular, monospace', minWidth: 0 }}>
-      <div style={{ padding: '5px 12px', borderBottom: '1px solid #18181d', fontSize: 11, fontWeight: 700, color: '#a1a1aa', letterSpacing: '0.08em' }}>
+      <div style={{ display: 'flex', alignItems: 'center', height: 30, boxSizing: 'border-box', padding: '0 12px', borderBottom: '1px solid #18181d', fontSize: 11, fontWeight: 700, color: '#a1a1aa', letterSpacing: '0.08em' }}>
         RUN DETAIL
       </div>
 
@@ -142,6 +157,11 @@ export function RunDetail() {
             <Field label="Duration" value={durationOf(run.startedAt, run.finishedAt) || '—'} />
             <Field label="Started" value={clock(run.startedAt)} />
             <Field label="Finished" value={clock(run.finishedAt)} />
+            {/* The Persist — the async mirror to the durable plane, its own log item landing after the
+                run (which closes at local publish). Absent field = no cloud / direct-to-plane Duck. */}
+            {run.persist !== undefined && run.persist !== null && (
+              <PersistField p={run.persist} />
+            )}
           </div>
 
           <div style={{ fontSize: 9, fontWeight: 700, color: '#52525b', letterSpacing: '0.1em', textTransform: 'uppercase', marginBottom: 4 }}>

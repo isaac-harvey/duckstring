@@ -122,7 +122,7 @@ export function RunHistory() {
 
   return (
     <div style={{ height: '100%', display: 'flex', flexDirection: 'column', background: '#0c0c10', fontFamily: 'ui-monospace, SFMono-Regular, monospace', minWidth: 0 }}>
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '5px 10px', borderBottom: '1px solid #18181d' }}>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', height: 30, boxSizing: 'border-box', padding: '0 10px', borderBottom: '1px solid #18181d' }}>
         <span style={{ fontSize: 11, fontWeight: 700, color: '#a1a1aa', letterSpacing: '0.08em' }}>
           RUN HISTORY
           <span style={{ color: '#52525b', fontWeight: 400, marginLeft: 8 }}>

@@ -104,3 +104,70 @@ def test_endpoint_is_open_and_outside_api_audit():
         assert r.status_code == 200
         assert r.headers["content-type"].startswith("text/plain; version=0.0.4")
         assert "duckstring_up 1" in r.text
+
+
+def test_cost_families_target_flock_runtime(tmp_path):
+    """The compute-cost signals (plans/cloud-config.md increment 4): duck target, Flock posture, and
+    cumulative Duck execution seconds."""
+    d = _driver(tmp_path)
+    key = pond_key("sales", 1)
+    d.add_pool("heavy", instance_type="m6i.large")
+    d.set_duck(key, duck_target="heavy", flock_mode="upgrade", flock_engine="athena")
+    # A completed Ripple Run gives a runtime span to sum.
+    (pv_id,) = d.db.execute("SELECT id FROM pond_version LIMIT 1").fetchone()
+    (rip_id,) = d.db.execute("SELECT id FROM ripple WHERE pond_version_id = ?", (pv_id,)).fetchone()
+    d.db.execute("INSERT INTO pond_run (pond_version_id, f, status) "
+                 "VALUES (?, '2026-01-01T00:00:00+00:00', 'success')", (pv_id,))
+    d.db.execute(
+        "INSERT INTO ripple_run (pond_version_id, ripple_id, f, retry, status, started_at, finished_at) "
+        "VALUES (?, ?, '2026-01-01T00:00:00+00:00', 0, 'success', "
+        "'2026-01-01T00:00:00+00:00', '2026-01-01T00:00:12+00:00')",
+        (pv_id, rip_id),
+    )
+    d.db.commit()
+    samples = _parse(render_metrics(d.metrics_snapshot()))
+    assert samples['duckstring_pond_duck_target{pond="sales",major="1",target="heavy"}'] == 1
+    assert samples['duckstring_pond_flock{pond="sales",major="1",mode="upgrade",engine="athena"}'] == 1
+    assert samples['duckstring_pond_run_seconds_total{pond="sales",major="1"}'] == pytest.approx(12, abs=0.1)
+
+
+def test_flock_dispatch_counters_accumulate_from_ripple_deltas(tmp_path):
+    """A failed Flock dispatch still completes the run locally — the counters are the only tell it is
+    degrading. The Duck reports a DELTA per Ripple Run (never a process-lifetime snapshot at run
+    completion): a Duck killed mid-run is respawned and resumes, so the process that dispatched is often
+    not the one that finishes the Pond Run. The Catchment accumulates, so two Ducks' reports for one Pond
+    sum rather than overwrite — this is what the live cloud run got wrong."""
+    d = _driver(tmp_path)
+    key = pond_key("sales", 1)
+    text = render_metrics(d.metrics_snapshot())
+    assert "flock_dispatched_total{" not in text  # nothing reported yet → no samples
+
+    d.pulse(key)
+    f = d.state.pond_states[key].start_f.isoformat()
+    # First Duck: two dispatches, one of which failed. It then dies without completing the Pond Run.
+    d.on_event(key, {"kind": "ripple", "ripple": "agg", "f": f, "status": "success",
+                     "flock": {"dispatched": 1, "failed": 1, "last_error": "AccessDenied: nope"}})
+    samples = _parse(render_metrics(d.metrics_snapshot()))
+    assert samples['duckstring_flock_dispatched_total{pond="sales",major="1"}'] == 1
+    assert samples['duckstring_flock_dispatch_failures_total{pond="sales",major="1"}'] == 1
+    assert next(p for p in d.status()["ponds"] if p["id"] == key)["flock_error"] == "AccessDenied: nope"
+
+    # The respawned Duck resumes and reports its own delta — totals accumulate, and a clean dispatch
+    # clears the warning.
+    d.on_event(key, {"kind": "ripple", "ripple": "agg", "f": f, "status": "success",
+                     "flock": {"dispatched": 2, "failed": 0, "last_error": None}})
+    samples = _parse(render_metrics(d.metrics_snapshot()))
+    assert samples['duckstring_flock_dispatched_total{pond="sales",major="1"}'] == 3
+    assert samples['duckstring_flock_dispatch_failures_total{pond="sales",major="1"}'] == 1
+    assert next(p for p in d.status()["ponds"] if p["id"] == key)["flock_error"] is None
+
+
+def test_malformed_flock_report_is_ignored(tmp_path):
+    """Observability must never reach into a Run: a garbage report is dropped, not raised."""
+    d = _driver(tmp_path)
+    key = pond_key("sales", 1)
+    d.pulse(key)
+    f = d.state.pond_states[key].start_f.isoformat()
+    d.on_event(key, {"kind": "ripple", "ripple": "agg", "f": f, "status": "success",
+                     "flock": {"dispatched": "lots", "failed": None}})
+    assert next(p for p in d.status()["ponds"] if p["id"] == key)["status"] != "failed"
