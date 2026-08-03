@@ -32,6 +32,7 @@ const sidebars: SidebarsConfig = {
       label: 'Guides',
       items: [
         'guides/running-a-catchment',
+        'guides/cloud',
         'guides/creating-a-pond',
         'guides/local-testing',
         'guides/deploying',

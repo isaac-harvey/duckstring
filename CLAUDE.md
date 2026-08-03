@@ -100,7 +100,12 @@ src/duckstring/
     base.py                #   the egress-driver SEAM: EgressDriver/Capabilities + get_egress(uri) scheme registry
     object_store.py        #   ObjectStoreEgressDriver — file://+s3://+gs:// snapshot write_full (incremental: TODO)
     postgres.py            #   PostgresEgressDriver — incremental CDC sink (apply_delta = delete+insert/txn, exactly-once watermark)
-docs/                      # Docusaurus docs site → docs.duckstring.com (content in docs/docs/; theory.md is authoritative)
+docs/                      # Docusaurus docs site → docs.duckstring.com (content in docs/docs/; theory.md is authoritative).
+                           # guides/cloud.md is the AWS guide: the cloud-enable gate, the three IAM roles (incl. the two
+                           # everyone forgets — ecs:TagResource and iam:PassRole), SG asymmetry (workers dial OUT, so
+                           # sg-duck has NO inbound), Fargate/EC2 worker setup, the AMI python3 constraint, the
+                           # build-your-own image policy, the Flock's DuckDB-authority rules, and debugging via console
+                           # output / CloudWatch / SSM rather than an SSH hole. Every warning in it cost a live session.
 frontend/                  # The live Catchment web UI (Next.js; static export served at catchment/static). See Web UI.
   src/lib/                 #   api.ts (HTTP client), store.ts (zustand poll store + colour palette), types.ts
   src/components/          #   DagCanvas, Pond/Ripple/TriggerNode, Sidebar, RunHistory, WindowEditor, TraceChart

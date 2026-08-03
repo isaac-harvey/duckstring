@@ -160,6 +160,11 @@ Object-store credentials are `${env:NAME}` references in the data-root URI query
 
 The three recipes below are the common shapes.
 
+:::tip Running workers on cloud compute
+This section covers pointing the **data plane** at S3. To also run *workers* on Fargate or EC2 — IAM,
+networking, the worker image, and the Flock — see [Running on AWS](cloud.md).
+:::
+
 ### Recipe: a Catchment backed by S3
 
 A VM / container with a local disk and the data plane in an S3 bucket.
