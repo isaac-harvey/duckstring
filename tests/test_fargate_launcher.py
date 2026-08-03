@@ -131,6 +131,44 @@ def test_diagnose_reports_the_stopped_reason(tmp_path):
     assert lch.diagnose("a@1") is None
 
 
+def test_diagnose_includes_the_cloudwatch_tail(tmp_path):
+    """The task definition has always routed container output to CloudWatch, but nothing read it back —
+    so an operator saw "container exit 1" and had to go to the console for the reason. The Duck logs its
+    traceback to stderr, so this tail IS the reason."""
+    ecs = FakeEcs()
+    ecs.describe_tasks = lambda **kw: {"tasks": [{
+        "lastStatus": "STOPPED", "stopCode": "EssentialContainerExited",
+        "containers": [{"exitCode": 1, "reason": None}],
+    }]}
+
+    class FakeLogs:
+        def __init__(self):
+            self.asked = None
+
+        def get_log_events(self, **kw):
+            self.asked = kw
+            return {"events": [{"message": "Traceback (most recent call last):"},
+                               {"message": "ValueError: no such table 'orders'"}]}
+
+    logs = FakeLogs()
+    lch = _fargate(ecs, logs_client=logs, region="ap-southeast-2")
+    lch.ensure("a@1", "1", "ponds/a/1", duck=_duck())
+    diag = lch.diagnose("a@1")
+    assert "container exit 1" in diag
+    assert "ValueError: no such table" in diag, "the Duck's own traceback must reach the Pond failure"
+    assert logs.asked["logGroupName"] == "/duckstring/duck"
+    assert logs.asked["logStreamName"].startswith("duck/duck/")  # prefix/container/task-id
+
+
+def test_log_tail_is_silent_without_a_region(tmp_path):
+    """No region means no CloudWatch client to build — degrade to the state-only diagnosis rather than
+    raising inside the failure path."""
+    ecs = FakeEcs()
+    lch = _fargate(ecs, region=None)
+    lch.ensure("a@1", "1", "ponds/a/1", duck=_duck())
+    assert lch.log_tail("a@1") is None
+
+
 def test_terminate_after_silent_failure_lets_ensure_respawn(tmp_path):
     """The wedge regression at the launcher level: a task record for a Duck that died before dialling
     back made every later ensure() a no-op. After terminate (the liveness sweep now calls it), ensure

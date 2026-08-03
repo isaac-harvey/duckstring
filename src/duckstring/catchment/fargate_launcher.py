@@ -39,7 +39,7 @@ class FargateLauncher:
                  subnets: str | None = None, security_groups: str | None = None,
                  task_role: str | None = None, execution_role: str | None = None,
                  assign_public_ip: str | None = None, task_definition: str | None = None,
-                 region: str | None = None, ecs_client=None):
+                 region: str | None = None, ecs_client=None, logs_client=None):
         from .dialback import RemoteDialback
 
         self.root = root
@@ -63,6 +63,7 @@ class FargateLauncher:
         # Region drives the ecs client + the awslogs config (so a Duck's output is visible in CloudWatch).
         self.region = region or os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
         self._client = ecs_client
+        self._logs_client = logs_client  # injectable so the diagnostic path is testable
         self._registered: dict = {}   # config signature → the registered task-def family:revision
         self._tasks: dict[str, str] = {}   # pond key → task ARN
         self._pending: dict[str, tuple] = {}
@@ -78,9 +79,17 @@ class FargateLauncher:
             self._client = boto3.client("ecs", **({"region_name": self.region} if self.region else {}))
         return self._client
 
+    def _logs(self):
+        if self._logs_client is None:
+            import boto3
+
+            self._logs_client = boto3.client("logs", region_name=self.region)
+        return self._logs_client
+
     def reset_client(self) -> None:
-        """Drop the cached boto3 client so added/rotated credentials take effect on the next spawn."""
+        """Drop the cached boto3 clients so added/rotated credentials take effect on the next spawn."""
         self._client = None
+        self._logs_client = None
 
     # ─── the launcher interface ───────────────────────────────────────────────────
 
@@ -245,11 +254,8 @@ class FargateLauncher:
         if task_arn is None or not self.region:
             return None
         try:
-            import boto3
-
             task_id = task_arn.rsplit("/", 1)[-1]
-            logs = boto3.client("logs", region_name=self.region)
-            events = logs.get_log_events(
+            events = self._logs().get_log_events(
                 logGroupName="/duckstring/duck", logStreamName=f"duck/{_CONTAINER}/{task_id}",
                 limit=lines, startFromHead=False,
             ).get("events") or []
