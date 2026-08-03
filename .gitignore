@@ -11,6 +11,8 @@ __pycache__/
 build/
 develop-eggs/
 dist/
+# local wheels built for the cloud gate box
+dist_gate/
 downloads/
 eggs/
 .eggs/

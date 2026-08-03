@@ -176,7 +176,7 @@ so you can pin exactly the version you run:
 
 ```dockerfile
 FROM python:3.13-slim
-RUN pip install "duckstring[aws]==0.4.0"
+RUN pip install "duckstring[aws]==0.5.0"
 ENTRYPOINT ["python", "-m"]
 CMD ["duckstring.duck", "--help"]
 ```
@@ -190,7 +190,7 @@ this is the common case, and it is why a stock image would not have helped you a
 
 ```dockerfile
 FROM python:3.13-slim
-RUN pip install "duckstring[aws]==0.4.0" pandas scikit-learn your-internal-lib
+RUN pip install "duckstring[aws]==0.5.0" pandas scikit-learn your-internal-lib
 ENTRYPOINT ["python", "-m"]
 ```
 

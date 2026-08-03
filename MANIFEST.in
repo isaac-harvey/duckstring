@@ -1,5 +1,7 @@
 # The sdist ships the installable package only — keep internal design notes and the test suite
 # out of the PyPI source tarball (they're in the git repo for contributors).
+include CHANGELOG.md
+
 prune tests
 prune plans
 prune experiment

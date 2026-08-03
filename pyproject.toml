@@ -1,6 +1,6 @@
 [project]
 name = "duckstring"
-version = "0.4.0"
+version = "0.5.0"
 description = "Build data pipelines the way you build software: version each transform, declare its dependencies, and Duckstring resolves the execution DAG automatically."
 readme = "README.md"
 requires-python = ">=3.10"
