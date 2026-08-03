@@ -104,16 +104,27 @@ def test_set_base_url_forwards_to_both():
 class FakeEc2:
     def __init__(self):
         self.launched, self.terminated, self._n = [], [], 0
+        self.state = {}       # instance id -> the state AWS reports
+        self.purged = set()   # ids AWS no longer knows at all
 
     def run_instances(self, **kw):
         self._n += 1
         iid = f"i-{self._n}"
         self.launched.append((iid, kw))
+        self.state[iid] = "running"
         return {"Instances": [{"InstanceId": iid}]}
 
     def terminate_instances(self, InstanceIds):
         self.terminated.extend(InstanceIds)
+        for iid in InstanceIds:
+            self.state[iid] = "terminated"
         return {}
+
+    def describe_instances(self, InstanceIds):
+        if any(i in self.purged for i in InstanceIds):
+            raise RuntimeError("InvalidInstanceID.NotFound: the instance ID does not exist")
+        return {"Reservations": [{"Instances": [{"InstanceId": i, "State": {"Name": self.state.get(i, "running")}}
+                                                for i in InstanceIds]}]}
 
 
 def _launcher(tmp_path, client, **kw):
@@ -347,3 +358,102 @@ def test_missing_ami_does_not_launch(tmp_path):
     disp = DispatchingLauncher(RecordingBackend("local"), {"_any": lch})
     disp.ensure("a@1", "1", "ponds/a/1", duck=_duck("heavy", pool={"instance_type": "m6i.large"}))
     assert "DUCKSTRING_EC2_AMI" in (disp.launch_error("a@1") or "")
+
+
+# ─── the Pool machine's own liveness ────────────────────────────────────────────
+#
+# Measured on the live gate box: terminating the Pool machine by hand wedged the Pool permanently. The
+# Catchment kept the dead instance's id, so ``start`` stayed a no-op, no replacement ever launched, and
+# the Pond sat "running" until the silent-Duck window failed it with a message blaming its Duck.
+
+
+def _pool_machine(tmp_path, ec2):
+    from duckstring.catchment.pool_launcher import Ec2PoolMachine, PoolLauncher
+
+    lch = _launcher(tmp_path, ec2, instance_profile="ds-worker")
+    machine = Ec2PoolMachine("devpool", {"instance_type": "m6i.large"}, lch)
+    return machine, PoolLauncher("devpool", machine)
+
+
+def test_a_live_pool_machine_is_never_relaunched(tmp_path):
+    """The probe must not cost a second machine: one Pool, one machine."""
+    ec2 = FakeEc2()
+    machine, _pool = _pool_machine(tmp_path, ec2)
+    machine.start()
+    machine._probed_at = 0.0   # force the probe rather than waiting out the throttle
+    machine.start()
+    assert len(ec2.launched) == 1
+
+
+def test_a_vanished_pool_machine_is_relaunched(tmp_path):
+    ec2 = FakeEc2()
+    machine, _pool = _pool_machine(tmp_path, ec2)
+    machine.start()
+    iid = ec2.launched[0][0]
+
+    ec2.state[iid] = "terminated"          # someone terminated it outside Duckstring
+    machine._probed_at = 0.0
+    machine.start()
+    assert len(ec2.launched) == 2, "the Pool stayed wedged on a dead machine"
+    assert machine._instance_id == ec2.launched[1][0]
+
+
+def test_a_purged_instance_id_counts_as_gone(tmp_path):
+    """A terminated instance eventually stops resolving at all — a definite answer, and it must not be
+    mistaken for the probe FAILING (which deliberately assumes the machine is still up)."""
+    ec2 = FakeEc2()
+    machine, _pool = _pool_machine(tmp_path, ec2)
+    machine.start()
+    ec2.purged.add(ec2.launched[0][0])
+    machine._probed_at = 0.0
+    machine.start()
+    assert len(ec2.launched) == 2
+
+
+def test_a_failing_probe_never_kills_a_machine(tmp_path):
+    """Throttling, a transient API error or lost credentials must not tear down a live Pool."""
+    ec2 = FakeEc2()
+    machine, _pool = _pool_machine(tmp_path, ec2)
+    machine.start()
+
+    def boom(**_kw):
+        raise RuntimeError("RequestLimitExceeded")
+
+    ec2.describe_instances = boom
+    machine._probed_at = 0.0
+    machine.start()
+    assert len(ec2.launched) == 1 and machine.is_up()
+
+
+def test_ponds_stop_counting_as_running_when_the_machine_is_gone(tmp_path):
+    """What the live box got wrong: the Ponds must not be reported up on a machine that is gone, and the
+    failure they get must name the machine rather than blaming the Duck."""
+    ec2 = FakeEc2()
+    machine, pool = _pool_machine(tmp_path, ec2)
+    pool.ensure("a@1", "1", "ponds/a/1")
+    pool.on_event({"kind": "duck_started", "pond": "a", "major": 1})
+    assert pool.is_running("a@1")
+
+    ec2.state[ec2.launched[0][0]] = "terminated"
+    machine._probed_at = 0.0
+    assert not pool.is_running("a@1")
+    assert "Pool machine (i-1) disappeared" in (pool.launch_error("a@1") or "")
+
+    # And the next spawn heals: a replacement machine, and the queued work goes to it.
+    pool.ensure("a@1", "1", "ponds/a/1")
+    assert len(ec2.launched) == 2
+    assert any(j["kind"] == "ensure" for j in pool.take_jobs())
+
+
+def test_a_recovered_pool_stops_reporting_the_old_failure(tmp_path):
+    """launch_error is what a Pond failure gets attributed to — a dead machine's epitaph must not
+    outlive it and misattribute the next, unrelated failure on that Pool."""
+    ec2 = FakeEc2()
+    machine, pool = _pool_machine(tmp_path, ec2)
+    machine.start()
+    ec2.state[ec2.launched[0][0]] = "terminated"
+    machine._probed_at = 0.0
+    machine.start()                       # detects, records the reason, relaunches
+    machine._probed_at = 0.0
+    assert machine.check() is True
+    assert pool.launch_error("a@1") is None

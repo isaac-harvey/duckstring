@@ -22,6 +22,12 @@ log = logging.getLogger("duckstring.fargate")
 
 _REMOTE_ROOT = "/var/lib/duckstring"
 _CONTAINER = "duck"
+
+
+def _NOISE(message: str) -> bool:
+    """Is this log line routine Duck chatter rather than a cause? A Duck's stream is dominated by its
+    job poll; keeping those crowds the actual error out of a bounded tail."""
+    return "/jobs" in message and " 200 " in message
 _FARGATE_NO_IMAGE = (
     "Fargate cannot launch — no container image or task definition configured. A Fargate pool needs the "
     "Duck image + VPC + IAM set as Catchment env: DUCKSTRING_FARGATE_IMAGE (or DUCKSTRING_FARGATE_TASK_DEF), "
@@ -255,11 +261,17 @@ class FargateLauncher:
             return None
         try:
             task_id = task_arn.rsplit("/", 1)[-1]
+            # Over-fetch, then drop the routine chatter: an idle Duck's log is almost entirely job polls,
+            # and a raw tail of it is all poll lines and no cause. Measured on a live Fargate failure —
+            # twelve identical GET /jobs lines, which is exactly where the traceback should have been.
             events = self._logs().get_log_events(
                 logGroupName="/duckstring/duck", logStreamName=f"duck/{_CONTAINER}/{task_id}",
-                limit=lines, startFromHead=False,
+                limit=max(lines * 10, 100), startFromHead=False,
             ).get("events") or []
-            return " | ".join(e["message"] for e in events) or None
+            messages = [e["message"] for e in events]
+            useful = [m for m in messages if not _NOISE(m)]
+            # If it is ALL chatter, show the raw tail rather than nothing — silence reads as "no logs".
+            return " | ".join((useful or messages)[-lines:]) or None
         except Exception:
             log.debug("fargate: log fetch failed for %s", pond_key, exc_info=True)
             return None

@@ -21,9 +21,57 @@ import logging
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 log = logging.getLogger(__name__)
+
+_PROBE_INTERVAL_S = 30.0
+
+
+class _RemoteMachine:
+    """Liveness for a remote Pool machine — shared by the Fargate and EC2 backends.
+
+    A machine RECORD is not proof the machine exists. An instance/task can vanish underneath the
+    Catchment (terminated by hand, reclaimed as spot, retired, stopped by an unrelated tool), and on the
+    record alone ``start`` was a permanent no-op: every Pond on that Pool queued work at a machine that
+    was gone. Measured on a live box — the Pool never relaunched, and each Pond took the full
+    silent-Duck window to fail with a message blaming its own Duck. So a stale record is checked against
+    the provider, cleared, and relaunched on the next spawn.
+
+    Probes are throttled: this runs on the scheduler tick, and the cost is one describe per machine per
+    :data:`_PROBE_INTERVAL_S` however many Ponds sit on the Pool."""
+
+    _probed_at: float = 0.0
+
+    def check(self) -> bool:
+        """Is the machine up? Clears the record — so the next ``start`` relaunches — when it is gone."""
+        if self._record() is None:
+            return False
+        now = time.monotonic()
+        if now - self._probed_at < _PROBE_INTERVAL_S:
+            return True
+        self._probed_at = now
+        try:
+            alive = self._probe()
+        except Exception:
+            # A failed describe is not evidence of death (throttling, a transient API error, lost
+            # credentials). Never tear down a live machine — and its Ducks — on it.
+            log.exception("pool '%s': could not probe the machine; assuming it is still up", self.pool)
+            return True
+        if alive:
+            # Don't let a past machine's epitaph outlive it: launch_error is what a Pond failure is
+            # attributed to, so a stale "disappeared" would misattribute every later failure on the Pool.
+            self._error = None
+            return True
+        # Name the machine: the id is what an operator takes to the console, and a probe that is WRONG
+        # about a live machine is only diagnosable if we say which one it judged.
+        record = self._record()
+        log.warning("pool '%s': machine %s is gone; relaunching on the next spawn", self.pool, record)
+        self._forget()
+        self._error = (f"the '{self.pool}' Pool machine ({record}) disappeared (terminated or stopped "
+                       "outside Duckstring); a replacement starts on the next run")
+        return False
 
 
 class LocalPoolMachine:
@@ -58,6 +106,9 @@ class LocalPoolMachine:
     def is_up(self) -> bool:
         return self._proc is not None and self._proc.poll() is None
 
+    def check(self) -> bool:
+        return self.is_up()  # a local process needs no probe — poll() is the truth
+
     def stop(self) -> None:
         if self._proc is not None and self._proc.poll() is None:
             self._proc.terminate()
@@ -71,7 +122,10 @@ class LocalPoolMachine:
         return None
 
 
-class FargatePoolMachine:
+_LIVE_TASK = {"PROVISIONING", "PENDING", "ACTIVATING", "RUNNING"}
+
+
+class FargatePoolMachine(_RemoteMachine):
     """One Fargate task running the Pool agent. Rides the per-Pond FargateLauncher's config resolution
     (task-def registration, cluster/subnets/roles from the pool's deploy_config over env defaults) with
     the AGENT command as the container override. Sizing = the pool's cpu/memory."""
@@ -97,8 +151,22 @@ class FargatePoolMachine:
             f"--persist-root={self.fl.data_root or ''}",  # a Pool Duck persists to the data root
         ]
 
+    def _record(self) -> str | None:
+        return self._task_arn
+
+    def _forget(self) -> None:
+        self._task_arn = None
+
+    def _probe(self) -> bool:
+        cluster = (self.spec.get("deploy_config") or {}).get("cluster") or self.fl.cluster
+        tasks = (self.fl._ecs().describe_tasks(cluster=cluster, tasks=[self._task_arn])
+                 .get("tasks") or [])
+        if not tasks:
+            return False  # ECS drops a stopped task from describe once it ages out
+        return (tasks[0].get("lastStatus") or "").upper() in _LIVE_TASK
+
     def start(self) -> None:
-        if self._task_arn is not None:
+        if self.check():
             return
         command = self._agent_command()
         if command is None:
@@ -148,7 +216,7 @@ class FargatePoolMachine:
             self._error = f"fargate pool: {exc}"
 
     def is_up(self) -> bool:
-        return self._task_arn is not None  # a record counts as up; the heartbeat catches a dead task
+        return self._task_arn is not None
 
     def stop(self) -> None:
         if self._task_arn is None:
@@ -165,7 +233,7 @@ class FargatePoolMachine:
         return self._error
 
 
-class Ec2PoolMachine:
+class Ec2PoolMachine(_RemoteMachine):
     """One EC2 instance running the Pool agent via userdata — the escape-hatch provider, same shape as
     :class:`FargatePoolMachine` over the Ec2Launcher's plumbing."""
 
@@ -176,8 +244,28 @@ class Ec2PoolMachine:
         self._instance_id: str | None = None
         self._error: str | None = None
 
+    def _record(self) -> str | None:
+        return self._instance_id
+
+    def _forget(self) -> None:
+        self._instance_id = None
+
+    def _probe(self) -> bool:
+        try:
+            resp = self.el._ec2().describe_instances(InstanceIds=[self._instance_id])
+        except Exception as exc:
+            # A terminated instance is purged after a while and the id stops resolving at all — that is
+            # a definite answer, not a probe failure, so don't let it reach the assume-alive fallback.
+            if "NotFound" in str(exc):
+                return False
+            raise
+        for reservation in resp.get("Reservations") or []:
+            for instance in reservation.get("Instances") or []:
+                return ((instance.get("State") or {}).get("Name")) in ("pending", "running")
+        return False
+
     def start(self) -> None:
-        if self._instance_id is not None:
+        if self.check():
             return
         if self.el.remote_base_url is None:
             self.el.dialback.request()
@@ -266,7 +354,20 @@ class PoolLauncher:
 
     def is_running(self, pond_key: str) -> bool:
         with self._lock:
-            return self._state.get(pond_key) in ("pending", "running")
+            live = self._state.get(pond_key) in ("pending", "running")
+        if not live:
+            return False
+        # An agent-reported state is only as good as the machine under it: if that is gone, nothing on
+        # it is running whatever the agent last said. Answering now fails the Pond promptly with the
+        # machine's own reason, instead of every Pond on the Pool waiting out the silent-Duck window and
+        # blaming its Duck. (Probed outside the lock — it is a network call.)
+        if not self.machine.check():
+            with self._lock:
+                for key, state in list(self._state.items()):
+                    if state in ("pending", "running"):
+                        self._state[key] = "exited"
+            return False
+        return True
 
     def launch_error(self, pond_key: str) -> str | None:
         return self.machine.error()

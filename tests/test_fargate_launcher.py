@@ -227,3 +227,34 @@ def test_dispatcher_routes_by_pool_provider():
     # dedicated (no pool provider) → the default provider (fargate).
     d.ensure("e@1", "1", "p/e", duck={"duck_target": "dedicated", "remote": True, "pool": None})
     assert fargate.ensured == ["a@1", "e@1"] and ec2.ensured == ["b@1"] and local.ensured == ["c@1"]
+
+def _logs_returning(messages):
+    class FakeLogs:
+        def get_log_events(self, **kw):
+            return {"events": [{"message": m} for m in messages]}
+    return FakeLogs()
+
+
+def test_poll_chatter_never_crowds_out_the_cause(tmp_path):
+    """Measured on a live Fargate failure: the tail came back as twelve identical job-poll lines, which
+    is precisely where the traceback should have been. The poll is the bulk of a Duck's log, so it is
+    filtered out before the tail is taken."""
+    ecs = FakeEcs()
+    chatter = ['INFO httpx: HTTP Request: GET http://c:7474/api/duck/a/1/jobs "HTTP/1.1 200 OK"'
+               for _ in range(40)]
+    logs = _logs_returning(chatter[:20] + ["ValueError: no such table 'orders'"] + chatter[:20])
+    lch = _fargate(ecs, logs_client=logs, region="ap-southeast-2")
+    lch.ensure("a@1", "1", "ponds/a/1", duck=_duck())
+    tail = lch.log_tail("a@1")
+    assert "ValueError: no such table" in tail
+    assert "/jobs" not in tail
+
+
+def test_an_all_chatter_log_still_shows_something(tmp_path):
+    """A Duck that vanished without logging a cause: an empty tail reads as 'no logs at all', which is a
+    different and misleading diagnosis. Show the raw tail instead."""
+    ecs = FakeEcs()
+    logs = _logs_returning(['INFO httpx: GET /api/duck/a/1/jobs "HTTP/1.1 200 OK"' for _ in range(30)])
+    lch = _fargate(ecs, logs_client=logs, region="ap-southeast-2")
+    lch.ensure("a@1", "1", "ponds/a/1", duck=_duck())
+    assert "/jobs" in (lch.log_tail("a@1") or "")
