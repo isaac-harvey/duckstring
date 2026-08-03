@@ -173,6 +173,7 @@ All under `/api/ponds/{name}/…`, all returning `{"ok": true}`; `404` for unkno
 | `POST …/sleep` | `{"upstream": false}` | Clear demand (optionally ancestors too) |
 | `POST …/kill` | — | Terminate the worker; park `killed` |
 | `POST …/clear` | — | Reset failed/killed; unblock downstream |
+| `POST …/reset-contract` | — | Drop the major line's recorded output schema (the next accepted run re-freezes it) and clear the failure — the escape hatch for a line wedged by a narrowing type change |
 | `GET …/budget` | — | `{"immediate_retries", "source_retries"}` |
 | `POST …/budget` | `{"immediate_retries": 1, "source_retries": 2}` | Set the live retry budgets |
 | `GET …/duck` | — | The Pond's effective worker config: `{"size", "flock", "override", "defaults"}` |

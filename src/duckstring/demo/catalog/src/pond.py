@@ -50,7 +50,10 @@ def ingest(pond):
           p.product_id,
           'Product ' || p.product_id                                  AS name,
           {cats}[CAST(p.product_id % {len(_CATEGORIES)} AS INTEGER) + 1] AS category,
-          round(p.base_price * {factor}, 2)                           AS unit_price
+          -- CAST to a declared type: without it the result type follows whichever branch {factor}
+          -- took (a bare literal vs a COALESCE over the drift CTE), so the published schema would
+          -- change with the DATA — see schema_contract.is_widening.
+          CAST(round(p.base_price * {factor}, 2) AS DECIMAL(12,2))    AS unit_price
         FROM (
           SELECT (i + 1) AS product_id, 5.0 + ((i * 37) % 2000) * 0.5 AS base_price
           FROM range({_PRODUCTS}) AS t(i)

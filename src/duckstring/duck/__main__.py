@@ -8,7 +8,9 @@ keeps draining in-flight Pond Runs and buffering events regardless of Catchment 
 from __future__ import annotations
 
 import argparse
+import logging
 import queue
+import sys
 import threading
 import traceback
 from datetime import datetime, timezone
@@ -29,6 +31,8 @@ def _now() -> datetime:
 # for this long, the Run is wedged — report it as a Pond failure rather than hang forever. Generous,
 # to absorb the momentary gap between one Ripple finishing and the next being launched.
 _STUCK_GRACE_S = 30.0
+
+log = logging.getLogger("duckstring.duck")
 
 
 def serve(core: DuckCore, executor: RippleExecutor, client: CatchmentClient) -> None:
@@ -133,7 +137,7 @@ def serve(core: DuckCore, executor: RippleExecutor, client: CatchmentClient) -> 
                 elif kind == "persisted":
                     pf, perr, pstarted, pfinished = data
                     if perr:
-                        print(f"[duck:{core.pond_name}] persist at {pf} failed: {perr}", flush=True)
+                        log.error("[%s] persist at %s failed: %s", core.pond_name, pf, perr)
                     core.events.append(Event(kind="persist", f=pf,
                                              status="failed" if perr else "success", error=perr,
                                              started_at=pstarted, finished_at=pfinished))
@@ -149,12 +153,12 @@ def serve(core: DuckCore, executor: RippleExecutor, client: CatchmentClient) -> 
                     if isinstance(exc, MissingSourceAsset):
                         # A read of an unpublished Source asset — waiting, not broken. Park it (no retry,
                         # no failure); the Catchment blocks the Pond with a reason. See plans/reset.md.
-                        print(f"[duck:{core.pond_name}] ripple {name} waiting on {exc.source}.{exc.table}", flush=True)
+                        log.warning("[%s] ripple %s waiting on %s.%s", core.pond_name, name, exc.source, exc.table)
                         _launch(core.ripple_missing_source(
                             name, exc.source, exc.table, _now(), started_at=started, finished_at=finished,
                         ))
                     else:
-                        print(f"[duck:{core.pond_name}] ripple {name} failed: {exc}", flush=True)
+                        log.error("[%s] ripple %s failed: %s", core.pond_name, name, exc)
                         _launch(core.ripple_failed(
                             name, _now(), started_at=started, finished_at=finished,
                             error=_msg(exc), traceback=_tb(exc),
@@ -164,13 +168,13 @@ def serve(core: DuckCore, executor: RippleExecutor, client: CatchmentClient) -> 
             except Exception as exc:
                 # A Pond-level error (e.g. a failed ledger write): report it against the most recent
                 # Pond Run and exit. The Catchment fails the Pond (and may retry it on change).
-                print(f"[duck:{core.pond_name}] pond-level failure: {exc}", flush=True)
+                log.error("[%s] pond-level failure: %s", core.pond_name, exc)
                 _report_pond_failure(core, client, _msg(exc), _tb(exc))
                 break
 
             # Watchdog: outstanding work but nothing running, past the grace period → the Run is stuck.
             if not core.idle() and inflight == 0 and (_now() - last_progress).total_seconds() > _STUCK_GRACE_S:
-                print(f"[duck:{core.pond_name}] stuck: active Pond Run with no running Ripple", flush=True)
+                log.error("[%s] stuck: active Pond Run with no running Ripple", core.pond_name)
                 _report_pond_failure(core, client, "stuck: active Pond Run with no running Ripple")
                 break
 
@@ -227,6 +231,10 @@ def main() -> None:
                                                        "locally, async-mirror here; empty = publish to "
                                                        "--data-root directly (remote Duck / no cloud)")
     args = ap.parse_args()
+    # Configure logging at entry: without this a Duck has no handler, so INFO is dropped and
+    # WARNING+ goes through the bare last-resort handler with no timestamp.
+    logging.basicConfig(level=logging.INFO, stream=sys.stderr,
+                        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
     root = Path(args.root)
     data_root = args.data_root or None
@@ -237,7 +245,7 @@ def main() -> None:
         # Remote-Duck boot (prereqs D6): this host doesn't share the Catchment's disk — fetch the
         # deployed source bundle over the duck channel and unpack it where the executor expects it.
         _unpack_artifact(client.fetch_artifact(), source_dir)
-        print(f"[duck:{args.pond}@{args.major}] fetched source artifact -> {source_dir}", flush=True)
+        log.info("[%s@%s] fetched source artifact -> %s", args.pond, args.major, source_dir)
     parents = load_topology(source_dir)
     major_dir = pond_major_dir(root, args.pond, args.major)
     major_dir.mkdir(parents=True, exist_ok=True)

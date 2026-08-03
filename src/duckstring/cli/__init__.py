@@ -13,7 +13,18 @@ from . import puddle as puddle_cmd
 from . import secret as secret_cmd
 from . import serve as serve_cmd
 from . import spout as spout_cmd
-from .control import clear, failure_budget, force, kill, refresh, repair, reset, sleep, wake
+from .control import (
+    clear,
+    failure_budget,
+    force,
+    kill,
+    refresh,
+    repair,
+    reset,
+    reset_contract,
+    sleep,
+    wake,
+)
 from .data import delete_object, delete_table, get, get_object, objects, query
 from .deploy import deploy
 from .deploy import remove as remove_pond
@@ -64,6 +75,7 @@ control_app.command("wake")(wake)
 control_app.command("sleep")(sleep)
 control_app.command("kill")(kill)
 control_app.command("clear")(clear)
+control_app.command("reset-contract")(reset_contract)
 control_app.command("failure-budget")(failure_budget)
 
 catchment_cmd.app.command("open")(duct_cmd.open_pond)

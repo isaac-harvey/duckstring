@@ -3289,6 +3289,30 @@ class Driver:
                 )
         self.db.commit()
 
+    def reset_contract(self, pond: str) -> dict:
+        """Drop the captured output schema for this major line, so the NEXT accepted run re-freezes the
+        contract from what it actually produces.
+
+        The contract is forward-only by design — that is what makes a Sink's pin safe — but it means a
+        genuinely narrowing type change wedges the line permanently: every run fails the gate, and a
+        failed run publishes nothing, so nothing can ever re-capture the schema. Without this the only
+        way out is editing ``pond_version_schema`` by hand (which is exactly what a live incident
+        required). Deliberately explicit and full-gated: it re-opens a Sink's pin, so it belongs with the
+        operator, not with a retry.
+
+        Also clears the failure so the line can run again."""
+        with self.lock:
+            meta = self.meta[pond]
+            rows = self.db.execute(
+                "DELETE FROM pond_version_schema WHERE pond_version_id IN "
+                "(SELECT pv.id FROM pond_version pv JOIN pond_name pn ON pn.id = pv.pond_name_id "
+                " WHERE pn.name = ? AND pv.major = ?)",
+                (meta["name"], meta["major"]),
+            ).rowcount
+            self.db.commit()
+        self.clear(pond)  # takes the lock itself
+        return {"pond": pond, "columns_cleared": max(rows, 0)}
+
     def _source_published_f(self, pond: str) -> dict[str, str]:
         """``{source name: published freshness}`` for this Pond's Sources — what the Duck's foreign reads
         must at least see. Keyed by NAME (not pond key) because that is how a Ripple refers to a Source

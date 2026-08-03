@@ -195,6 +195,17 @@ def refresh(
     return {"ok": True}
 
 
+@router.post("/ponds/{name}/reset-contract", dependencies=[auth.full])
+def reset_contract(
+    name: str, request: Request, major: int | None = None, version: str | None = None,
+):
+    """Drop this major line's captured output schema so the next accepted run re-freezes it, and clear
+    the failure. The escape hatch for a line wedged by a narrowing type change: the gate is forward-only
+    and a failed run publishes nothing, so without this the line can never recover. It re-opens a Sink's
+    pin — full access only, and never automatic."""
+    return _driver(request).reset_contract(_resolve(request, name, major, version))
+
+
 @router.post("/ponds/{name}/reset", dependencies=[auth.full])
 def reset(
     name: str, request: Request, clear_history: bool = False,

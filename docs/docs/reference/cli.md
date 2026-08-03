@@ -157,6 +157,7 @@ See [Control](../guides/control.md) and [Fault Tolerance](../guides/fault-tolera
 | `control sleep {pond} [--upstream]` | Clear all demand (started runs complete). `--upstream` also sleeps every ancestor. |
 | `control kill {pond}` | Terminate the Pond's worker and cancel its run; parks the Pond `killed` until wake/force/clear. |
 | `control clear {pond}` | Reset a failed/killed Pond to idle and unblock downstream, without running. |
+| `control reset-contract {pond} [-y]` | Drop the major line's recorded output schema so the next accepted run re-freezes it, and clear the failure. The escape hatch for a line wedged by a **narrowing** type change — the schema gate is forward-only, and a failed run publishes nothing, so the line could otherwise never recover. Widenings need no reset: they are accepted as additive. Re-opens what a pinned Sink was promised, so it confirms first. |
 | `control failure-budget {pond} [-i N] [-o N]` | Show (no flags) or set the retry budgets: `--immediate` Ripple retries per run, `--on-change` Pond Runs retried as Sources update. |
 
 ## `duckstring duck` — per-Pond compute config

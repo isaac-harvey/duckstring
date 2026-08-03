@@ -17,7 +17,7 @@ def priced_line(pond):
         .join(pond.trickle("catalog.product"), on="product_id")
         .select(
             "s0.order_id, s0.product_id, s0.quantity, s1.unit_price, "
-            "round(s0.quantity * s1.unit_price, 2) AS revenue"
+            "CAST(round(s0.quantity * s1.unit_price, 2) AS DECIMAL(14,2)) AS revenue"
         )
         .merge("priced_line", pk="order_id")
     )

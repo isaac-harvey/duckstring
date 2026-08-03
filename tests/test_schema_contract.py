@@ -29,13 +29,65 @@ def test_additive_changes_are_compatible():
     assert contract_violations(output, contract) == []
 
 
-def test_dropped_column_removed_table_and_type_change_are_violations():
-    contract = {"event": {"id": "INTEGER", "val": "VARCHAR"}, "side": {"k": "INTEGER"}}
-    output = {"event": {"id": "BIGINT"}}  # val dropped, id retyped, side table gone
+def test_dropped_column_removed_table_and_narrowing_are_violations():
+    contract = {"event": {"id": "BIGINT", "val": "VARCHAR"}, "side": {"k": "INTEGER"}}
+    output = {"event": {"id": "INTEGER"}}  # val dropped, id NARROWED, side table gone
     msgs = " | ".join(contract_violations(output, contract))
     assert "event.val" in msgs and "dropped" in msgs
-    assert "event.id" in msgs and "INTEGER → BIGINT" in msgs
+    assert "event.id" in msgs and "BIGINT → INTEGER" in msgs
     assert "side" in msgs and "no longer produced" in msgs
+
+
+def test_a_lossless_widening_is_additive_not_breaking():
+    """The production wedge: a Ripple whose SQL takes a data-dependent branch emitted DECIMAL(24,2) on
+    one run and DECIMAL(25,2) on the next — identical semantics, every value still representable. Judged
+    by string equality that was a "type change", which fails the Pond and, because the contract is
+    forward-only, wedges it permanently with no way back short of DB surgery."""
+    contract = {"t": {"revenue": "DECIMAL(24,2)", "n": "INTEGER", "ts": "TIMESTAMP_S"}}
+    output = {"t": {"revenue": "DECIMAL(25,2)", "n": "BIGINT", "ts": "TIMESTAMP"}}
+    assert contract_violations(output, contract) == []
+
+
+def test_reset_contract_unwedges_a_narrowed_line(tmp_path):
+    """A narrowing IS breaking, so the gate keeps failing it — and a failed run publishes nothing, so the
+    contract can never re-capture. Without an escape hatch the line is wedged forever (the live incident
+    needed hand-edited SQLite). reset-contract drops the recorded schema and clears the failure."""
+    from duckstring.keys import pond_key
+
+    db = connect(tmp_path / "duck.db")
+    migrate(db)
+    cfg = {"sources": {}, "immediate_retries": 0, "source_retries": 0, "kind": "outlet"}
+    _register(db, "sales", "1.0.0", "outlet", "ponds/sales/1.0.0", cfg,
+              [{"func": "f", "name": "agg", "parents": []}])
+    d = Driver(db, tmp_path, "http://x", NoopLauncher())
+    key = pond_key("sales", 1)
+
+    d._capture_schema(key, {"out": {"amount": "DECIMAL(25,2)"}})
+    assert d._contract_for(key) == {"out": {"amount": "DECIMAL(25,2)"}}
+    # A narrowing still fails the gate — the rule did not go soft.
+    assert contract_violations({"out": {"amount": "DECIMAL(24,2)"}}, d._contract_for(key))
+
+    d.pulse(key)
+    f = d.state.pond_states[key].start_f.isoformat()
+    d.on_event(key, {"kind": "contract_failed", "f": f, "status": "failed", "error": "narrowed"})
+    assert d.state.pond_states[key].is_failed
+
+    res = d.reset_contract(key)
+    assert res["columns_cleared"] == 1
+    assert d._contract_for(key) is None       # the next accepted run re-freezes it
+    assert not d.state.pond_states[key].is_failed  # and the line can run again
+
+
+def test_widening_rules_are_conservative():
+    from duckstring.schema_contract import is_widening
+
+    assert is_widening("DECIMAL(10,2)", "DECIMAL(11,3)")      # both parts grow
+    assert not is_widening("DECIMAL(10,2)", "DECIMAL(10,3)")  # scale grew at the integer part's expense
+    assert not is_widening("DECIMAL(25,2)", "DECIMAL(24,2)")  # shrinking is still breaking
+    assert is_widening("UINTEGER", "BIGINT")                  # unsigned into a wider signed
+    assert not is_widening("BIGINT", "DOUBLE")                # a large BIGINT loses precision as a double
+    assert not is_widening("INTEGER", "DECIMAL(20,0)")        # cross-family: not asserted
+    assert not is_widening("VARCHAR", "INTEGER")
 
 
 # ── extract_schema over a live registry (Trickle-aware) ─────────────────────────
