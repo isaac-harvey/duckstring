@@ -164,32 +164,45 @@ def test_an_extra_column_is_refused(tmp_path, monkeypatch):
 class _Builder:
     def __init__(self, ops):
         self._ops = ops
+        self._materialised = self._agg = self._acc = None
+
+
+def _athena_reason(expr_kind, expr):
+    """Athena's own verdict — equivalence is a property of the expression AND the engine that runs it,
+    so the lists live with the engine rather than in a universal 'safe SQL' notion."""
+    from duckstring.flock import equivalence
+    from duckstring.flock.engines.athena import _ALLOWED_FUNCS, _ALLOWED_NODES
+
+    return equivalence.unproven(_Builder([(expr_kind, expr)]), _ALLOWED_NODES, _ALLOWED_FUNCS)
 
 
 @pytest.mark.parametrize("expr", [
-    "s0.a, s1.b",                      # bare columns
-    "s0.a AS x, s1.b AS y",            # renamed
+    "s0.a, s1.b",                          # bare columns
+    "s0.a AS x, s1.b AS y",                # renamed
+    "s0.q * s1.p AS gross",                # decimal arithmetic: same result-type rule, exact
+    "round(s0.q * s1.p, 2) AS r",          # both round half away from zero
+    "coalesce(s0.a, 0) AS a",              # null semantics agree
 ])
-def test_provably_equivalent_expressions_are_dispatchable(expr):
-    assert flock.semantic_reason(_Builder([("select", expr)])) is None
+def test_expressions_trino_evaluates_like_duckdb_are_dispatchable(expr):
+    assert _athena_reason("select", expr) is None
 
 
 @pytest.mark.parametrize("expr,why", [
-    ("round(s0.q * s1.p, 2) AS r", "decimal arithmetic + rounding rules differ"),
-    ("s0.a + s0.b AS c", "arithmetic result types differ"),
-    ("CAST(s0.a AS INTEGER) AS a", "cast truncate/round/raise behaviour differs"),
-    ("sum(s0.amount) AS total", "float summation order is not even stable within DuckDB"),
-    ("upper(trim(s0.name)) AS n", "collation and trimming differ"),
+    ("s0.a / s0.b AS r",
+     "DuckDB `/` is TRUE division (7/2 = 3.5 DOUBLE); Trino's is integer division (3). conform would "
+     "cast Trino's 3 to DOUBLE and publish 3.0 — right type, WRONG VALUE"),
+    ("CAST(s0.a AS INTEGER) AS a",
+     "at .5 DuckDB casts to even (CAST(2.5 AS INTEGER)=2), Trino rounds half up (3)"),
+    ("upper(trim(s0.name)) AS n", "trimming and collation are unverified"),
 ])
-def test_unproven_expressions_stay_local(expr, why):
-    reason = flock.semantic_reason(_Builder([("select", expr)]))
-    assert reason is not None, f"{expr} should not be dispatched: {why}"
+def test_expressions_with_a_known_divergence_stay_local(expr, why):
+    assert _athena_reason("select", expr) is not None, f"{expr} must not dispatch: {why}"
 
 
 def test_filters_are_judged_too():
-    assert flock.semantic_reason(_Builder([("filter", "s0.a > 5 AND s1.b IS NOT NULL")])) is None
-    assert flock.semantic_reason(_Builder([("filter", "s0.a * 2 > 5")])) is not None
+    assert _athena_reason("filter", "s0.a > 5 AND s1.b IS NOT NULL") is None
+    assert _athena_reason("filter", "s0.a / 2 > 5") is not None
 
 
 def test_unparseable_sql_is_never_assumed_safe():
-    assert flock.semantic_reason(_Builder([("select", "this is not sql (((")])) is not None
+    assert _athena_reason("select", "this is not sql (((") is not None

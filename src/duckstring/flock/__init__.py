@@ -98,72 +98,6 @@ def _qi(name: str) -> str:
     return '"' + str(name).replace('"', '""') + '"'
 
 
-# The expression forms whose meaning is PROVEN identical between DuckDB and a dispatch engine, by
-# conformance test rather than by assumption. Deliberately small: column references, literals,
-# comparisons and boolean connectives. It grows only as conformance coverage grows.
-#
-# What is excluded, and why (each is a known cross-engine divergence, not caution for its own sake):
-#   arithmetic  — decimal result-type and overflow rules differ; float summation order is not even
-#                 stable within DuckDB across thread counts, so "what DuckDB would have done" is not a
-#                 single value. Those columns must be computed locally or declared DECIMAL.
-#   CAST        — string→number and narrowing casts differ in whether they round, truncate, or raise.
-#   functions   — round/trunc half-way rules, string collation and trimming, temporal precision and
-#                 timezone handling all vary by engine.
-_SAFE_SQL_NODES = (
-    "Column", "Identifier", "Star", "Alias", "Literal", "Boolean", "Null", "Paren",
-    "EQ", "NEQ", "GT", "GTE", "LT", "LTE", "And", "Or", "Not", "Is", "In", "Between",
-)
-
-
-def semantic_reason(builder) -> str | None:
-    """``None`` when every expression in this terminal is on the proven-equivalent whitelist, else the
-    reason it must run locally.
-
-    The engine-agnostic half of eligibility: an engine's own ``eligible`` says what its compiler can
-    *express*, this says what we have *proven equivalent*. Shape alone is not enough — a left-deep join
-    of two tables is expressible everywhere, but `round(qty * price, 2)` in its projection is where the
-    engines actually disagree.
-
-    Needs a SQL parser to judge an expression (the ``duckstring[lineage]`` extra, which ships sqlglot).
-    Without one we cannot read the projection, so only bare column lists are dispatched — unparsed SQL
-    is never assumed safe."""
-    exprs: list[str] = []
-    for kind, payload in builder._ops:
-        if kind in ("filter", "select"):
-            exprs.append(str(payload))
-        elif kind == "mutate":
-            exprs.extend(str(v) for v in (payload or {}).values())
-    if not exprs:
-        return None
-    try:
-        import sqlglot
-    except ImportError:
-        bare = all(all(_is_bare_column(part) for part in e.split(",")) for e in exprs)
-        return None if bare else "no SQL parser available to prove the expressions equivalent (pip install duckstring[lineage])"  # noqa: E501
-    for expr in exprs:
-        try:
-            trees = sqlglot.parse(f"SELECT {expr}", read="duckdb")
-        except Exception:  # noqa: BLE001 — unparseable means unprovable
-            return f"could not parse {expr!r} to prove it engine-equivalent"
-        for tree in trees:
-            for node in tree.walk():
-                name = type(node).__name__
-                if name in ("Select", "Expression"):
-                    continue
-                if name not in _SAFE_SQL_NODES:
-                    return (f"{name} is not on the engine-equivalence whitelist — DuckDB and the engine "
-                            f"may not agree on it (in {expr!r})")
-    return None
-
-
-def _is_bare_column(text: str) -> bool:
-    """A plain column reference, optionally qualified/aliased — the only thing we dare dispatch when no
-    parser is available to judge anything richer."""
-    import re
-
-    return bool(re.fullmatch(r"\s*[\w.\"]+(\s+AS\s+[\w\"]+)?\s*", text, re.IGNORECASE))
-
-
 def conform(builder, result):
     """Force an engine's result to be **exactly what DuckDB would have produced**, or reject it.
 
@@ -333,9 +267,9 @@ def comprehensive(builder, out_pk, *, pond_mode: str | None, comprehensive_bound
     mode = resolve_mode(pond_mode)
     if mode == "off":
         return None
-    # Two gates, in order: what we have PROVEN equivalent (engine-agnostic), then what this engine's
-    # compiler can express. The first is the one that keeps DuckDB the authority.
-    reason = semantic_reason(builder) or engine.eligible(builder)
+    # The engine decides what it can be trusted with: both what its compiler can express and which
+    # expressions it is known to evaluate the way DuckDB does (flock/equivalence.py + the engine's lists).
+    reason = engine.eligible(builder)
     if reason is not None:
         log.info("flock: not dispatching (%s)", reason)
         return None

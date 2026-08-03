@@ -32,6 +32,8 @@ import logging
 import time
 import uuid
 
+from .. import equivalence
+
 log = logging.getLogger("duckstring.flock.athena")
 
 _JOIN_SQL = {"inner": "INNER JOIN", "left": "LEFT JOIN", "right": "RIGHT JOIN", "full": "FULL JOIN"}
@@ -43,6 +45,39 @@ _TYPES = {
     "VARCHAR": "string", "DATE": "date", "BLOB": "binary",
     "TIMESTAMP": "timestamp", "TIMESTAMP WITH TIME ZONE": "timestamp",
 }
+
+
+
+# ── What Athena (Trino) may be handed unchanged ────────────────────────────────
+#
+# Scoped to THIS engine: equivalence is a property of the expression and the engine, not of SQL. Each
+# entry is here because Trino's documented semantics match DuckDB's measured behaviour; the excluded
+# ones are excluded for a specific reason, not caution in general.
+#
+# ALLOWED
+#   arithmetic + - *  — Trino and DuckDB share the decimal result-type rule (p1+p2, s1+s2) and decimal
+#                       arithmetic is exact, so no rounding can creep in.
+#   round()           — both round half away from zero (DuckDB measured: round(2.5)=3, round(3.5)=4).
+#   abs/floor/ceil    — exact, no half-way case.
+#   coalesce/nullif   — null semantics agree.
+#
+# EXCLUDED, each with a concrete divergence
+#   division (/)      — DuckDB `7 / 2` is TRUE division → 3.5 DOUBLE; Trino's is integer division → 3.
+#                       This one is dangerous rather than merely different: `conform` would cast Trino's
+#                       3 to DOUBLE and publish 3.0 — the right type carrying the wrong value.
+#   div by zero       — DuckDB yields inf; Trino throws.
+#   CAST              — at the .5 boundary DuckDB casts to even (CAST(2.5 AS INTEGER) = 2) while Trino
+#                       rounds half up = 3. Note DuckDB's own cast and round() disagree there.
+#   string functions  — trimming, collation and CHAR padding are not verified.
+#   SUM/AVG on FLOAT  — IEEE addition is not associative, so a parallel engine's partitioning shows up
+#                       in the last bits. Not a correctness cliff (DuckDB is not bit-stable across
+#                       thread counts either) but unverified, so it waits for a measurement.
+#
+# The list grows from evidence: tests/test_flock_athena_conformance.py runs each candidate on BOTH
+# engines and compares. Nothing joins it on reasoning alone.
+_ALLOWED_NODES = equivalence.BASE_NODES | frozenset({"Add", "Sub", "Mul", "Neg", "Coalesce", "If", "Case"})
+_ALLOWED_FUNCS = frozenset({"round", "abs", "floor", "ceil", "ceiling", "coalesce", "nullif",
+                            "least", "greatest"})
 
 
 class AthenaEngine:
@@ -61,8 +96,15 @@ class AthenaEngine:
         return bool(self.workgroup and self.database and self.scratch)
 
     def eligible(self, builder) -> str | None:
-        """None when the v0 compiler can express this terminal; else the reason (→ local)."""
+        """None when this terminal can be dispatched to Athena; else the reason (→ local compute).
+
+        Two questions, both this engine's: can the v0 compiler EXPRESS the shape, and are its expressions
+        ones Trino is known to evaluate the way DuckDB does (see the lists above)."""
         from ...trickle.builder import _Join, _Source
+
+        unproven = equivalence.unproven(builder, _ALLOWED_NODES, _ALLOWED_FUNCS)
+        if unproven is not None:
+            return unproven
 
         if builder._materialised is not None or builder._agg is not None or builder._acc is not None:
             return ".sql()/.aggregate()/.accumulate() terminals are v0-local"
