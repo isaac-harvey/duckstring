@@ -27,6 +27,28 @@ def _qi(ident: str) -> str:
     return '"' + ident.replace('"', '""') + '"'
 
 
+def _temp_dir(driver, sandboxed: bool) -> str:
+    """Where a serving connection may spill.
+
+    DuckDB has to be able to write its spill files, so it EXEMPTS ``temp_directory`` from
+    ``enable_external_access = false``. Pointing that at the shared system temp therefore hands a read
+    user every Parquet/CSV under it — on Linux, all of ``/tmp``. (Measured: the sandbox test read a file
+    outside the served surface on CI and passed on macOS only because its temp path doesn't string-match.)
+    The exemption is scoped to that one directory, so a sandbox gets a private directory of its own and
+    the hole covers nothing but DuckDB's own spill files."""
+    import tempfile
+
+    if not sandboxed:
+        return tempfile.gettempdir()
+    spill = Path(driver.root) / ".serving-tmp"
+    spill.mkdir(parents=True, exist_ok=True)
+    try:
+        spill.chmod(0o700)
+    except OSError:
+        pass  # a filesystem without POSIX modes: the sandbox scoping still holds
+    return str(spill)
+
+
 def _served_ponds(driver) -> list[tuple[str, int, list[int]]]:
     """(name, served_major, deployed_majors) for every non-spout/non-draw pond."""
     names = sorted({m["name"] for m in driver.meta.values()
@@ -52,10 +74,9 @@ def build_serving_con(driver, *, sandboxed: bool):
     con = duckdb.connect()
     # Spill instead of OOM (materialising a large serviceable table over S3) + keep Parquet footers warm.
     # Set before the sandbox freezes configuration below.
-    import tempfile
 
     try:
-        con.execute(f"SET temp_directory='{tempfile.gettempdir()}'")
+        con.execute(f"SET temp_directory='{_temp_dir(driver, sandboxed)}'")
         con.execute("SET enable_object_cache=true")
     except Exception:
         pass

@@ -3,6 +3,9 @@ operational override + reset-on-new-major + served-major/promote) and the sandbo
 
 from __future__ import annotations
 
+import tempfile
+from pathlib import Path
+
 import duckdb
 import pytest
 
@@ -143,6 +146,17 @@ def test_serving_core_sandboxed(tmp_path, monkeypatch):
     # The sandbox blocks escaping the allowlist via external file access.
     with pytest.raises(duckdb.Error):
         serving_query(d, f"SELECT * FROM read_parquet('{tmp_path}/ponds/sales/m1/data/secret_internal.parquet')")
+
+    # And specifically NOT from the system temp directory. DuckDB exempts temp_directory from the
+    # external-access lock (it must be able to spill), so pointing that at the shared system temp used to
+    # hand a read user every Parquet under /tmp. Only Linux CI caught it — on macOS the path above does
+    # not sit inside gettempdir(), so the check above passed while the hole was wide open.
+    probe = Path(tempfile.mkdtemp()) / "not_yours.parquet"
+    con = duckdb.connect()
+    con.execute(f"COPY (SELECT 1 AS x) TO '{probe}' (FORMAT PARQUET)")
+    con.close()
+    with pytest.raises(duckdb.Error):
+        serving_query(d, f"SELECT * FROM read_parquet('{probe}')")
 
 
 def test_full_connection_sees_all_tables(tmp_path, monkeypatch):

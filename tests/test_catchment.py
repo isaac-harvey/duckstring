@@ -187,7 +187,10 @@ def test_local_catchments_can_share_port(runner, tmp_path, mock_uvicorn):
 def test_start_help(runner):
     result = runner.invoke(app, ["catchment", "start", "--help"])
     assert result.exit_code == 0
-    assert "NAME" in result.output
+    # Typer renders an argument's metavar differently across versions (NAME, then {name} from 0.22), so
+    # match case-insensitively — the point of the test is that the command documents its name argument,
+    # not how the current Typer chooses to draw it.
+    assert "name" in result.output.lower()
 
 
 def test_start_unknown_catchment_exits(runner):

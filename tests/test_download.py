@@ -75,3 +75,16 @@ def test_cli_download_default_path_is_dot_duckstring(runner, catchment_root, liv
     result = runner.invoke(app, ["catchment", "download", "--yes"])
     assert result.exit_code == 0, result.output
     assert (tmp_path / ".duckstring" / "duck.db").exists()
+
+
+def test_serving_spill_is_not_bundled(tmp_path):
+    """The sandbox spills into the root; that scratch is transient and can be large, so it must not ride
+    a state bundle the way real state does."""
+    from duckstring.catchment.routes.catchment import _root_files
+
+    (tmp_path / ".serving-tmp").mkdir()
+    (tmp_path / ".serving-tmp" / "duckdb_temp_block-1.tmp").write_bytes(b"spill")
+    (tmp_path / "duck.db").write_bytes(b"state")
+    names = [arc for _p, arc in _root_files(tmp_path)]
+    assert "duck.db" in names
+    assert not any(n.startswith(".serving-tmp") for n in names)

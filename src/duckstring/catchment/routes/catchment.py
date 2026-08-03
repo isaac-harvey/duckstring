@@ -27,6 +27,7 @@ router = APIRouter()
 
 _SKIP_SUFFIXES = (".db-wal", ".db-shm")  # subsumed by the SQLite snapshot
 _SKIP_NAMES = {"secrets.json", "secrets.json.tmp"}  # the write-only secret store never travels in a bundle
+_SERVING_TMP = ".serving-tmp"  # the sandbox's private spill dir (see serving._temp_dir)
 
 
 def _db(request: Request) -> sqlite3.Connection:
@@ -393,6 +394,8 @@ def _root_files(root: Path) -> list[tuple[Path, str]]:
     for path in sorted(root.rglob("*")):
         if not path.is_file() or path.name.endswith(_SKIP_SUFFIXES) or path.name in _SKIP_NAMES:
             continue
+        if _SERVING_TMP in path.parts:
+            continue  # a serving connection's spill scratch: transient, can be huge, and rebuilt on demand
         files.append((path, path.relative_to(root).as_posix()))
     return files
 
