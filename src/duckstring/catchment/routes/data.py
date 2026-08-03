@@ -71,7 +71,11 @@ def _data_dir(request: Request, pond_name: str, major: int):
     from ..registry import resolve_data_dir
 
     data_root = getattr(request.app.state, "data_root", None)
-    return resolve_data_dir(Path(request.app.state.root), pond_name, major, data_root)
+    # expected_f = what the engine says this line published, so a stale local publish (a line that MOVED
+    # to a remote Pool) can't answer a query with old data.
+    driver = getattr(request.app.state, "driver", None)
+    expected_f = driver.published_f(pond_name, major) if driver is not None else None
+    return resolve_data_dir(Path(request.app.state.root), pond_name, major, data_root, expected_f=expected_f)
 
 
 def _tune_read_con(con) -> None:

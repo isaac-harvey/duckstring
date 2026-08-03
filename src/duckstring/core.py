@@ -356,7 +356,8 @@ class MissingSourceAsset(FileNotFoundError):
 class Pond:
     def __init__(
         self, name: str, version: str, con, root,
-        source_majors: dict[str, int] | None = None, f=None, previous_f=None, data_root: str | None = None,
+        source_majors: dict[str, int] | None = None, source_f: dict[str, str] | None = None,
+        f=None, previous_f=None, data_root: str | None = None,
         sources_changed: bool = True, skip_sink=None, staging_dir=None, own_data_dir=None,
         flock: str | None = None,
     ) -> None:
@@ -386,6 +387,9 @@ class Pond:
         # Which major line of each Source this Pond consumes (from its pond.toml [sources] pins).
         # None/missing falls back to the flat puddles layout (local runs have no majors).
         self.source_majors = source_majors or {}
+        # The freshness the Catchment says each Source has published — lets a read reject a stale
+        # local publish (see catchment.registry.resolve_data_dir). Absent for puddle runs.
+        self.source_f = source_f or {}
         # The run's freshness F (tz-aware UTC datetime): the ideal watermark/provenance stamp —
         # stable across crash recovery and retries, which all re-run at the same F (wall-clock
         # would differ per attempt). Local (puddle) runs stamp the run's start time.
@@ -544,7 +548,8 @@ class Pond:
             return LocalStorage(_Path(self.root) / "ponds" / source_pond / "data")
         from .catchment.registry import resolve_data_dir
 
-        return resolve_data_dir(_Path(self.root), source_pond, major, self.data_root)
+        return resolve_data_dir(_Path(self.root), source_pond, major, self.data_root,
+                                expected_f=self.source_f.get(source_pond))
 
     def read_table(self, ref: str):
         """A relation over a table — own (``"name"``) or a Source's (``"source.table"``). A Source

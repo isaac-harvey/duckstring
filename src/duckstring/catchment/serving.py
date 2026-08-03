@@ -70,7 +70,8 @@ def build_serving_con(driver, *, sandboxed: bool):
             tables = driver.serviceable(key) if sandboxed else driver._output_tables(pv_id)
             if not tables:
                 continue
-            data_dir = resolve_data_dir(root, name, major, driver.data_root)
+            data_dir = resolve_data_dir(root, name, major, driver.data_root,
+                                        expected_f=driver.published_f(name, major))
             data_dir.duckdb_setup(con)  # object store → httpfs + creds (before we lock external access)
             schema = f"{name}_v{major}"
             con.execute(f"CREATE SCHEMA IF NOT EXISTS {_qi(schema)}")

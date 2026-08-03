@@ -158,6 +158,58 @@ def test_resolve_data_dir_prefers_the_local_publish(tmp_path):
     assert str(local) in resolve_data_dir(tmp_path, "p", 1, None).uri()
 
 
+def _sidecar(dir_path, f: str):
+    """A minimal published sidecar stamped at ``f`` (the shape publish_plan writes)."""
+    import json
+    dir_path.mkdir(parents=True, exist_ok=True)
+    (dir_path / "_trickle.json").write_text(json.dumps({"t": {"mode": "overwrite", "f": f}}))
+
+
+def test_a_stale_local_publish_does_not_shadow_the_data_root(tmp_path):
+    """The move-to-a-remote-Pool hole: a line that moves off this box leaves its local publish behind,
+    and the presence probe alone would keep answering from it — silently serving OLD data forever. Given
+    what the Catchment knows the line has published, a local copy behind that is rejected."""
+    from duckstring.catchment.registry import resolve_data_dir
+
+    remote = tmp_path / "durable"
+    local = tmp_path / "ponds" / "p" / "m1" / "data"
+    _sidecar(local, "2026-01-01T00:00:00+00:00")
+
+    # Local is current → still the fast local read (expected_f matches what local backs).
+    dd = resolve_data_dir(tmp_path, "p", 1, str(remote), expected_f="2026-01-01T00:00:00+00:00")
+    assert str(local) in dd.uri()
+
+    # The Pond moved and published remotely at a newer f — the stale local must NOT answer.
+    dd = resolve_data_dir(tmp_path, "p", 1, str(remote), expected_f="2026-06-01T00:00:00+00:00")
+    assert str(remote) in dd.uri(), "a local publish behind the Catchment's claim must fall through"
+
+    # An unreadable/empty sidecar backs no claim at all → the data root.
+    (local / "_trickle.json").write_text("{}")
+    dd = resolve_data_dir(tmp_path, "p", 1, str(remote), expected_f="2026-06-01T00:00:00+00:00")
+    assert str(remote) in dd.uri()
+
+    # No expectation supplied (a puddle run) → the old presence behaviour, unchanged.
+    assert str(local) in resolve_data_dir(tmp_path, "p", 1, str(remote)).uri()
+
+
+def test_pond_foreign_read_rejects_a_stale_local_source(tmp_path):
+    """The same rule on the Duck's own foreign read — the one that would feed stale rows INTO a
+    computation, not merely answer a query with them."""
+    from duckstring.core import Pond
+
+    local = tmp_path / "ponds" / "src" / "m1" / "data"
+    _sidecar(local, "2026-01-01T00:00:00+00:00")
+    remote = str(tmp_path / "durable")
+
+    fresh = Pond("me", "1.0.0", con=None, root=str(tmp_path), source_majors={"src": 1},
+                 source_f={"src": "2026-01-01T00:00:00+00:00"}, data_root=remote)
+    assert str(local) in fresh._source_data_dir("src").uri()
+
+    moved = Pond("me", "1.0.0", con=None, root=str(tmp_path), source_majors={"src": 1},
+                 source_f={"src": "2026-06-01T00:00:00+00:00"}, data_root=remote)
+    assert remote in moved._source_data_dir("src").uri()
+
+
 def test_pond_source_read_resolves_local_first(tmp_path):
     """`Pond._source_data_dir` (the Duck-side foreign read): a co-located Source published locally is
     read from the local layout even with a data root configured."""
@@ -220,6 +272,44 @@ def test_driver_persist_event_releases_cross_pool_sink(tmp_path, monkeypatch):
     assert driver.persisted["sales@1"] == t0.isoformat()
     st = next(p for p in driver.status()["ponds"] if p["id"] == "sales@1")
     assert st["persisted_f"] == t0.isoformat()
+
+
+def test_begin_run_job_carries_each_sources_published_freshness(tmp_path):
+    """A Duck cannot know whether its Source moved Pools, so the Catchment tells it what each Source has
+    published; the Duck's foreign read uses that to reject a stale local copy. Keyed by Source NAME —
+    how a Ripple refers to it (``source.table``)."""
+    from datetime import datetime, timezone
+
+    from duckstring.catchment.db import connect, migrate
+    from duckstring.catchment.driver import Driver
+    from duckstring.catchment.launcher import NoopLauncher
+    from duckstring.catchment.routes.deploy import _register
+
+    t0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    db = connect(tmp_path / "duck.db")
+    migrate(db)
+    cfg = {"sources": {}, "immediate_retries": 0, "source_retries": 0, "kind": "pond"}
+    _register(db, "sales", "1.0.0", "pond", "ponds/sales/1.0.0", cfg,
+              [{"func": "f", "name": "agg", "parents": []}])
+    _register(db, "rpt", "1.0.0", "outlet", "ponds/rpt/1.0.0",
+              {**cfg, "kind": "outlet", "sources": {"sales": "1.0.0"}},
+              [{"func": "f", "name": "out", "parents": []}])
+    driver = Driver(db, tmp_path, "http://x", NoopLauncher(), data_root=str(tmp_path / "durable"))
+
+    # Nothing published yet → no claim to make (the Duck falls back to the presence probe).
+    assert driver._source_published_f("rpt@1") == {}
+
+    # The source published content at t0 → that travels on the Run's job.
+    with driver.lock:
+        ss = driver.state.pond_states["sales@1"]
+        ss.start_f = ss.end_f = ss.changed_f = ss.persisted_f = t0
+    driver.tap("rpt@1")
+    job = next(j for j in driver.jobs["rpt@1"] if j["kind"] == "begin_run")
+    assert job["source_f"] == {"sales": t0.isoformat()}
+    # A pass (end_f advanced, nothing written) must not raise the claim above the content anchor.
+    with driver.lock:
+        driver.state.pond_states["sales@1"].end_f = datetime(2026, 2, 1, tzinfo=timezone.utc)
+    assert driver._source_published_f("rpt@1") == {"sales": t0.isoformat()}
 
 
 def _persist_driver(tmp_path, monkeypatch=None, data_root=None):

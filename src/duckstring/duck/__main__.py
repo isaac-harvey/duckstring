@@ -104,6 +104,9 @@ def serve(core: DuckCore, executor: RippleExecutor, client: CatchmentClient) -> 
                         shutdown_requested = True
                     elif data.get("kind") == "begin_run":
                         prev = data.get("previous_f")
+                        # What the Catchment says each Source has published — foreign reads use it to
+                        # reject a stale local publish (registry.resolve_data_dir).
+                        executor.source_f = data.get("source_f") or {}
                         if data.get("refresh"):
                             executor.wipe()  # cold reset: the run rebuilds from scratch
                         _launch(core.begin_run(

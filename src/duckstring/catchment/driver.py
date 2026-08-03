@@ -1823,7 +1823,8 @@ class Driver:
         from ..trickle_io import load_sidecar
         from .registry import resolve_data_dir
 
-        sidecar = load_sidecar(resolve_data_dir(Path(self.root), name, major, self.data_root))
+        sidecar = load_sidecar(resolve_data_dir(Path(self.root), name, major, self.data_root,
+                                                expected_f=self.published_f(name, major)))
         targets = [table] if table else list(sidecar)
         for t in targets:
             meta = sidecar.get(t)
@@ -2955,6 +2956,9 @@ class Driver:
             # The major line's additive schema contract this Run must keep (vetted by the Duck before
             # publishing); None for a first run or a deliberate rollback (governed by min_version).
             "contract": self._contract_for(pond),
+            # What each Source has published ({name: iso}), so a foreign read can reject a stale LOCAL
+            # publish left behind by a Source that moved to a remote Pool (registry.resolve_data_dir).
+            "source_f": self._source_published_f(pond),
         })
         # Write started_at as tz-aware ISO (UTC) to match finished_at; the SQLite `datetime('now')`
         # default is naive and would be misread as local time by the UI. A Force re-opens the Run.
@@ -3285,6 +3289,31 @@ class Driver:
                 )
         self.db.commit()
 
+    def _source_published_f(self, pond: str) -> dict[str, str]:
+        """``{source name: published freshness}`` for this Pond's Sources — what the Duck's foreign reads
+        must at least see. Keyed by NAME (not pond key) because that is how a Ripple refers to a Source
+        (``source.table``) and how ``Pond.source_majors`` is keyed."""
+        out: dict[str, str] = {}
+        for skey in self.state.ponds[pond].sources:
+            meta = self.meta.get(skey)
+            if meta is None:
+                continue
+            f = self.published_f(meta["name"], meta["major"])
+            if f is not None:
+                out[meta["name"]] = f
+        return out
+
+    def published_f(self, name: str, major: int) -> str | None:
+        """The freshness this Catchment believes ``name@major`` has PUBLISHED — its ``changed_f`` (the
+        content anchor: a pass advances end_f without writing anything). Passed to ``resolve_data_dir``
+        so a stale local publish left behind by a move to a remote Pool can't shadow the data root.
+        ``None`` when the line is unknown or has never published (nothing to compare against)."""
+        key = pond_key(name, major)
+        ps = self.state.pond_states.get(key)
+        if ps is None or ps.changed_f == NEVER:
+            return None
+        return _iso(ps.changed_f)
+
     def _record_flock(self, pond: str, delta: dict) -> None:
         """Accumulate a Duck's Flock dispatch delta (shipped per Ripple Run). Cumulative counters live
         here rather than in the Duck because a Duck is per-run and can be restarted mid-run; the Duck
@@ -3415,7 +3444,8 @@ class Driver:
         if meta.get("is_draw"):
             return set()
         try:
-            data_dir = resolve_data_dir(Path(self.root), meta["name"], meta["major"], self.data_root)
+            data_dir = resolve_data_dir(Path(self.root), meta["name"], meta["major"], self.data_root,
+                                        expected_f=self.published_f(meta["name"], meta["major"]))
             out = set(get_data_plane().list_tables(data_dir))
         except Exception:
             out = set()
@@ -3437,7 +3467,8 @@ class Driver:
         if meta.get("is_draw"):
             return False
         try:
-            data_dir = resolve_data_dir(Path(self.root), meta["name"], meta["major"], self.data_root)
+            data_dir = resolve_data_dir(Path(self.root), meta["name"], meta["major"], self.data_root,
+                                        expected_f=self.published_f(meta["name"], meta["major"]))
             out = bool(list_objects(data_dir))
         except Exception:
             out = False

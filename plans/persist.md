@@ -43,6 +43,20 @@
 > normal demand re-running the gap. Fate-sharing (argued in "The correctness core" below) is what makes
 > the regression coherent. Deterministic from (DB, disk); re-runs are no-ops.
 >
+> **Built (freshness-checked read resolution):** the local-first probe is no longer presence-only.
+> `resolve_data_dir` takes an `expected_f` — what the Catchment knows the line has PUBLISHED (its
+> `changed_f`, the content anchor) — and a local publish behind that claim is treated as the stale
+> leftover it is, falling through to the data root. This closes the move-to-a-remote-Pool hole, where a
+> line's abandoned local sidecar silently shadowed fresher remote data: a *wrong answer*, not just a slow
+> one. Catchment-side readers (query route, serving/pg wire, the published-surface probes, the egress
+> PK gate) pass it from engine state; a Duck cannot know a Source moved, so the `begin_run` job carries
+> `source_f` ({source name: published f}) and `Pond._source_data_dir` uses it. Cost is one small LOCAL
+> file read; the data root is touched only when the local copy actually looks stale, so the fast handoff
+> still costs nothing. Absent an expectation (a puddle run) the old presence probe stands, which is never
+> wrong for a line that has not moved. Tests: `test_a_stale_local_publish_does_not_shadow_the_data_root`,
+> `test_pond_foreign_read_rejects_a_stale_local_source`,
+> `test_begin_run_job_carries_each_sources_published_freshness`.
+>
 > **Built (phase 6):** registry eviction under disk pressure. Below `DUCKSTRING_MIN_FREE_BYTES` free
 > (default 1 GiB; 0 disables; one statvfs per 30 s tick), idle demand-free Ponds shed reconstructible
 > hot state LRU: the registry when a publish backs it; the local publish too only when fully mirrored

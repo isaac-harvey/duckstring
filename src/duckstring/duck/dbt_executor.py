@@ -50,6 +50,7 @@ class DbtExecutor:
         self.proj_dir = project_dir(source_dir, info)
         self.declared_sources = set(info.get("sources", {}).keys())
         self.source_majors = {s: spec_major(spec) for s, spec in info.get("sources", {}).items()}
+        self.source_f: dict[str, str] = {}  # set per begin_run job (see duck/__main__)
 
         # dbt's writable areas, isolated per major line under the Pond's dir; the profile points dbt at
         # this line's registry. Parse once for the per-model source lookup materialisation needs.
@@ -110,7 +111,8 @@ class DbtExecutor:
         try:
             pond = Pond(
                 name=self.pond_name, version=self.version, con=con, root=Path(self.root),
-                source_majors=self.source_majors, f=f, previous_f=previous_f, data_root=self.data_root,
+                source_majors=self.source_majors, source_f=self.source_f, f=f, previous_f=previous_f,
+                data_root=self.data_root,
             )
             materialize_sources(pond, self.manifest, model_name, self.declared_sources)
             return pond.take_lineage()["reads"]  # the cross-Pond source tables this model consumed

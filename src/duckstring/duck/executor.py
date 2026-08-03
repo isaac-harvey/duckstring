@@ -75,7 +75,7 @@ def _run_ripple(
     func, pond_name: str, version: str, con, root_str: str,
     source_majors: dict[str, int], f: datetime | None, previous_f: datetime | None,
     data_root: str | None = None, sources_changed: bool = True, skip_sink=None,
-    staging_dir=None, own_data_dir=None,
+    staging_dir=None, own_data_dir=None, source_f: dict[str, str] | None = None,
 ) -> dict:
     from ..core import Pond
 
@@ -84,7 +84,7 @@ def _run_ripple(
     # so they coexist without the "file handle conflict" two separate connect()s to the same file raise.
     pond = Pond(
         name=pond_name, version=version, con=con, root=Path(root_str),
-        source_majors=source_majors, f=f, previous_f=previous_f, data_root=data_root,
+        source_majors=source_majors, source_f=source_f, f=f, previous_f=previous_f, data_root=data_root,
         sources_changed=sources_changed, skip_sink=skip_sink,
         staging_dir=staging_dir, own_data_dir=own_data_dir,
         # Flock is a Pond-level posture now (not per-Ripple): the Duck's config env carries the
@@ -192,6 +192,10 @@ class RippleExecutor:
         # Which major line of each Source this Pond's reads resolve to (its pond.toml pins).
         sources = read_pond_toml(root / source_path).get("sources", {})
         self.source_majors = {sname: spec_major(spec) for sname, spec in sources.items()}
+        # What the Catchment says each Source has published ({name: iso}) — carried on the begin_run job
+        # and used to reject a stale LOCAL publish left behind by a Source that moved to a remote Pool.
+        # Empty until a job supplies it; then the resolve is only ever more correct, never less.
+        self.source_f: dict[str, str] = {}
         self._pool = ThreadPoolExecutor(max_workers=max_workers)
 
     def _cursor(self):
@@ -219,7 +223,7 @@ class RippleExecutor:
             timing["lineage"] = _run_ripple(
                 func, self.pond_name, self.version, self._cursor(), str(self.root),
                 self.source_majors, f, previous_f, self.data_root,
-                sources_changed=sources_changed, skip_sink=skip_sink,
+                sources_changed=sources_changed, skip_sink=skip_sink, source_f=self.source_f,
                 staging_dir=self.staging_dir, own_data_dir=self.own_data_dir,
             )
 
