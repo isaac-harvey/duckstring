@@ -54,6 +54,8 @@ aws = [
 ]
 dev = [
   "pytest>=8.0",
+  # A local S3 API, so the object-store data plane is a normal test rather than a live-AWS session.
+  "moto[server]>=5.0",
   "pytest-timeout>=0.5",
   "ruff>=0.3",
   "mypy>=1.8",

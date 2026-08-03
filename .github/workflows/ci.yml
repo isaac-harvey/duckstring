@@ -60,6 +60,32 @@ jobs:
         env:
           DUCKSTRING_TEST_PG: postgres://ds:ds@127.0.0.1:5432/ds
 
+  # The object-store data plane against a REAL S3 (MinIO — unlike moto it REJECTS unsigned requests, so
+  # this catches the credential class of bug, not just the code paths). Everything S3 was previously
+  # proved by hand on a live AWS box, one session at a time; this is that, per commit, for free.
+  object-store:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Start MinIO
+        run: |
+          docker run -d --name minio -p 9000:9000 \
+            -e MINIO_ROOT_USER=duckstringtest -e MINIO_ROOT_PASSWORD=duckstringtest \
+            quay.io/minio/minio server /data
+          for i in $(seq 1 30); do
+            curl -sf http://127.0.0.1:9000/minio/health/live && break
+            sleep 2
+          done
+      - run: pip install -e .[dev]
+      - run: pytest tests/test_object_store.py -v
+        env:
+          DUCKSTRING_TEST_S3: http://127.0.0.1:9000
+          DUCKSTRING_TEST_S3_KEY: duckstringtest
+          DUCKSTRING_TEST_S3_SECRET: duckstringtest
+
   # The web UI: typecheck + the vitest unit suite (pure lib/component logic).
   frontend:
     runs-on: ubuntu-latest

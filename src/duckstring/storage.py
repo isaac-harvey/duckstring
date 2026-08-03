@@ -207,6 +207,25 @@ class Storage:
         secret for an object store). A no-op for local paths."""
 
 
+
+def _s3_endpoint(params: dict) -> str | None:
+    """An S3-compatible endpoint override (MinIO, Ceph, R2, moto), from the URI's ``?endpoint=`` or the
+    ``DUCKSTRING_S3_ENDPOINT`` environment. Absent for real AWS, which addresses buckets by region."""
+    from .egress import credentials
+
+    raw = params.get("endpoint") or os.environ.get("DUCKSTRING_S3_ENDPOINT")
+    return credentials.resolve(raw) if raw else None
+
+
+def _split_endpoint(endpoint: str) -> tuple[str, bool]:
+    """``(host:port, use_ssl)`` — DuckDB wants the host without a scheme plus a USE_SSL flag, where
+    fsspec wants a full URL. A bare host defaults to https, as AWS does."""
+    if "://" in endpoint:
+        scheme, _, rest = endpoint.partition("://")
+        return rest.rstrip("/"), scheme.lower() != "http"
+    return endpoint.rstrip("/"), True
+
+
 class LocalStorage(Storage):
     """A local POSIX directory — today's behaviour, byte-for-byte. Atomic writes are ``tmp + os.replace``."""
 
@@ -366,6 +385,11 @@ class ObjectStorage(Storage):
                         opts.setdefault("client_kwargs", {})["region_name"] = credentials.resolve(v)
                 elif k in ("key", "key_id", "secret", "token", "account_name", "account_key", "anon"):
                     opts[_FSSPEC_OPT.get(k, k)] = credentials.resolve(v)
+            if protocol == "s3":
+                endpoint = _s3_endpoint(self.params)
+                if endpoint:
+                    host, ssl = _split_endpoint(endpoint)
+                    opts.setdefault("client_kwargs", {})["endpoint_url"] = f"{'https' if ssl else 'http'}://{host}"
             self._fs = fsspec.filesystem(protocol, **opts)
         return self._fs
 
@@ -567,6 +591,12 @@ class ObjectStorage(Storage):
                 bits.append("PROVIDER credential_chain")
             if region:
                 bits.append(f"REGION '{credentials.resolve(region)}'")
+            endpoint = _s3_endpoint(self.params) if duck_type == "S3" else None
+            if endpoint:
+                host, ssl = _split_endpoint(endpoint)
+                # Path-style addressing: an S3-compatible server is rarely reachable as
+                # bucket.host, and virtual-host style silently resolves nowhere.
+                bits += [f"ENDPOINT '{host}'", f"USE_SSL {str(ssl).lower()}", "URL_STYLE 'path'"]
             con.execute(f"CREATE OR REPLACE SECRET duckstring_data ({', '.join(bits)})")
         except Exception:  # never echo a credential value in the error
             raise RuntimeError(f"failed to configure DuckDB {duck_type} credentials for the data plane") from None
