@@ -181,6 +181,25 @@ def test_no_placement_config_still_launches_and_warns(tmp_path, caplog):
     assert warned == 1, "warn once, not once per spawn"
 
 
+def test_pool_agent_boots_against_the_directory_the_userdata_creates(tmp_path):
+    """The agent's --root must be the dir the userdata mkdirs. It was hardcoded to /var/duckstring while
+    the userdata created /var/lib/duckstring, so on real EC2 the agent died on boot and every Pond on the
+    pool timed out as a silent Duck with no other clue. Caught on the gate box."""
+    import base64
+
+    from duckstring.catchment.ec2_launcher import _REMOTE_ROOT
+    from duckstring.catchment.pool_launcher import Ec2PoolMachine
+
+    ec2 = FakeEc2()
+    lch = _launcher(tmp_path, ec2, instance_profile="ds-worker")
+    Ec2PoolMachine("devpool", {"instance_type": "m6i.large"}, lch).start()
+    _iid, kw = ec2.launched[0]
+    script = base64.b64decode(kw["UserData"]).decode()
+    assert f"mkdir -p {_REMOTE_ROOT}" in script
+    assert f"--root {_REMOTE_ROOT}" in script, f"agent root must exist on the box:\n{script}"
+    assert "/var/duckstring " not in script
+
+
 def test_pool_agent_launch_gets_the_same_placement(tmp_path, monkeypatch):
     """The Pool agent dials back exactly like a Duck, so it needs the same network placement."""
     monkeypatch.setenv("DUCKSTRING_EC2_SUBNET", "subnet-abc")

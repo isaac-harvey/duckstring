@@ -183,9 +183,14 @@ class Ec2PoolMachine:
             self.el.dialback.request()
             self._error = "ec2 pool: waiting for a reachable Catchment URL (dial-back)"
             return
+        # The root MUST be the directory the launcher's userdata creates (_REMOTE_ROOT) — a hardcoded
+        # "/var/duckstring" here never exists on the box, so the agent died on boot and the Pond just
+        # timed out as a silent Duck. The Fargate pool machine above already uses _REMOTE_ROOT.
+        from .ec2_launcher import _REMOTE_ROOT as _EC2_ROOT
+
         agent_args = (
             f"--pool {self.pool} --catchment {self.el.remote_base_url} "
-            f"--token={self.el.token} --root /var/duckstring "
+            f"--token={self.el.token} --root {_EC2_ROOT} "
             f"--data-root={self.el.data_root or ''} --persist-root={self.el.data_root or ''}"
         )
         try:
